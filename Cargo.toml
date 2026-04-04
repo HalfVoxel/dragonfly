@@ -14,3 +14,5 @@ serde_json = "1"
 regex = "1"
 tempfile = "3"
 chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+html-escape = "0.2.13"

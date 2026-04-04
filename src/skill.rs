@@ -166,8 +166,13 @@ For each bot comment:
 4. **If the bot is correct and the fix is obvious**: Fix it, commit, and note what you fixed.
 5. **If the bot is correct but the fix is non-trivial**: Explain the issue to the user and ask how they'd like to proceed.
 6. **If the bot is wrong**: Skip it and briefly explain why.
-7. **Offer to mark the specific bot threads as resolved**: Use the gh cli is the user approves. Clearly state the titles of the threads you are resolving in bold.
-    When resolving bot threads, also add a comment to each thread saying in which commit this was fixed (e.g. "Fixed in #....").
+7. **Offer to mark the specific bot threads as resolved**: Clearly state the titles of the threads you are resolving in bold.
+    When resolving bot threads, first add a comment to each thread saying in which commit this was fixed, then resolve it:
+    ```bash
+    push-and-check pr thread comment --thread-id PRRT_... --body "Fixed in abc1234"
+    push-and-check pr thread resolve --thread-id PRRT_...
+    ```
+    The thread IDs are available in the pre-collected review-threads data.
 
 ## Phase 6: Custom review
 
