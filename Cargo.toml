@@ -1,0 +1,16 @@
+[package]
+name = "push-and-check"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "push-and-check"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+tempfile = "3"
+chrono = { version = "0.4", features = ["serde"] }
