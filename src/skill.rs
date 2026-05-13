@@ -6,10 +6,6 @@ When thinking, always start by listing which phase you are on.
 Like: "Phase 4.1 Identify the failure".
 But no need to show this to the user.
 
-## Arguments
-
-- Flags: "$ARGUMENTS" (pass `--force` to allow force push after rebase confirmation)
-
 ## Phase 1: Safe Push
 
 ### Determine push strategy
@@ -38,8 +34,6 @@ The above will display:
 1. The user passed `--force` OR you detect a diverged state (local and remote have diverged)
 2. The local branch contains all the *content* from the remote (i.e., it was a rebase, not a reset that dropped commits). Verify by checking that `git log @{upstream} --not HEAD` shows no commits whose changes are missing from HEAD — compare with `git diff @{upstream}...HEAD` or check that the remote's patches are all present.
 3. Confirm with the user before force pushing if there's any ambiguity.
-
-**No remote yet**: Just `git push -u origin HEAD`.
 
 If the push fails or the situation is ambiguous, ask the user how to proceed.
 
@@ -113,12 +107,16 @@ Repeat until CI is green or you need user input.
 
 ## Phase 5: Review Bot Comments
 
-After CI passes (or in parallel while waiting), check for review bot comments:
+Inline review threads (including bot comments) and top-level PR reviews are
+already in the pre-collected data — see the `review-threads`, `review-pr`, and
+`pr-meta` files in the index. Read those first.
+
+If you need to re-check after pushing a fix or suspect the snapshot is stale,
+re-fetch live:
 
 ```bash
 # Get PR number
 gh pr view --json number --jq '.number'
-
 
 gh pr view <number> --json reviews
 
@@ -177,19 +175,96 @@ For each bot comment:
 ## Phase 6: Custom review
 
 If CI is passing and the PR is not marked as ready for review yet,
-then use a subagent to review the pr using the /pr-review skill.
+then use a subagent to review the pr.
+
+If you think there's some risk of deployment edge cases, start a subagent to evaluate this.
+The system is deployed gradually, with new backends spinning up over a period of ~10 minutes,
+replacing the old ones. This means old or new frontends can communicate with old and new backends
+for a short time. Potentially even having data flows like
+old frontend -> new backend -> old frontend -> old backend or similar.
 
 CUSTOM_REVIEW_PLACEHOLDER
 
+Instruct the subagents to write a numbered list of issues they find.
 Ask the user which issues they want you to fix.
 After fixing, present the changes to the user, and allow for them to review manually before comitting and pushing.
 
 After changes have been approved, re-run the review subagent to see if it finds more issues.
 
-## Phase 7: Final Status
+## Phase 7: PR description
+
+If the PR has no substantial description, write one using:
+
+```
+push-and-check pr description "..."
+```
+
+This phase may be done in parallel with waiting on CI, if CI has passed at least once before.
+
+If the PR has a description, validate that it still makes sense and is up to date with the latest changes.
+However, you should not include fixes to the PR itself in its description. It should be about what the PR as a whole aims to do.
+
+Before submitting a PR description, you *must* always check the latest PR description via the `gh` cli, to ensure it hasn't been updated from elsewhere.
+
+### PR description guide
+
+Pick a sensible subset of sections per PR. A tiny fix may only need `# Summary` + `# Why`, while a CLI feature should usually have all four including `# Example`.
+This guide complements the existing repo rule in `AGENTS.md`, but overrides it when there are conflicts.
+
+#### Sections (use `#` headings)
+
+Pick the ones that fit the change; skip ones that don't. Order them as listed below.
+
+- **`# Summary`** — 1-3 bullets. What changed and the headline why.
+- **`# Why`** — 2-4 bullets. Motivation, prior behavior, what hurt without this.
+- **`# Who`** — If the features are behind a feature flag, list it here. E.g. "* All functionality gated behind the new-trajectory/constructPrompt feature flag (rolled out to 5%)".
+- **`# What changed`** — 3-6 bullets. Concrete changes. One sentence per bullet.
+- **`# Example`** (or `# Examples`) — only when appropriate (CLI updates, new APIs, config changes that benefit from showing usage). Contains a fenced code block.
+- **`# Links`** — For bugfixes, you may include grafana urls / braintrust trace links or similar that show the bug happening.
+
+#### PR examples
+
+You can find 3 PR description examples at:
+
+- ~/cloud/Programming/dragonfly/pr-descriptions/bug-fix.md
+- ~/cloud/Programming/dragonfly/pr-descriptions/cli-feature.md
+- ~/cloud/Programming/dragonfly/pr-descriptions/refactor.md
+
+#### Graphs (encouraged)
+
+Including a relevant rendered graph in the PR description is **encouraged**, especially when the change:
+
+- Fixes a bug — show the panel that captures the bug (error rate, latency spike, panic count) so reviewers can see the problem.
+- Improves a metric or touches a hot path — show the baseline panel for the affected endpoint / tool / node.
+
+A reference for the production Grafana setup, the catalog of dashboards, and how to convert any panel URL into a `/render/d-solo/...` PNG lives at:
+
+```
+GRAFANA_DASHBOARDS_PATH
+```
+
+Read that file when you need to render a panel. The `GRAFANA_TOKEN` and `GRAFANA_HOST` env vars are already exported in this environment, so you can `curl` the render endpoint directly — no setup required. Save the PNG under `/tmp/`.
+
+To embed the PNG in a PR body or comment, upload it with the `gh image` extension and use the markdown reference it prints:
+
+```bash
+gh image /tmp/panel.png
+# -> ![panel.png](https://github.com/user-attachments/assets/...)
+```
+
+It pulls the session token from browser cookies automatically — no setup. Then update the PR with `gh pr edit <number> --body-file <new-body.md>`. Do **not** put the raw `/render/d-solo/...` URL in the PR body — it requires the service-account token and won't render for anyone else.
+
+#### Hard rules
+
+- **No "Test plan" / "Test checklist" / "Testing" section.** Reviewers don't need it; CI runs the tests.
+- Bullets are one sentence each, no trailing prose underneath.
+- Keep it short. If a bullet doesn't add information, cut it.
+- No emojis. No "Co-Authored-By" footers in the body. No Slack/Cursor/external-tool links.
+- Skip CI-self-evident items (lint passes, typecheck passes, "CI green").
+
+## Phase 8: Final Status
 
 Report a summary:
-- **Push**: How the push went (normal / force-with-lease)
 - **CI**: Final status of all checks
 - **Fixes applied**: List of commits made to fix CI or bot issues. Remember that CI issues unrelated to this PR should not be fixed, but the user should be informed.
 - **Remaining items**: Any unresolved bot comments or issues needing user input
@@ -197,7 +272,7 @@ Report a summary:
 
 If everything is green and clean, say so concisely.
 
-## Phase 8: Ready for review
+## Phase 9: Ready for review
 
 If everything is green and clean, offer to make mark the PR as ready for review, if it isn't already.
 If the user approves, investigate who would be the most reasonable person to review it. Look at who is the code owner of the files, and who has been the primary author as of late. Use git blame around important changes. Make sure to discard mechanical changes like formatting and linting fixes.
@@ -271,4 +346,21 @@ git log --all -S 'MySearchText' --format='%h %ad %s' --date=short -- path/to/opt
 ## Pre-existing issues
 
 If CI fails due to, or bots report on, pre-existing bugs in the code (before this PR), then they should never be fixed without asking the user first.
+
+## Submitting feedback about this review process
+
+While working through the phases, watch for friction that future runs could avoid:
+
+- Something took an unnecessary amount of time to get right (e.g. you fumbled the same command twice, hunted for data that should have been pre-collected, or worked around a limitation of this prompt).
+- A helper command or subcommand is missing that would have saved you a round-trip (e.g. a shortcut for a gh/git incantation you had to assemble by hand).
+- A phase instruction is ambiguous or sent you down the wrong path.
+
+When you notice one of these, submit a brief, concrete note via CLI:
+
+```bash
+push-and-check --feedback "Spent 3 round-trips resolving review threads because thread IDs weren't in the pre-collected data for outdated threads. A `push-and-check pr thread list` subcommand would help."
+```
+
+Keep each entry short and specific — describe the friction and (if obvious) what would fix it. Do NOT use this for PR-level issues or user-facing status; it's only for meta-feedback about your process.
+
 "#;
