@@ -2,13 +2,15 @@
   <img src="logo-transparent.png" alt="dragonfly logo" width="220" />
 </p>
 
-# push-and-check
+# Dragonfly
 
-A Rust CLI that pushes the current branch, waits for CI, collects the failure logs and review-bot threads, then hands the whole package to Claude Code with a large prompt so the agent can land the PR.
+A Rust CLI that helps with reviewing and monitoring pull requests.
+
+The cli pushes the current branch, waits for CI, collects the failure logs and review threads, and then hands the whole package to Claude Code with a large prompt so the agent can review and help land the PR.
 
 ## What it does
 
-1. **Push** — fast-forwards or `--force-with-lease` after a rebase (with safety checks).
+1. **Push** — Pushes the latest commit.
 2. **Watch CI** — streams `gh pr checks` and pulls logs for any failing jobs.
 3. **Collect context** — changed files, commits, recent Claude Code sessions on the branch, unresolved PR review threads, and merge-conflict status against `origin/main`.
 4. **Hand off to Claude** — `exec`s `claude` with a curated prompt and the bundled push-and-fix skill, so the agent fixes failures and replies to review comments.
@@ -23,6 +25,7 @@ Why use this instead of just letting claude do everything itself?
 * Claude often doesn't realize it's in a graphite stacked PR by itself.
 * Claude is automatically prompted to follow a strict sequence of phases, which covers much more than it does by itself, unprompted.
 * Dangerous git commands require approval via a hook, even if claude runs the rest with dangerously-skip-permissions.
+* Responds to review comments in a concise way if asked. Always labels ai comments with a footer.
 
 ## Install
 
