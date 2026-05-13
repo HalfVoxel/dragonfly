@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="dragonfly logo" width="220" />
+  <img src="logo-transparent.png" alt="dragonfly logo" width="220" />
 </p>
 
 # push-and-check
