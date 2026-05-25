@@ -482,6 +482,7 @@ dependencies = [
  "clap",
  "dialoguer",
  "html-escape",
+ "libc",
  "regex",
  "serde",
  "serde_json",

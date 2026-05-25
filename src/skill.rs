@@ -55,16 +55,20 @@ If they are easy to resolve, offer to rebase and fix the merge conflicts.
 After pushing, monitor CI checks:
 
 ```bash
-# Wait a few seconds for checks to register, then watch for changes
-sleep 10 && gh pr checks --watch --fail-fast
+# Auto-reconnecting watch — prints a single final summary when CI settles
+push-and-check ci watch
 ```
 
-Always prefer using watch, but if you need to poll, you can so like this:
+For a one-shot poll instead of watching:
 
 ```bash
-# Check status
-gh pr checks
+push-and-check ci status            # failing + pending only (exits 1 if any failing)
+push-and-check ci status --all      # show every check (passed + skipped too)
 ```
+
+Both subcommands print one line per check with a provider tag (`github`,
+`buildkite`, `wiz`, `spacelift`, …), so you can see at a glance which system
+is gating the PR. Prefer these over hand-assembling `gh pr checks | grep`.
 
 Start the watch command in the background, and while waiting, start phases 5 and 6 to save time.
 Remember to check back on the CI status if you are done with everything else.
@@ -75,16 +79,30 @@ When checks fail:
 
 1. **Identify the failure**: Get the failed check details.
    ```bash
-   gh pr checks
+   push-and-check ci status
    ```
 
-2. **Get failure logs**: For each failed check, fetch the logs.
+2. **Get failure logs**: Fetch logs for **every** failed check, across providers
+   (GitHub Actions, Buildkite, Spacelift, Wiz, etc.) in one shot.
    ```bash
-   # List workflow runs for the PR's head SHA
-   gh run list --branch $(git branch --show-current) --limit 5
+   push-and-check ci failures
+   ```
+   Each failed check gets its own section with extracted error lines and a link.
+   Non-GHA providers fall back to the check-run output GitHub stores plus the URL,
+   so you always see *something* even when full logs require provider credentials.
 
-   # View specific failed run
-   gh run view <RUN_ID> --log-failed
+   Raw `gh run view <ID> --log-failed` is still available if you need the full
+   GitHub Actions log for a single job.
+
+3. **Decide if it's flaky or pre-existing on main**: don't fix unrelated regressions.
+   ```bash
+   push-and-check ci flaky test-go   # checks the same name on the last 20 main commits
+   ```
+
+4. **Check retry history before re-running**:
+   ```bash
+   push-and-check ci retries         # lists this head's GHA runs + attempt counts
+   push-and-check ci rerun test-go   # rerun-failed-jobs for that named check
    ```
 
 3. **Diagnose and fix**: Read the relevant source files, understand the failure.
@@ -112,43 +130,15 @@ already in the pre-collected data — see the `review-threads`, `review-pr`, and
 `pr-meta` files in the index. Read those first.
 
 If you need to re-check after pushing a fix or suspect the snapshot is stale,
-re-fetch live:
+re-fetch live with the dragonfly helper — it returns the same cleaned
+`<review-threads>` / `<pr-reviews>` / `# PR` sections that you already see in
+the pre-collected files (thread IDs included), so you don't need to write
+GraphQL by hand:
 
 ```bash
-# Get PR number
-gh pr view --json number --jq '.number'
-
-gh pr view <number> --json reviews
-
-# Fetch all review threads including bot comments
-gh api graphql -f query='
-query($owner: String!, $repo: String!, $pr: Int!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $pr) {
-      reviewThreads(first: 100) {
-        nodes {
-          isResolved
-          isOutdated
-          path
-          line
-          comments(first: 50) {
-            nodes {
-              author { login }
-              body
-              createdAt
-            }
-          }
-        }
-      }
-    }
-  }
-}' -f owner=OWNER -f repo=REPO -F pr=PR_NUMBER
-
-# Also check review comments via REST
-gh api repos/{owner}/{repo}/pulls/{pr}/comments --jq '.[] | select(.user.type == "Bot" or (.user.login | test("bot|amp|review"; "i"))) | {user: .user.login, path: .path, line: .line, body: .body}'
+push-and-check pr comments              # current branch's PR
+push-and-check pr comments --pr 12345   # explicit PR number
 ```
-
-Replace OWNER, REPO, and PR_NUMBER with actual values from `gh repo view --json owner,name` and the PR number.
 
 ### Handling bot feedback
 
@@ -186,7 +176,7 @@ old frontend -> new backend -> old frontend -> old backend or similar.
 CUSTOM_REVIEW_PLACEHOLDER
 
 Instruct the subagents to write a numbered list of issues they find.
-Ask the user which issues they want you to fix.
+Ask the user which issues they want you to fix by writing the aggregated list of issues using markdown. Do not use the AskUserQuestion tool, allow the user to answer in free form text.
 After fixing, present the changes to the user, and allow for them to review manually before comitting and pushing.
 
 After changes have been approved, re-run the review subagent to see if it finds more issues.
@@ -216,11 +206,11 @@ This guide complements the existing repo rule in `AGENTS.md`, but overrides it w
 Pick the ones that fit the change; skip ones that don't. Order them as listed below.
 
 - **`# Summary`** — 1-3 bullets. What changed and the headline why.
-- **`# Why`** — 2-4 bullets. Motivation, prior behavior, what hurt without this.
-- **`# Who`** — If the features are behind a feature flag, list it here. E.g. "* All functionality gated behind the new-trajectory/constructPrompt feature flag (rolled out to 5%)".
+- **`# Problem`** — 2-4 bullets. Motivation, prior behavior, what hurt without this.
 - **`# What changed`** — 3-6 bullets. Concrete changes. One sentence per bullet.
+- **`# Who`** — If the features are behind a feature flag, list it here. E.g. "* All functionality gated behind the new-trajectory/constructPrompt feature flag (rolled out to 5%)".
 - **`# Example`** (or `# Examples`) — only when appropriate (CLI updates, new APIs, config changes that benefit from showing usage). Contains a fenced code block.
-- **`# Links`** — For bugfixes, you may include grafana urls / braintrust trace links or similar that show the bug happening.
+- **`# Links`** — For bugfixes, it's useful to include grafana urls / braintrust trace links or similar that show the bug happening.
 
 #### PR examples
 
@@ -301,14 +291,16 @@ If CI is failing due to a seemingly unrelated issue, it could be that:
 
 ### Checking tests on main
 
-To check the test status on main run
+To check the test status on main:
 
 ```
-git log origin/main --format='%H' -20 | while read sha; do
-  result=$(gh api "repos/lovablelabs/lovable/commits/$sha/check-runs?per_page=100" --jq '.check_runs[] | select(.name == "test-go") | .conclusion' 2>/dev/null)
-  echo "${sha:0:7} ${result:-no-run}"
-done
+push-and-check ci flaky <check-name>           # default: last 20 commits
+push-and-check ci flaky test-go --limit 50
 ```
+
+This prints pass/fail/skip counts for the named check on the last N commits of
+`origin/main` and a verdict (consistently failing → pre-existing; mixed →
+flaky; clean → likely caused by this PR).
 
 * A verified flaky is sometimes passing and sometimes failing (check the latest hour or so).
 * Not all tests run for all PRs and commits. Always verify that the test was not skipped (and thus looks like a success).
@@ -317,13 +309,25 @@ done
 * If the test is passing on main, rebasing is always a good idea if possible.
 
 ### Check retries for CI
-To check how many times a given CI test has been retried, use:
 
 ```
-  gh run list --branch "$(git branch --show-current)" --limit 5 --json databaseId,attempt,conclusion,name --jq '.[] | select(.name == "Test") | "\(.databaseId) attempt:\(.attempt) \(.conclusion)"'
+push-and-check ci retries
 ```
 
-Before re-running a test, always check if it has already been run more than once for the latest commit on the current PR. If so, ask the user before scheduling it yet another time.
+Lists the GitHub Actions runs for the current head SHA with attempt counts so
+you can see "already retried, don't re-run". Before re-running a test, always
+check if it has already been run more than once for the latest commit on the
+current PR. If so, ask the user before scheduling it yet another time.
+
+To rerun the failed jobs of a named check:
+
+```
+push-and-check ci rerun <check-name>
+```
+
+This resolves the name to the right workflow run and calls `gh run rerun
+<id> --failed` for you. Note: Buildkite/Wiz/Spacelift checks cannot be rerun
+through this command — visit the provider's URL.
 
 After re-running, wait until the CI completes and check the results.
 
@@ -346,6 +350,7 @@ git log --all -S 'MySearchText' --format='%h %ad %s' --date=short -- path/to/opt
 ## Pre-existing issues
 
 If CI fails due to, or bots report on, pre-existing bugs in the code (before this PR), then they should never be fixed without asking the user first.
+Try rebasing on origin/main as this may fix the issue.
 
 ## Submitting feedback about this review process
 

@@ -17,3 +17,4 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 html-escape = "0.2.13"
 dialoguer = "0.11"
+libc = "0.2"

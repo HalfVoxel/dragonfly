@@ -50,6 +50,8 @@ PR review-thread helpers (used by the skill, but callable directly):
 push-and-check pr thread comment --thread-id <id> --body "..."
 push-and-check pr thread resolve --thread-id <id>
 push-and-check pr description -          # read body from stdin
+push-and-check pr comments               # print review threads, reviews, and meta (cleaned)
+push-and-check pr comments --pr 12345    # explicit PR number
 push-and-check --feedback "..."  # append a note to ~/.dragonfly/feedback
 ```
 

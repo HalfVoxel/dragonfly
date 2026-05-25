@@ -40,6 +40,12 @@ enum CliCommand {
         #[command(subcommand)]
         command: PrCommand,
     },
+    /// CI status, failure logs, watch, flakiness, retries, rerun.
+    /// Replaces ad-hoc gh pr checks / gh run incantations with bounded, agent-friendly output.
+    Ci {
+        #[command(subcommand)]
+        command: CiCommand,
+    },
     /// Run the full flow (push, CI wait, data collection) but print the prompt
     /// instead of invoking Claude Code. Useful for debugging / iterating on the
     /// prompt itself.
@@ -59,6 +65,14 @@ enum PrCommand {
         /// PR description body (markdown). Pass `-` to read from stdin.
         body: String,
     },
+    /// Print PR review threads, top-level reviews, and metadata in the same
+    /// cleaned format used by the pre-collected data (review-threads,
+    /// review-pr, pr-meta). Defaults to the current branch's PR.
+    Comments {
+        /// Explicit PR number. Defaults to the current branch's PR.
+        #[arg(long)]
+        pr: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -77,6 +91,62 @@ enum ThreadCommand {
         /// The review thread ID (e.g. PRRT_kwDOJyl9f8541jLH)
         #[arg(long)]
         thread_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum CiCommand {
+    /// Compact, deduped view of all checks (one line each). Hides passed+skipped by default.
+    /// Exits non-zero if any check is failing.
+    Status {
+        /// Show every check, including passed and skipped.
+        #[arg(long)]
+        all: bool,
+        /// Explicit PR number. Defaults to the current branch's PR.
+        #[arg(long)]
+        pr: Option<String>,
+    },
+    /// For each failed check (GitHub Actions, Buildkite, Spacelift, Wiz, …), print
+    /// a per-check section with extracted error lines, then the link. Full logs are
+    /// saved to /tmp/ when available.
+    Failures {
+        /// Explicit PR number. Defaults to the current branch's PR.
+        #[arg(long)]
+        pr: Option<String>,
+        /// Maximum bytes of full log per check (default 8000).
+        #[arg(long, default_value = "8000")]
+        max_bytes: usize,
+    },
+    /// Wrap `gh pr checks --watch --fail-fast` with auto-reconnect; print a single
+    /// final summary (same shape as `ci status`).
+    Watch {
+        /// Explicit PR number. Defaults to the current branch's PR.
+        #[arg(long)]
+        pr: Option<String>,
+    },
+    /// Look back N commits on origin/main for a given check name and report how
+    /// often it passed vs failed. Useful for diagnosing flaky tests.
+    Flaky {
+        /// Check name (e.g. `test-go`, `test-spanner`).
+        name: String,
+        /// How many recent main commits to inspect.
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+    /// List the workflow runs for the current PR's branch with attempt counts so the
+    /// agent can see "already retried, don't re-run".
+    Retries {
+        /// Explicit PR number. Defaults to the current branch's PR.
+        #[arg(long)]
+        pr: Option<String>,
+    },
+    /// Resolve a check name to its workflow run and call `gh run rerun <id> --failed`.
+    Rerun {
+        /// Failed check name (matched against `gh pr checks`).
+        name: String,
+        /// Explicit PR number. Defaults to the current branch's PR.
+        #[arg(long)]
+        pr: Option<String>,
     },
 }
 
@@ -305,7 +375,69 @@ fn submit_feedback(message: &str) {
 
 // ── Push ─────────────────────────────────────────────────────────────────────
 
-async fn push(force: bool) -> PushResult {
+/// If the branch is behind origin/main and would rebase cleanly, rebase it.
+/// New branches (no upstream) rebase automatically; branches with a remote
+/// counterpart prompt first. Reuses the merge-tree probe that will later
+/// drive the "Merge Conflict Check" prompt section. Returns true if a rebase
+/// actually happened, so the caller can promote a normal push to a force-push.
+async fn maybe_rebase_on_main(has_upstream: bool, merge_probe: &ShResult) -> bool {
+    let behind = sh("git rev-list --count HEAD..origin/main")
+        .await
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    if behind == 0 {
+        return false;
+    }
+
+    let dirty = sh("git status --porcelain --untracked-files=no").await.unwrap_or_default();
+    if !dirty.is_empty() {
+        println!("   Branch is {behind} behind origin/main; skipping auto-rebase (working tree dirty).");
+        return false;
+    }
+
+    if merge_probe.code != 0 {
+        println!("   Branch is {behind} behind origin/main; skipping auto-rebase (would conflict).");
+        return false;
+    }
+
+    let proceed = if !has_upstream {
+        println!("   Branch is {behind} behind origin/main — rebasing (new branch)...");
+        true
+    } else {
+        let prompt = format!("Branch is {behind} behind origin/main and rebase is clean. Rebase now?");
+        match dialoguer::Confirm::new()
+            .with_prompt(prompt)
+            .default(true)
+            .interact()
+        {
+            Ok(yes) => yes,
+            Err(e) => {
+                println!("   Rebase prompt cancelled: {e}");
+                false
+            }
+        }
+    };
+    if !proceed {
+        return false;
+    }
+
+    let r = sh3("git rebase origin/main").await;
+    if r.code == 0 {
+        println!("   ✅ Rebased on origin/main");
+        return true;
+    }
+    println!("⚠️  Rebase on origin/main failed:");
+    if !r.stdout.is_empty() {
+        println!("{}", r.stdout);
+    }
+    if !r.stderr.is_empty() {
+        println!("{}", r.stderr);
+    }
+    let _ = sh3("git rebase --abort").await;
+    false
+}
+
+async fn push(force: bool) -> (PushResult, ShResult) {
     println!("   Fetching remote...");
     let bg_fetch = sh_bg("git fetch");
 
@@ -318,17 +450,35 @@ async fn push(force: bool) -> PushResult {
 
     sh_wait(bg_fetch).await;
 
+    // One merge-tree probe drives both the rebase decision below and the
+    // prompt's "Merge Conflict Check" section (returned to the caller).
+    let bg_merge = sh_bg("git merge-tree --write-tree --name-only origin/main HEAD");
     let upstream = sh("git rev-parse --abbrev-ref @{upstream} 2>/dev/null").await;
+    let merge_probe = sh3_wait(bg_merge).await;
+
+    let rebased = maybe_rebase_on_main(upstream.is_some(), &merge_probe).await;
+    let force = force || rebased;
+    // After a successful rebase HEAD sits on top of origin/main, so the
+    // pre-rebase merge probe is stale. The new state is trivially clean.
+    let merge_probe = if rebased {
+        ShResult { code: 0, stdout: String::new(), stderr: String::new() }
+    } else {
+        merge_probe
+    };
+
     if upstream.is_none() {
         println!("   No upstream — pushing with -u...");
         let r = sh3("git push -u origin HEAD").await;
-        return PushResult {
-            branch,
-            strategy: "new",
-            code: r.code,
-            stdout: r.stdout,
-            stderr: r.stderr,
-        };
+        return (
+            PushResult {
+                branch,
+                strategy: "new",
+                code: r.code,
+                stdout: r.stdout,
+                stderr: r.stderr,
+            },
+            merge_probe,
+        );
     }
 
     let ab = sh("git rev-list --left-right --count HEAD...@{upstream}").await;
@@ -342,13 +492,16 @@ async fn push(force: bool) -> PushResult {
 
     if ahead == 0 && behind == 0 {
         println!("✅ Already up to date with remote.");
-        return PushResult {
-            branch,
-            strategy: "up-to-date",
-            code: 0,
-            stdout: "Already up to date".into(),
-            stderr: String::new(),
-        };
+        return (
+            PushResult {
+                branch,
+                strategy: "up-to-date",
+                code: 0,
+                stdout: "Already up to date".into(),
+                stderr: String::new(),
+            },
+            merge_probe,
+        );
     }
 
     let needs_force = behind > 0;
@@ -371,13 +524,16 @@ async fn push(force: bool) -> PushResult {
     let cmd = if needs_force { "git push --force-with-lease" } else { "git push" };
     println!("   {kind} ({label})...");
     let r = sh3(cmd).await;
-    PushResult {
-        branch,
-        strategy: if needs_force { "force-with-lease" } else { "fast-forward" },
-        code: r.code,
-        stdout: r.stdout,
-        stderr: r.stderr,
-    }
+    (
+        PushResult {
+            branch,
+            strategy: if needs_force { "force-with-lease" } else { "fast-forward" },
+            code: r.code,
+            stdout: r.stdout,
+            stderr: r.stderr,
+        },
+        merge_probe,
+    )
 }
 
 // ── Reviews ──────────────────────────────────────────────────────────────────
@@ -619,7 +775,16 @@ fn format_threads_xml(threads: &[GqlThread]) -> String {
     out
 }
 
-async fn collect_reviews(owner: &str, repo: &str, pr_number: &str) -> (Vec<TempFile>, bool) {
+struct PrCommentsBundle {
+    threads_xml: Option<String>,
+    /// Raw JSON from `gh api graphql`, kept only when XML parsing failed.
+    threads_raw_json: Option<String>,
+    reviews_xml: Option<String>,
+    meta: Option<String>,
+    has_unresolved: bool,
+}
+
+async fn fetch_pr_comments(owner: &str, repo: &str, pr_number: &str) -> PrCommentsBundle {
     let query_escaped = REVIEW_THREADS_QUERY.replace('\'', "'\\''");
     let bg_threads = sh_bg(&format!(
         "gh api graphql -f query='{query_escaped}' -f owner={owner} -f repo={repo} -F pr={pr_number}"
@@ -628,8 +793,13 @@ async fn collect_reviews(owner: &str, repo: &str, pr_number: &str) -> (Vec<TempF
         "gh pr view {pr_number} --json title,body,reviewDecision,reviews,reviewRequests"
     ));
 
-    let mut files = Vec::new();
-    let mut has_unresolved = false;
+    let mut bundle = PrCommentsBundle {
+        threads_xml: None,
+        threads_raw_json: None,
+        reviews_xml: None,
+        meta: None,
+        has_unresolved: false,
+    };
 
     let threads = sh3_wait(bg_threads).await;
     if !threads.stdout.is_empty() {
@@ -641,27 +811,101 @@ async fn collect_reviews(owner: &str, repo: &str, pr_number: &str) -> (Vec<TempF
                 .and_then(|p| p.review_threads)
                 .map(|t| t.nodes)
                 .unwrap_or_default();
-            has_unresolved = nodes.iter().any(|t| !t.is_resolved && !t.is_outdated);
+            bundle.has_unresolved = nodes.iter().any(|t| !t.is_resolved && !t.is_outdated);
             if !nodes.is_empty() {
-                files.push(section("review-threads", &format_threads_xml(&nodes)));
+                bundle.threads_xml = Some(format_threads_xml(&nodes));
             }
         } else {
-            // Fallback to raw JSON if parsing fails
-            files.push(section_json("review-threads", &threads.stdout));
+            bundle.threads_raw_json = Some(threads.stdout);
         }
     }
 
     let pr_view = sh3_wait(bg_pr_view).await;
     if !pr_view.stdout.is_empty() {
-        if let Some(formatted) = format_pr_reviews(&pr_view.stdout) {
-            files.push(section("review-pr", &formatted));
-        }
-        if let Some(meta) = format_pr_meta(&pr_view.stdout) {
-            files.push(section("pr-meta", &meta));
-        }
+        bundle.reviews_xml = format_pr_reviews(&pr_view.stdout);
+        bundle.meta = format_pr_meta(&pr_view.stdout);
     }
 
-    (files, has_unresolved)
+    bundle
+}
+
+async fn collect_reviews(owner: &str, repo: &str, pr_number: &str) -> (Vec<TempFile>, bool) {
+    let bundle = fetch_pr_comments(owner, repo, pr_number).await;
+    let mut files = Vec::new();
+    if let Some(xml) = &bundle.threads_xml {
+        files.push(section("review-threads", xml));
+    } else if let Some(raw) = &bundle.threads_raw_json {
+        files.push(section_json("review-threads", raw));
+    }
+    if let Some(xml) = &bundle.reviews_xml {
+        files.push(section("review-pr", xml));
+    }
+    if let Some(meta) = &bundle.meta {
+        files.push(section("pr-meta", meta));
+    }
+    (files, bundle.has_unresolved)
+}
+
+async fn pr_comments(pr_arg: Option<String>) {
+    let pr_number = match pr_arg {
+        Some(n) => n.trim().to_string(),
+        None => match sh("gh pr view --json number --jq '.number'").await {
+            Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+            _ => {
+                eprintln!("Failed to find a PR for the current branch.");
+                std::process::exit(1);
+            }
+        },
+    };
+    if pr_number.is_empty() || !pr_number.chars().all(|c| c.is_ascii_digit()) {
+        eprintln!("Invalid PR number: {pr_number:?}");
+        std::process::exit(1);
+    }
+
+    let url = match sh(&format!("gh pr view {pr_number} --json url --jq '.url'")).await {
+        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        _ => {
+            eprintln!("Failed to fetch PR URL for #{pr_number}.");
+            std::process::exit(1);
+        }
+    };
+    let parts: Vec<&str> = url.split('/').collect();
+    if parts.len() < 5 {
+        eprintln!("Unexpected PR URL: {url}");
+        std::process::exit(1);
+    }
+    let (owner, repo) = (parts[3], parts[4]);
+
+    let bundle = fetch_pr_comments(owner, repo, &pr_number).await;
+
+    let mut sections: Vec<(&str, String)> = Vec::new();
+    if let Some(meta) = bundle.meta {
+        sections.push(("pr-meta", meta));
+    }
+    if let Some(xml) = bundle.reviews_xml {
+        sections.push(("review-pr", xml));
+    }
+    if let Some(xml) = bundle.threads_xml {
+        sections.push(("review-threads", xml));
+    } else if let Some(raw) = bundle.threads_raw_json {
+        sections.push((
+            "review-threads (raw JSON — XML parse failed)",
+            raw,
+        ));
+    }
+
+    if sections.is_empty() {
+        eprintln!("No review threads, reviews, or metadata found for PR #{pr_number}.");
+        return;
+    }
+
+    for (i, (label, body)) in sections.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("<!-- {label} -->");
+        println!("{}", body.trim_end());
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1113,7 +1357,8 @@ async fn wait_for_ci(
     }
 
     println!("❌ CI failures detected");
-    let logs = collect_failure_logs(branch, &head_sha).await;
+    let _ = branch; // branch no longer needed; failure list comes from `gh pr checks --json`
+    let logs = collect_failure_logs(pr_number, &head_sha).await;
     CiWaitResult {
         ci_content,
         failures_content: Some(logs.content),
@@ -1143,33 +1388,279 @@ struct RunInfo {
     #[serde(rename = "databaseId")]
     database_id: u64,
     name: Option<String>,
+    #[allow(dead_code)]
     #[serde(rename = "headSha")]
     head_sha: Option<String>,
 }
 
-async fn collect_failure_logs(branch: &str, head_sha: &str) -> FailureLogs {
-    println!("   Collecting failure logs...");
-    let r = sh3(&format!(
-        "gh run list --branch {branch} --status failure --limit 10 \
-         --json databaseId,name,headSha"
-    ))
-    .await;
+/// One failing check, sourced from `gh pr checks --json`. Covers every provider
+/// surfaced as a commit status / check-run — GitHub Actions, Buildkite, Wiz,
+/// Spacelift, custom statuses — not just GHA workflow runs.
+#[derive(Deserialize, Debug, Clone)]
+struct PrCheck {
+    name: String,
+    /// `pass`, `fail`, `pending`, `skipping`.
+    bucket: String,
+    /// Empty string when GitHub provides no link (rare but observed).
+    #[serde(default)]
+    link: String,
+    /// Workflow filename (for GHA checks); empty for non-GHA providers.
+    #[allow(dead_code)]
+    #[serde(default)]
+    workflow: String,
+    #[serde(default)]
+    description: String,
+}
 
-    let runs: Vec<RunInfo> = parse_json(&r.stdout).unwrap_or_default();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckProvider {
+    GitHubActions,
+    Buildkite,
+    External,
+}
+
+fn classify_provider(link: &str) -> CheckProvider {
+    if link.contains("github.com/") && link.contains("/actions/runs/") {
+        CheckProvider::GitHubActions
+    } else if link.contains("buildkite.com/") {
+        CheckProvider::Buildkite
+    } else {
+        CheckProvider::External
+    }
+}
+
+/// `link` like `https://github.com/<owner>/<repo>/actions/runs/<run_id>[/job/<job_id>]`.
+/// Returns (run_id, optional job_id). Falls back to last numeric segment.
+fn parse_gha_link(link: &str) -> (u64, Option<u64>) {
+    let job = Regex::new(r"/job/(\d+)").unwrap()
+        .captures(link)
+        .and_then(|c| c.get(1)?.as_str().parse().ok());
+    let run = Regex::new(r"/actions/runs/(\d+)").unwrap()
+        .captures(link)
+        .and_then(|c| c.get(1)?.as_str().parse().ok())
+        .unwrap_or_else(|| run_id_from_url(link));
+    (run, job)
+}
+
+/// `link` like `https://buildkite.com/<org>/<pipeline>/builds/<n>`. Returns
+/// (org, pipeline, build_number) when parsable.
+fn parse_buildkite_link(link: &str) -> Option<(String, String, u64)> {
+    let re = Regex::new(r"buildkite\.com/([^/]+)/([^/]+)/builds/(\d+)").unwrap();
+    let c = re.captures(link)?;
+    Some((c.get(1)?.as_str().into(), c.get(2)?.as_str().into(), c.get(3)?.as_str().parse().ok()?))
+}
+
+async fn list_failed_checks(pr_number: &str) -> Vec<PrCheck> {
+    let r = sh3(&format!(
+        "gh pr checks {pr_number} --json name,bucket,link,workflow,description"
+    )).await;
+    let mut all: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
+    all.retain(|c| c.bucket == "fail" && !IGNORED_CHECKS.contains(&c.name.as_str()));
+    all
+}
+
+/// Fetch the failing job's log via `gh run view`. Prefer per-job mode when the
+/// check link points at a specific job; that avoids dumping every failing job
+/// in a workflow when only one is the target.
+async fn fetch_gha_log(check: &PrCheck) -> String {
+    let (run_id, job_id) = parse_gha_link(&check.link);
+    let cmd = match job_id {
+        Some(j) => format!("gh run view --job={j} --log-failed"),
+        None if run_id != 0 => format!("gh run view {run_id} --log-failed"),
+        _ => return String::new(),
+    };
+    let log = sh3(&cmd).await;
+    if !log.stdout.is_empty() { log.stdout } else { log.stderr }
+}
+
+/// Buildkite logs require `BUILDKITE_API_TOKEN`. Without one, surface the URL +
+/// any check-run output GitHub already stored, so the agent isn't left blind.
+async fn fetch_buildkite_log(check: &PrCheck, head_sha: &str) -> String {
+    let parsed = parse_buildkite_link(&check.link);
+    let token = std::env::var("BUILDKITE_API_TOKEN").ok().filter(|t| !t.is_empty());
+
+    if let (Some((org, pipeline, number)), Some(tok)) = (parsed.clone(), token) {
+        let api = format!(
+            "https://api.buildkite.com/v2/organizations/{org}/pipelines/{pipeline}/builds/{number}?include_retried_jobs=true"
+        );
+        let r = sh3(&format!(
+            "curl -sf -H 'Authorization: Bearer {tok}' {api:?}"
+        )).await;
+        if r.code == 0 && !r.stdout.is_empty() {
+            // Extract per-job logs for failing jobs.
+            let logs = extract_buildkite_failed_logs(&r.stdout, &tok).await;
+            if !logs.is_empty() {
+                return logs;
+            }
+        }
+    }
+
+    // Fallback: GitHub's check-run output for this name, plus the link.
+    let mut parts = Vec::new();
+    if let Some((_, _, number)) = parsed {
+        parts.push(format!("Buildkite build #{number}: {}", check.link));
+    } else {
+        parts.push(format!("Buildkite check: {}", check.link));
+    }
+    if !check.description.is_empty() {
+        parts.push(check.description.clone());
+    }
+    let cr = fetch_check_run_output(head_sha, &check.name).await;
+    if !cr.is_empty() {
+        parts.push(cr);
+    }
+    if std::env::var("BUILDKITE_API_TOKEN").ok().filter(|t| !t.is_empty()).is_none() {
+        parts.push(
+            "(Set BUILDKITE_API_TOKEN to fetch full Buildkite logs. \
+             Otherwise open the URL above.)".into(),
+        );
+    }
+    parts.join("\n")
+}
+
+#[derive(Deserialize)]
+struct BkBuild {
+    #[allow(dead_code)] number: u64,
+    jobs: Option<Vec<BkJob>>,
+}
+#[derive(Deserialize)]
+struct BkJob {
+    id: Option<String>,
+    name: Option<String>,
+    state: Option<String>,
+    exit_status: Option<i64>,
+    raw_log_url: Option<String>,
+}
+
+async fn extract_buildkite_failed_logs(build_json: &str, token: &str) -> String {
+    let build: BkBuild = match serde_json::from_str(build_json) {
+        Ok(b) => b,
+        Err(_) => return String::new(),
+    };
+    let mut out = Vec::new();
+    for j in build.jobs.into_iter().flatten() {
+        let failed = j.state.as_deref() == Some("failed")
+            || j.exit_status.map(|e| e != 0).unwrap_or(false);
+        if !failed { continue; }
+        let name = j.name.clone().unwrap_or_else(|| "unnamed".into());
+        let log = if let Some(url) = j.raw_log_url.as_ref() {
+            let r = sh3(&format!("curl -sf -H 'Authorization: Bearer {token}' {url:?}")).await;
+            if r.code == 0 { r.stdout } else { String::new() }
+        } else {
+            String::new()
+        };
+        let summary = extract_failure_summary(&log);
+        out.push(format!(
+            "### Buildkite job: {name} (id={})\nExit: {}\n```\n{}\n```\n",
+            j.id.unwrap_or_default(),
+            j.exit_status.map(|e| e.to_string()).unwrap_or_else(|| "?".into()),
+            if summary.is_empty() { truncate(&log, 4000).to_string() } else { summary },
+        ));
+    }
+    out.join("\n")
+}
+
+/// `gh api repos/.../check-runs` returns `output.title` / `output.summary` /
+/// `output.text` for many providers (Buildkite, Wiz, Spacelift). Use it as a
+/// fallback so the agent always gets *something* even when we can't fetch the
+/// provider's full log.
+async fn fetch_check_run_output(head_sha: &str, name: &str) -> String {
+    if head_sha.is_empty() { return String::new(); }
+    let r = sh3(&format!(
+        "gh api 'repos/{{owner}}/{{repo}}/commits/{head_sha}/check-runs?per_page=100' \
+         --jq '.check_runs[] | select(.name == \"{}\")'",
+        name.replace('"', "\\\"")
+    )).await;
+    if r.code != 0 || r.stdout.is_empty() { return String::new(); }
+    // Take the first check-run if there are multiple (retries).
+    let first_obj = r.stdout.split("\n}\n{").next().unwrap_or(&r.stdout);
+    let parsed: serde_json::Value = match serde_json::from_str(first_obj) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let mut parts = Vec::new();
+    for k in ["title", "summary", "text"] {
+        if let Some(s) = parsed.pointer(&format!("/output/{k}")).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                parts.push(format!("**{k}**: {}", truncate(s, 2000)));
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+async fn fetch_external_log(check: &PrCheck, head_sha: &str) -> String {
+    let mut parts = vec![format!("External check ({}): {}", classify_provider_label(&check.link), check.link)];
+    if !check.description.is_empty() {
+        parts.push(check.description.clone());
+    }
+    let cr = fetch_check_run_output(head_sha, &check.name).await;
+    if !cr.is_empty() { parts.push(cr); }
+    parts.join("\n")
+}
+
+fn classify_provider_label(link: &str) -> &'static str {
+    if link.contains("buildkite.com/") { "buildkite" }
+    else if link.contains("spacelift.io") { "spacelift" }
+    else if link.contains("wiz.io") { "wiz" }
+    else if link.contains("mintlify.com") { "mintlify" }
+    else if link.contains("depthfirst.com") { "depthfirst" }
+    else if link.contains("github.com") { "github" }
+    else { "unknown" }
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    if s.len() <= max { s }
+    else {
+        // Slice at a UTF-8 boundary.
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+        &s[..end]
+    }
+}
+
+/// Collect per-check failure logs across all providers. Replaces the old
+/// GHA-only run-list path. Falls back to a synthetic note for any check we
+/// can't fetch a real log for — never returns empty when there are failures.
+async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
+    println!("   Collecting failure logs...");
+    let failed = list_failed_checks(pr_number).await;
     let mut summaries = Vec::new();
     let mut full_logs = Vec::new();
     let mut names = Vec::new();
 
-    for run in runs.iter().filter(|r| r.head_sha.as_deref() == Some(head_sha)) {
-        let name = run.name.as_deref().unwrap_or("unknown");
-        let run_id = run.database_id;
-        names.push(name.to_string());
-        println!("      Fetching logs for run {run_id} ({name})...");
-        let log = sh3(&format!("gh run view {run_id} --log-failed")).await;
-        let log_text = if !log.stdout.is_empty() { &log.stdout } else { &log.stderr };
-        let summary = extract_failure_summary(log_text);
-        summaries.push(format!("### {name}\n```\n{summary}\n```"));
-        full_logs.push(format!("## Run {run_id} — {name}\n```\n{log_text}\n```"));
+    for check in &failed {
+        let provider = classify_provider(&check.link);
+        let provider_label = classify_provider_label(&check.link);
+        println!("      Fetching log for {} ({})...", check.name, provider_label);
+        let raw = match provider {
+            CheckProvider::GitHubActions => fetch_gha_log(check).await,
+            CheckProvider::Buildkite => fetch_buildkite_log(check, head_sha).await,
+            CheckProvider::External => fetch_external_log(check, head_sha).await,
+        };
+        names.push(check.name.clone());
+        let summary = if matches!(provider, CheckProvider::GitHubActions) {
+            extract_failure_summary(&raw)
+        } else {
+            // For non-GHA, the "raw" text is already a curated summary.
+            raw.clone()
+        };
+        let header = format!("### {} ({})", check.name, provider_label);
+        let link_line = if check.link.is_empty() { String::new() } else { format!("\nLink: {}", check.link) };
+        summaries.push(format!("{header}{link_line}\n```\n{}\n```",
+            if summary.trim().is_empty() { "(no extracted error lines)" } else { summary.trim() }));
+        if matches!(provider, CheckProvider::GitHubActions) && !raw.is_empty() {
+            let body = truncate(&raw, 16000);
+            full_logs.push(format!("## {} — full log\n```\n{}\n```", check.name, body));
+        }
+    }
+
+    if failed.is_empty() {
+        // Defensive: gh pr checks --json returned nothing failed but caller
+        // believed there were failures. Don't leave the file empty — point at
+        // the live `gh pr checks` output.
+        summaries.push("(no failing checks reported by `gh pr checks --json`; \
+                        run `push-and-check ci status` to investigate)".into());
     }
 
     FailureLogs {
@@ -1180,6 +1671,304 @@ async fn collect_failure_logs(branch: &str, head_sha: &str) -> FailureLogs {
         ),
         names,
     }
+}
+
+// ── CI subcommands ───────────────────────────────────────────────────────────
+
+async fn resolve_pr_number(pr: Option<String>) -> Option<String> {
+    if let Some(p) = pr { return Some(p); }
+    let s = sh("gh pr view --json number --jq '.number'").await?;
+    if s.is_empty() { None } else { Some(s) }
+}
+
+async fn ci_status_cmd(pr: Option<String>, all: bool) -> i32 {
+    let Some(pr_number) = resolve_pr_number(pr).await else {
+        eprintln!("No PR for current branch and --pr not supplied.");
+        return 2;
+    };
+    let r = sh3(&format!(
+        "gh pr checks {pr_number} --json name,bucket,link,workflow,description"
+    )).await;
+    let mut checks: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
+    // Dedup by name, keeping the highest-priority bucket: fail > pending > pass > skipping.
+    let priority = |b: &str| match b { "fail" => 3, "pending" => 2, "pass" => 1, _ => 0 };
+    checks.sort_by(|a, b| priority(&b.bucket).cmp(&priority(&a.bucket)));
+    let mut seen = std::collections::HashSet::new();
+    checks.retain(|c| seen.insert(c.name.clone()));
+    if !all {
+        checks.retain(|c| c.bucket == "fail" || c.bucket == "pending");
+    }
+    checks.sort_by(|a, b| (priority(&b.bucket), &a.name).cmp(&(priority(&a.bucket), &b.name)));
+
+    let mut failed = 0;
+    let mut pending = 0;
+    let mut passed_total = 0;
+    let mut skipped_total = 0;
+    // Always count totals from full set.
+    let all_checks: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
+    let mut by_name: HashMap<String, &PrCheck> = HashMap::new();
+    for c in &all_checks {
+        // Keep the highest-priority row per name.
+        let keep = by_name.get(&c.name).map(|p| priority(&c.bucket) > priority(&p.bucket)).unwrap_or(true);
+        if keep { by_name.insert(c.name.clone(), c); }
+    }
+    for c in by_name.values() {
+        match c.bucket.as_str() {
+            "fail" => failed += 1,
+            "pending" => pending += 1,
+            "pass" => passed_total += 1,
+            _ => skipped_total += 1,
+        }
+    }
+
+    println!("PR #{pr_number} — {} fail, {} pending, {} pass, {} skip",
+        failed, pending, passed_total, skipped_total);
+    for c in &checks {
+        let icon = match c.bucket.as_str() {
+            "fail" => "❌",
+            "pending" => "⏳",
+            "pass" => "✅",
+            _ => "⏭",
+        };
+        let provider = classify_provider_label(&c.link);
+        let link = if c.link.is_empty() { String::new() } else { format!("  {}", c.link) };
+        println!("{icon} [{provider:>10}] {}{link}", c.name);
+    }
+    if failed > 0 { 1 } else { 0 }
+}
+
+async fn ci_failures_cmd(pr: Option<String>, max_bytes: usize) -> i32 {
+    let Some(pr_number) = resolve_pr_number(pr).await else {
+        eprintln!("No PR for current branch and --pr not supplied.");
+        return 2;
+    };
+    let head_sha = sh("git rev-parse HEAD").await.unwrap_or_default();
+    let failed = list_failed_checks(&pr_number).await;
+    if failed.is_empty() {
+        println!("No failing checks for PR #{pr_number}.");
+        return 0;
+    }
+    println!("# Failing checks for PR #{pr_number} ({} total)\n", failed.len());
+    for check in &failed {
+        let provider = classify_provider(&check.link);
+        let provider_label = classify_provider_label(&check.link);
+        println!("## {} ({})", check.name, provider_label);
+        if !check.link.is_empty() { println!("Link: {}", check.link); }
+        let raw = match provider {
+            CheckProvider::GitHubActions => fetch_gha_log(check).await,
+            CheckProvider::Buildkite => fetch_buildkite_log(check, &head_sha).await,
+            CheckProvider::External => fetch_external_log(check, &head_sha).await,
+        };
+        let body = if matches!(provider, CheckProvider::GitHubActions) {
+            let s = extract_failure_summary(&raw);
+            if s.is_empty() {
+                truncate(&raw, max_bytes).to_string()
+            } else {
+                s
+            }
+        } else {
+            truncate(&raw, max_bytes).to_string()
+        };
+        if body.trim().is_empty() {
+            println!("(no extracted error lines)\n");
+        } else {
+            println!("```\n{}\n```\n", body.trim());
+        }
+    }
+    1
+}
+
+async fn ci_watch_cmd(pr: Option<String>) -> i32 {
+    let Some(pr_number) = resolve_pr_number(pr).await else {
+        eprintln!("No PR for current branch and --pr not supplied.");
+        return 2;
+    };
+    // Use --watch --fail-fast and retry on dropped connection up to 3 times.
+    let mut attempts = 0;
+    loop {
+        let r = sh3(&format!("gh pr checks {pr_number} --watch --fail-fast")).await;
+        attempts += 1;
+        // gh exits 0 when all pass, 8 when some fail (and shows final state).
+        // Treat any other exit (1, broken pipe, etc.) as a dropped connection.
+        if r.code == 0 || r.code == 8 || attempts >= 4 {
+            // Print final summary in the ci-status shape, regardless of exit code.
+            let _ = ci_status_cmd(Some(pr_number.clone()), false).await;
+            return if r.code == 0 { 0 } else { 1 };
+        }
+        eprintln!("gh watch exited {} (attempt {attempts}/4); reconnecting in 5s...", r.code);
+        sleep(std::time::Duration::from_secs(5)).await;
+    }
+}
+
+async fn ci_flaky_cmd(name: String, limit: usize) -> i32 {
+    let shas = sh(&format!("git log origin/main --format='%H' -{limit}"))
+        .await
+        .unwrap_or_default();
+    if shas.is_empty() {
+        eprintln!("Could not list commits on origin/main.");
+        return 2;
+    }
+    let mut pass = 0;
+    let mut fail = 0;
+    let mut skip = 0;
+    let mut other = 0;
+    let mut rows = Vec::new();
+    for sha in shas.lines() {
+        let r = sh(&format!(
+            "gh api 'repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100' \
+             --jq '.check_runs[] | select(.name == \"{}\") | \"\\(.conclusion // .status) \\(.html_url)\"' 2>/dev/null | head -1",
+            name.replace('"', "\\\"")
+        )).await.unwrap_or_default();
+        let mut parts = r.splitn(2, ' ');
+        let conclusion = parts.next().unwrap_or("").to_string();
+        let url = parts.next().unwrap_or("").trim().to_string();
+        let conclusion = if conclusion.is_empty() { "no-run".to_string() } else { conclusion };
+        match conclusion.as_str() {
+            "success" => pass += 1,
+            "failure" | "cancelled" | "timed_out" => fail += 1,
+            "skipped" | "neutral" => skip += 1,
+            "no-run" => skip += 1,
+            _ => other += 1,
+        }
+        rows.push(format!("{} {}{}", &sha[..7.min(sha.len())], conclusion, if url.is_empty() { String::new() } else { format!("  {url}") }));
+    }
+    println!("Check `{name}` on last {limit} commits of origin/main:");
+    println!("  ✅ {pass} pass    ❌ {fail} fail    ⏭ {skip} skip/none    ? {other} other\n");
+    for row in &rows { println!("{row}"); }
+    let verdict = if pass + fail == 0 {
+        "No data — this check doesn't run on main commits. Compare against other PRs instead."
+    } else if fail == 0 {
+        "Consistently passing on main — failure is likely caused by this PR."
+    } else if pass == 0 {
+        "Consistently failing on main — pre-existing issue, do not fix in this PR without confirmation."
+    } else {
+        "Mixed pass/fail on main — likely flaky. Consider rerunning."
+    };
+    println!("\nVerdict: {verdict}");
+    0
+}
+
+#[derive(Deserialize)]
+struct GhRun {
+    #[serde(rename = "databaseId")]
+    database_id: u64,
+    name: String,
+    #[serde(rename = "headSha")]
+    head_sha: String,
+    conclusion: Option<String>,
+    status: String,
+    attempt: u64,
+    #[serde(rename = "createdAt")]
+    created_at: String,
+}
+
+async fn ci_retries_cmd(pr: Option<String>) -> i32 {
+    let Some(pr_number) = resolve_pr_number(pr).await else {
+        eprintln!("No PR for current branch and --pr not supplied.");
+        return 2;
+    };
+    let head_sha = sh(&format!(
+        "gh pr view {pr_number} --json headRefOid --jq '.headRefOid'"
+    )).await.unwrap_or_default();
+    let branch = sh(&format!(
+        "gh pr view {pr_number} --json headRefName --jq '.headRefName'"
+    )).await.unwrap_or_default();
+    if branch.is_empty() {
+        eprintln!("Could not determine PR head branch.");
+        return 2;
+    }
+    let r = sh3(&format!(
+        "gh run list --branch {branch} --limit 50 \
+         --json databaseId,name,headSha,conclusion,status,attempt,createdAt"
+    )).await;
+    let mut runs: Vec<GhRun> = parse_json(&r.stdout).unwrap_or_default();
+    runs.retain(|r| r.head_sha == head_sha);
+
+    println!("# Workflow runs for PR #{pr_number} (head {})",
+        &head_sha[..7.min(head_sha.len())]);
+    if runs.is_empty() {
+        println!("(no GitHub Actions runs found for this head SHA)");
+        return 0;
+    }
+
+    fn short_time(iso: &str) -> String {
+        // "2026-05-25T09:25:18Z" -> "05-25 09:25"
+        let mut chars = iso.chars();
+        let date: String = chars.by_ref().skip(5).take(5).collect(); // "MM-DD"
+        let _ = chars.next(); // 'T'
+        let time: String = chars.take(5).collect(); // "HH:MM"
+        format!("{date} {time}")
+    }
+    fn result_str(r: &GhRun) -> String {
+        r.conclusion.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| r.status.clone())
+    }
+
+    // Sort: retried runs (attempt > 1) first, then by name, then by createdAt desc.
+    runs.sort_by(|a, b| {
+        b.attempt.cmp(&a.attempt)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| b.created_at.cmp(&a.created_at))
+    });
+
+    let name_w = runs.iter().map(|r| r.name.len()).max().unwrap_or(4).min(50);
+    let result_w = runs.iter().map(|r| result_str(r).len()).max().unwrap_or(7);
+
+    println!("{:<name_w$}  {:>3}  {:<result_w$}  {:<11}  {}",
+        "NAME", "ATT", "RESULT", "TIME", "RUN_ID");
+    for r in &runs {
+        let marker = if r.attempt > 1 { " ← retried" } else { "" };
+        println!("{:<name_w$}  {:>3}  {:<result_w$}  {:<11}  {}{}",
+            r.name, r.attempt, result_str(r), short_time(&r.created_at),
+            r.database_id, marker);
+    }
+
+    let retried = runs.iter().filter(|r| r.attempt > 1).count();
+    if retried > 0 {
+        println!("\n{retried} run(s) retried (attempt > 1). Avoid rerunning these without asking the user.");
+    }
+    0
+}
+
+async fn ci_rerun_cmd(name: String, pr: Option<String>) -> i32 {
+    let Some(pr_number) = resolve_pr_number(pr).await else {
+        eprintln!("No PR for current branch and --pr not supplied.");
+        return 2;
+    };
+    let head_sha = sh(&format!(
+        "gh pr view {pr_number} --json headRefOid --jq '.headRefOid'"
+    )).await.unwrap_or_default();
+    let branch = sh(&format!(
+        "gh pr view {pr_number} --json headRefName --jq '.headRefName'"
+    )).await.unwrap_or_default();
+    // Match by check name → GHA run ID. We need to look up the workflow file
+    // for the failing job, not the job ID, since rerun --failed acts on a run.
+    let runs_json = sh3(&format!(
+        "gh run list --branch {branch} --limit 50 \
+         --json databaseId,name,headSha,conclusion \
+         --jq '[.[] | select(.headSha == \"{head_sha}\" and .conclusion == \"failure\")]'"
+    )).await;
+    let runs: Vec<RunInfo> = parse_json(&runs_json.stdout).unwrap_or_default();
+    if runs.is_empty() {
+        eprintln!("No failing GHA runs for {name} on head {head_sha}. \
+                   (Non-GHA checks like Buildkite cannot be rerun via this command.)");
+        return 2;
+    }
+    // Try exact match first, then prefix.
+    let target = runs.iter().find(|r| r.name.as_deref() == Some(name.as_str()))
+        .or_else(|| runs.iter().find(|r| r.name.as_deref().map(|n| n.contains(&name)).unwrap_or(false)));
+    let Some(run) = target else {
+        eprintln!("No failing run named `{name}`. Failing runs:");
+        for r in &runs { eprintln!("  - {}", r.name.as_deref().unwrap_or("?")); }
+        return 2;
+    };
+    println!("Re-running failed jobs in {} (run {})...", run.name.as_deref().unwrap_or("?"), run.database_id);
+    let r = sh3(&format!("gh run rerun {} --failed", run.database_id)).await;
+    if !r.stdout.is_empty() { println!("{}", r.stdout); }
+    if r.code != 0 {
+        eprintln!("{}", r.stderr);
+        return r.code;
+    }
+    0
 }
 
 // ── Merge conflict check ─────────────────────────────────────────────────────
@@ -1220,19 +2009,38 @@ struct PrData {
     is_draft: bool,
 }
 
-async fn find_or_create_pr(bg_pr: Child, branch_commits: &Option<String>) -> PrInfo {
+async fn lookup_existing_pr(bg_pr: Child) -> Option<PrInfo> {
     let pr_data: Option<PrData> = sh_wait(bg_pr).await.and_then(|s| parse_json(&s));
-
-    if let Some(pr) = pr_data {
+    pr_data.map(|pr| {
         println!("🔗 {}", pr.url);
-        return PrInfo {
+        PrInfo {
             number: Some(pr.number.to_string()),
             url: Some(pr.url),
             is_draft: pr.is_draft,
-        };
-    }
+        }
+    })
+}
 
-    println!("   No PR found — creating draft PR...");
+/// Block SIGCHLD on the current thread for the duration of `f`. Tokio's I/O
+/// driver runs on a separate thread, so the kernel still gets to reap children
+/// via that thread — we just stop SIGCHLD from interrupting our blocking
+/// `read(2)` inside dialoguer (which surfaces as EINTR → user-cancelled).
+fn with_sigchld_blocked<T>(f: impl FnOnce() -> T) -> T {
+    let mut new_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    let mut old_set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut new_set);
+        libc::sigaddset(&mut new_set, libc::SIGCHLD);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &new_set, &mut old_set);
+    }
+    let out = f();
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, &old_set, std::ptr::null_mut());
+    }
+    out
+}
+
+fn prompt_pr_title(branch_commits: &Option<String>) -> Option<String> {
     let commit_subjects: Vec<String> = branch_commits
         .as_deref()
         .unwrap_or("")
@@ -1246,26 +2054,29 @@ async fn find_or_create_pr(bg_pr: Child, branch_commits: &Option<String>) -> PrI
         }
     }
 
-    // Prompt for title — show the single-commit subject as a greyed default,
-    // but never auto-fill the body from the commit message.
+    // Show the single-commit subject as a greyed default, but never auto-fill
+    // the body from the commit message.
     let mut input = dialoguer::Input::<String>::new().with_prompt("Title");
     if commit_subjects.len() == 1 {
         input = input.default(commit_subjects[0].clone());
     }
-    let title = match input.interact_text() {
+    let title = match with_sigchld_blocked(|| input.interact_text()) {
         Ok(t) => t.trim().to_string(),
         Err(e) => {
             println!("⚠️  Title prompt cancelled: {e}");
-            return PrInfo { number: None, url: None, is_draft: false };
+            return None;
         }
     };
     if title.is_empty() {
         println!("⚠️  Empty title — aborting PR creation.");
-        return PrInfo { number: None, url: None, is_draft: false };
+        return None;
     }
+    Some(title)
+}
 
+async fn create_pr_with_title(title: &str) -> PrInfo {
     let rc = std::process::Command::new("gh")
-        .args(["pr", "create", "--draft", "--title", &title, "--body", ""])
+        .args(["pr", "create", "--draft", "--title", title, "--body", ""])
         .status()
         .map(|s| s.code().unwrap_or(1))
         .unwrap_or(1);
@@ -2036,12 +2847,12 @@ struct ClaudeInvocation {
 }
 
 async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
-    let push_result = push(force).await;
+    let (push_result, merge_probe) = push(force).await;
     if push_result.code != 0 {
         println!("⚠️  Push had issues: {}", push_result.stderr);
     }
 
-    let graphite_handle = tokio::spawn(build_graphite_info());
+    let mut graphite_handle = Some(tokio::spawn(build_graphite_info()));
 
     let base_ref = pr_base_ref().await;
     if base_ref != "origin/main" {
@@ -2052,7 +2863,7 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
     // Run area analysis in parallel with PR/CI checks
     let branch_commits_clone = branch_commits.clone();
     let base_ref_clone = base_ref.clone();
-    let areas_handle = tokio::spawn(async move {
+    let mut areas_handle = Some(tokio::spawn(async move {
         let changed_files = get_changed_files(&base_ref_clone).await;
         let relevant_changed_files = filter_relevant_files(&changed_files);
         let diff_files_str = write_diff_files(&relevant_changed_files, &base_ref_clone).await;
@@ -2060,21 +2871,44 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
 
         let pr_areas = analyze_pr_areas(&diff_files_str, &ctx.changed_files, &ctx.pr_commits).await;
         (pr_areas, diff_files_str, ctx)
-    });
+    }));
 
-    // Launch independent checks in parallel
+    // Launch independent checks in parallel. The merge-tree probe was
+    // already run inside push() (it drives the rebase decision); reuse it.
     let bg_status = sh_bg("git status -b --porcelain=v2");
-    let bg_merge = sh_bg("git merge-tree --write-tree --name-only origin/main HEAD");
     let bg_pr = sh_bg("gh pr view --json number,url,isDraft 2>/dev/null");
 
     let git_status = sh_wait(bg_status).await.unwrap_or_default();
     let push_content = build_push_content(&push_result, &git_status);
     let mut files = vec![section("push", &push_content)];
 
-    let merge = build_merge_content(sh3_wait(bg_merge).await).await;
+    let merge = build_merge_content(merge_probe).await;
     files.push(section("merge", &merge.content));
 
-    let pr_info = find_or_create_pr(bg_pr, &branch_commits).await;
+    let mut pre_areas: Option<(Option<serde_json::Value>, String, ContextStrings)> = None;
+    let mut pre_graphite: Option<Option<GraphiteInfo>> = None;
+    let pr_info = if let Some(pr) = lookup_existing_pr(bg_pr).await {
+        pr
+    } else {
+        println!("   No PR found — creating draft PR...");
+        // Prompt for the title first so the user isn't blocked by the
+        // subagent. `prompt_pr_title` masks SIGCHLD on the prompt thread so
+        // a background child exiting won't interrupt dialoguer's read(2).
+        let title = prompt_pr_title(&branch_commits);
+        // Drain the subagent and graphite handles after the prompt; the
+        // results are needed by the rest of build_claude_invocation either
+        // way, and waiting now keeps the later `pre_*` paths tidy.
+        if let Some(h) = areas_handle.take() {
+            pre_areas = h.await.ok();
+        }
+        if let Some(h) = graphite_handle.take() {
+            pre_graphite = Some(h.await.ok().flatten());
+        }
+        match title {
+            Some(t) => create_pr_with_title(&t).await,
+            None => PrInfo { number: None, url: None, is_draft: false },
+        }
+    };
 
     let mut skip_ci = None;
     let mut failed_names = Vec::new();
@@ -2099,7 +2933,10 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
     };
 
     println!("   Analyzing PR areas...");
-    let (pr_areas, diff_files_str, ctx) = areas_handle.await.unwrap();
+    let (pr_areas, diff_files_str, ctx) = match pre_areas {
+        Some(v) => v,
+        None => areas_handle.take().unwrap().await.unwrap(),
+    };
     let pr_areas_str = pr_areas
         .as_ref()
         .map(|v| {
@@ -2110,7 +2947,10 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
         })
         .unwrap_or_default();
 
-    let graphite_info = graphite_handle.await.ok().flatten();
+    let graphite_info = match pre_graphite {
+        Some(v) => v,
+        None => graphite_handle.take().unwrap().await.ok().flatten(),
+    };
     if graphite_info.is_some() {
         println!("   Graphite stack detected — including stack workflow + per-PR CI status.");
     }
@@ -2182,6 +3022,20 @@ async fn main() {
             },
             CliCommand::Pr { command: PrCommand::Description { body } } => {
                 pr_set_description(&body).await;
+            }
+            CliCommand::Pr { command: PrCommand::Comments { pr } } => {
+                pr_comments(pr).await;
+            }
+            CliCommand::Ci { command } => {
+                let code = match command {
+                    CiCommand::Status { all, pr } => ci_status_cmd(pr, all).await,
+                    CiCommand::Failures { pr, max_bytes } => ci_failures_cmd(pr, max_bytes).await,
+                    CiCommand::Watch { pr } => ci_watch_cmd(pr).await,
+                    CiCommand::Flaky { name, limit } => ci_flaky_cmd(name, limit).await,
+                    CiCommand::Retries { pr } => ci_retries_cmd(pr).await,
+                    CiCommand::Rerun { name, pr } => ci_rerun_cmd(name, pr).await,
+                };
+                std::process::exit(code);
             }
             CliCommand::Prompt => {
                 let invocation = build_claude_invocation(cli.force).await;
