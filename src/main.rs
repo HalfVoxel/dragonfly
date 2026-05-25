@@ -423,7 +423,7 @@ async fn maybe_rebase_on_main(has_upstream: bool, merge_probe: &ShResult) -> boo
 
     let r = sh3("git rebase origin/main").await;
     if r.code == 0 {
-        println!("   ✅ Rebased on origin/main");
+        println!("✅ Rebased on origin/main");
         return true;
     }
     println!("⚠️  Rebase on origin/main failed:");
@@ -1190,7 +1190,7 @@ fn format_ci_status(counts: &CheckCounts, ci_start: f64, local_running: usize) -
             parts.push(format!("{local_running} local"));
         }
         status += &format!("  ⏳ {}", parts.join(" + "));
-        if !counts.pending_names.is_empty() {
+        if !counts.pending_names.is_empty() && counts.pending_names.len() <= 2 {
             status += &format!(" ({})", counts.pending_names.join(", "));
         }
     }
