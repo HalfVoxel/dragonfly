@@ -1,0 +1,56 @@
+{
+  "env": {
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+    "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+    "ENABLE_CLAUDEAI_MCP_SERVERS": "false"
+  },
+  "deniedMcpServers": [
+    { "serverName": "linear" },
+    { "serverName": "figma" },
+    { "serverName": "who-is-everyone" },
+    { "serverName": "playwright" },
+    { "serverName": "sentry" },
+    { "serverName": "lovable-shipped" },
+    { "serverName": "lovable-kit" }
+  ],
+  "permissions": {
+    "allow": [
+      "Bash(git:*)",
+      "Bash(gh:*)",
+      "Bash(direnv*)",
+      "Bash(lint*)",
+      "Bash(format:*)",
+      "Bash(test*)",
+      "Bash(push-and-check:*)",
+      "Bash(process-compose*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(find:*)",
+      "Bash(jq:*)",
+      "Read",
+      "Grep",
+      "Glob",
+      "Edit",
+      "Write",
+      "Agent",
+      "AskUserQuestion"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__DRAGONFLY_HOOKS__/git-guard.py"
+          },
+          {
+            "type": "command",
+            "command": "__DRAGONFLY_HOOKS__/ci-guard.py"
+          }
+        ]
+      }
+    ]
+  }
+}

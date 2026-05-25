@@ -2682,14 +2682,29 @@ fn graphite_section(info: &GraphiteInfo) -> String {
 
 // ── Prompt building ──────────────────────────────────────────────────────────
 
-const PUSH_AND_FIX_SETTINGS: &str = "~/cloud/Programming/claude-code/push-and-check-settings.json";
+// Settings JSON + Bash PreToolUse hooks are bundled with the binary. The
+// template's hook commands use `__DRAGONFLY_HOOKS__` as a placeholder we
+// substitute with the absolute hooks dir at runtime, so the file passed to
+// `claude --settings ...` always points at the hooks shipped alongside this
+// build of push-and-check.
+const PUSH_AND_FIX_SETTINGS_TEMPLATE: &str =
+    include_str!("../settings/push-and-check-settings.json");
+const DRAGONFLY_HOOKS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/hooks");
 
 const GRAFANA_DASHBOARDS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/grafana_dashboards.md");
 const DOTENV_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/.env");
 
 fn push_and_fix_settings_expanded() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PUSH_AND_FIX_SETTINGS.replacen('~', &home, 1)
+    let body = PUSH_AND_FIX_SETTINGS_TEMPLATE.replace("__DRAGONFLY_HOOKS__", DRAGONFLY_HOOKS_DIR);
+    let f = tempfile::Builder::new()
+        .prefix("push-and-check-settings-")
+        .suffix(".json")
+        .tempfile_in("/tmp")
+        .expect("failed to create settings tempfile");
+    let (mut file, path) = f.keep().expect("failed to persist settings tempfile");
+    file.write_all(body.as_bytes())
+        .expect("failed to write settings tempfile");
+    path.to_string_lossy().into_owned()
 }
 
 fn load_dotenv() -> Vec<(String, String)> {
