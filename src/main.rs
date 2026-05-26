@@ -107,8 +107,10 @@ enum CiCommand {
         pr: Option<String>,
     },
     /// For each failed check (GitHub Actions, Buildkite, Spacelift, Wiz, …), print
-    /// a per-check section with extracted error lines, then the link. Full logs are
-    /// saved to /tmp/ when available.
+    /// a per-check section with extracted error lines, then the link. Output is
+    /// piped through an LLM (claude --model haiku) to distill into a terse summary
+    /// when the raw dump is non-trivial (>=1000 bytes); the full untruncated log is
+    /// saved to /tmp/psc-ci-failures-full-*.md and referenced in the footer.
     Failures {
         /// Explicit PR number. Defaults to the current branch's PR.
         #[arg(long)]
@@ -116,6 +118,9 @@ enum CiCommand {
         /// Maximum bytes of full log per check (default 8000).
         #[arg(long, default_value = "8000")]
         max_bytes: usize,
+        /// Skip the LLM distill step; print the raw per-check dump.
+        #[arg(long)]
+        raw: bool,
     },
     /// Wrap `gh pr checks --watch --fail-fast` with auto-reconnect; print a single
     /// final summary (same shape as `ci status`).
@@ -147,6 +152,13 @@ enum CiCommand {
         /// Explicit PR number. Defaults to the current branch's PR.
         #[arg(long)]
         pr: Option<String>,
+    },
+    /// Run an existing failure-log file through the haiku distiller and print
+    /// the summary. Useful for benchmarking the distill prompt against cached
+    /// `/tmp/psc-failures-*.md` files without needing a live PR.
+    Distill {
+        /// Path to a failure-log markdown file (e.g. /tmp/psc-failures-XXXX.md).
+        file: PathBuf,
     },
 }
 
@@ -196,6 +208,7 @@ struct CiResult {
 struct CiWaitResult {
     ci_content: String,
     failures_content: Option<String>,
+    failures_full_file: Option<TempFile>,
     failed_names: Vec<String>,
     lint_files: Vec<TempFile>,
 }
@@ -203,6 +216,9 @@ struct CiWaitResult {
 struct FailureLogs {
     content: String,
     names: Vec<String>,
+    /// Set when `content` is an LLM-distilled summary; points at the
+    /// untruncated raw log on disk so the agent can drill in if needed.
+    full_file: Option<TempFile>,
 }
 
 struct LintResult {
@@ -1341,6 +1357,7 @@ async fn wait_for_ci(
         return CiWaitResult {
             ci_content,
             failures_content: None,
+            failures_full_file: None,
             failed_names: vec![],
             lint_files,
         };
@@ -1351,6 +1368,7 @@ async fn wait_for_ci(
         return CiWaitResult {
             ci_content,
             failures_content: None,
+            failures_full_file: None,
             failed_names: vec![],
             lint_files,
         };
@@ -1362,6 +1380,7 @@ async fn wait_for_ci(
     CiWaitResult {
         ci_content,
         failures_content: Some(logs.content),
+        failures_full_file: logs.full_file,
         failed_names: logs.names,
         lint_files,
     }
@@ -1381,6 +1400,131 @@ fn extract_failure_summary(log: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+const DISTILL_INSTRUCTIONS: &str = r#"You are given CI failure logs collected from a GitHub PR. Extract the most relevant information so a developer can quickly understand what failed and why.
+
+# Output rules
+
+- Find the error(s) and the most relevant context and output them verbatim with light summarization to skip irrelevant details.
+- Output markdown. Do NOT output JSON. Do NOT wrap your output in a fenced code block.
+- Open with a one-line headline naming the error. If failures fall into multiple distinct buckets, list each bucket on its own line.
+- Distinguish infrastructure failures (runner outages, network issues) from PR-introduced failures (compile errors, failing tests, lint, type errors).
+- Group similar failures across checks. Example: "5 cases: use slices.Sort instead of manual sort (go modernization lint)".
+- For each unique failure bucket, include the exact error line that pinpoints the problem. Strip timestamps, runner names, and any boilerplate. Just the error itself.
+- If a check has a real PR-introduced failure (e.g. type errors, failing tests), list each distinct error once with file:line:col when available.
+- DO NOT write a root cause analysis or remediation advice. NO sentences like "Fix the code above", "Remove the unused field", "Suggested next steps", "Check your network", or any "this means / this is because" inference. Just surface the raw failure lines verbatim and stop. The developer will decide what to do.
+- If a test failed across multiple re-runs, surface EVERY distinct FAIL line (one per attempt) and the final summary line (e.g. `2 runs, 32693 tests, 198 skipped, 2 failures`). Don't show only the first attempt.
+- Some checks are pure aggregators of other checks (names ending in `-result`, or whose only failure line is `echo "X failed"` / `Process completed with exit code 1`). Label these as `(aggregator of: X, Y)` and don't repeat the underlying errors — they're already covered by the upstream check.
+- Drop "Set up job", "Prepare workflow", "Download action repository", and other setup noise unless it IS the failure.
+- Keep total output under ~60 lines. Be concise. The developer has access to the full log if they really need it.
+
+# Example
+
+## Good
+
+'''
+## Infrastructure: GitHub Actions download failures (codeload.github.com)
+- 11 checks: Failed to download `actions/checkout@v4` (codeload.github.com)
+- 2 checks: Failed to download `docker/setup-qemu-action@v3` (codeload.github.com)
+
+All checks fail with a similar error:
+```
+An action could not be found at the URI 'https://codeload.github.com/[action]/tar.gz/[hash]'
+Failed to download archive after 1 attempts.
+```
+
+Affected jobs: test-firestore, Build & Deploy Preview, label-pr
+'''
+
+## Bad
+
+'''
+## GitHub Actions download failures (codeload.github.com)
+
+Root cause: check your internet connection. The URL 'https://codeload.github.com/[action]/tar.gz/[hash]' cannot be downloaded.
+
+Suggested next steps: check network connectivity using ping.
+'''
+
+## Also bad (remediation drift — forbidden)
+
+'''
+## Go linting failures (unused code)
+
+go/api/integrations/security/tools/integration.go:28:6: type securityDeps is unused (unused)
+go/api/integrations/security/tools/integration.go:35:2: field deps is unused (unused)
+
+Affected jobs: lint-go, lint-go-result (aggregator of: lint-go)
+
+Result: Fix the code issues above and remove the unused type, then the lint checks will pass.
+'''
+
+The "Result:" sentence is exactly what to AVOID — just stop after the error lines and affected-jobs list.
+"#;
+
+/// Hardcoded fallback so push-and-check picks up lovable's `kit` even when
+/// it isn't on PATH. PATH lookup is still tried first so the user can override.
+const KIT_FALLBACK_PATH: &str = "/Users/arong/projects/lovable/lovable/bin/kit";
+
+/// Call `kit llm` with a system prompt and a file containing the user
+/// content. Tries `kit` on PATH first, then `KIT_FALLBACK_PATH`. Returns
+/// `None` on spawn failure / nonzero exit / empty output.
+///
+/// Same-model benchmark showed kit's transport is 2-6x faster than the
+/// claude CLI (claude --print has 15-35s of startup overhead even when
+/// nothing else is happening); kit pays ~1s flat. Quality is identical
+/// for `--print`-style runs that don't need tool use.
+async fn call_kit_llm(
+    model: &str,
+    system_prompt: &str,
+    content_file: &std::path::Path,
+) -> Option<String> {
+    let path_str = content_file.to_string_lossy();
+    for bin in ["kit", KIT_FALLBACK_PATH] {
+        let result = Command::new(bin)
+            .args([
+                "llm",
+                "--model", model,
+                "--system", system_prompt,
+                "--file", &path_str,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await;
+        let Ok(out) = result else { continue };
+        if !out.status.success() { continue; }
+        let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if body.is_empty() { continue; }
+        return Some(body);
+    }
+    None
+}
+
+/// Pipe a full failure-log dump through kit + Haiku 4.5 and return a
+/// terse, deduped markdown summary. Skips the LLM entirely for inputs
+/// under 5 KB. Returns `None` on invocation failure so callers can fall
+/// back to the raw content.
+///
+/// The full untruncated log lives on disk at `full_log_path`; a footer
+/// pointing back at it is appended below.
+async fn distill_failure_logs(raw: &str, full_log_path: &std::path::Path) -> Option<String> {
+    if raw.len() < 5000 {
+        return None;
+    }
+    let mut output = call_kit_llm(
+        "anthropic/claude-haiku-4-5",
+        DISTILL_INSTRUCTIONS,
+        full_log_path,
+    ).await?;
+    output.push_str(&format!(
+        "\n\nFull untruncated log ({} bytes): {}\n",
+        raw.len(),
+        full_log_path.display()
+    ));
+    Some(output)
 }
 
 #[derive(Deserialize)]
@@ -1646,6 +1790,7 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
             CheckProvider::Buildkite => fetch_buildkite_log(check, head_sha).await,
             CheckProvider::External => fetch_external_log(check, head_sha).await,
         };
+        let raw = strip_ansi(&raw);
         names.push(check.name.clone());
         let summary = if matches!(provider, CheckProvider::GitHubActions) {
             extract_failure_summary(&raw)
@@ -1671,14 +1816,35 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
                         run `push-and-check ci status` to investigate)".into());
     }
 
-    FailureLogs {
-        content: format!(
-            "# CI Failure Logs\n\n## Error Summary\n\n{}\n\n---\n\n# Full Logs\n\n{}\n",
-            summaries.join("\n\n"),
-            full_logs.join("\n\n"),
-        ),
-        names,
+    let raw_content = format!(
+        "# CI Failure Logs\n\n## Error Summary\n\n{}\n\n---\n\n# Full Logs\n\n{}\n",
+        summaries.join("\n\n"),
+        full_logs.join("\n\n"),
+    );
+
+    // For non-trivial logs, pipe through haiku and replace the bulk dump
+    // with a distilled summary that points at the full log on disk.
+    if raw_content.len() >= 1000 {
+        let full_file = section("failures-full", &raw_content);
+        println!("   Distilling failure logs ({} bytes) via LLM...", raw_content.len());
+        let distill_start = std::time::Instant::now();
+        match distill_failure_logs(&raw_content, &full_file.path).await {
+            Some(distilled) => {
+                println!(
+                    "   Distilled in {:.1}s ({} bytes → {} bytes).",
+                    distill_start.elapsed().as_secs_f64(),
+                    raw_content.len(),
+                    distilled.len(),
+                );
+                return FailureLogs { content: distilled, names, full_file: Some(full_file) };
+            }
+            None => {
+                println!("   Distill failed; falling back to raw failure logs.");
+            }
+        }
     }
+
+    FailureLogs { content: raw_content, names, full_file: None }
 }
 
 // ── CI subcommands ───────────────────────────────────────────────────────────
@@ -1752,7 +1918,7 @@ async fn ci_status_cmd(pr: Option<String>, all: bool) -> i32 {
     if failed > 0 { 1 } else { 0 }
 }
 
-async fn ci_failures_cmd(pr: Option<String>, max_bytes: usize) -> i32 {
+async fn ci_failures_cmd(pr: Option<String>, max_bytes: usize, raw_only: bool) -> i32 {
     let Some(pr_number) = resolve_pr_number(pr).await else {
         eprintln!("No PR for current branch and --pr not supplied.");
         return 2;
@@ -1763,12 +1929,16 @@ async fn ci_failures_cmd(pr: Option<String>, max_bytes: usize) -> i32 {
         println!("No failing checks for PR #{pr_number}.");
         return 0;
     }
-    println!("# Failing checks for PR #{pr_number} ({} total)\n", failed.len());
+
+    // Build the full per-check dump into a buffer so we can optionally
+    // pipe it through the distiller before printing.
+    let mut buf = String::new();
+    buf.push_str(&format!("# Failing checks for PR #{pr_number} ({} total)\n\n", failed.len()));
     for check in &failed {
         let provider = classify_provider(&check.link);
         let provider_label = classify_provider_label(&check.link);
-        println!("## {} ({})", check.name, provider_label);
-        if !check.link.is_empty() { println!("Link: {}", check.link); }
+        buf.push_str(&format!("## {} ({})\n", check.name, provider_label));
+        if !check.link.is_empty() { buf.push_str(&format!("Link: {}\n", check.link)); }
         let raw = match provider {
             CheckProvider::GitHubActions => fetch_gha_log(check).await,
             CheckProvider::Buildkite => fetch_buildkite_log(check, &head_sha).await,
@@ -1786,9 +1956,33 @@ async fn ci_failures_cmd(pr: Option<String>, max_bytes: usize) -> i32 {
             truncate(&raw, max_bytes).to_string()
         };
         if body.trim().is_empty() {
-            println!("(no extracted error lines)\n");
+            buf.push_str("(no extracted error lines)\n\n");
         } else {
-            println!("```\n{}\n```\n", body.trim());
+            buf.push_str(&format!("```\n{}\n```\n\n", body.trim()));
+        }
+    }
+
+    if raw_only || buf.len() < 1000 {
+        print!("{buf}");
+        return 1;
+    }
+
+    let full_file = section("ci-failures-full", &buf);
+    eprintln!("   Distilling failure logs ({} bytes) via LLM...", buf.len());
+    let start = std::time::Instant::now();
+    match distill_failure_logs(&buf, &full_file.path).await {
+        Some(distilled) => {
+            eprintln!(
+                "   Distilled in {:.1}s ({} bytes → {} bytes).",
+                start.elapsed().as_secs_f64(),
+                buf.len(),
+                distilled.len(),
+            );
+            println!("{distilled}");
+        }
+        None => {
+            eprintln!("   Distill failed; falling back to raw failure logs.");
+            print!("{buf}");
         }
     }
     1
@@ -1988,6 +2182,39 @@ async fn ci_rerun_cmd(name: String, pr: Option<String>) -> i32 {
         return r.code;
     }
     0
+}
+
+async fn ci_distill_cmd(file: PathBuf) -> i32 {
+    let raw = match std::fs::read_to_string(&file) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Failed to read {}: {e}", file.display());
+            return 2;
+        }
+    };
+    if raw.len() < 1000 {
+        eprintln!("Input is only {} bytes; distill skipped (raw printed as-is).", raw.len());
+        print!("{raw}");
+        return 0;
+    }
+    eprintln!("   Distilling failure logs ({} bytes) via LLM...", raw.len());
+    let start = std::time::Instant::now();
+    match distill_failure_logs(&raw, &file).await {
+        Some(distilled) => {
+            eprintln!(
+                "   Distilled in {:.1}s ({} bytes → {} bytes).",
+                start.elapsed().as_secs_f64(),
+                raw.len(),
+                distilled.len(),
+            );
+            println!("{distilled}");
+            0
+        }
+        None => {
+            eprintln!("Distill failed.");
+            1
+        }
+    }
 }
 
 // ── Merge conflict check ─────────────────────────────────────────────────────
@@ -2203,6 +2430,9 @@ async fn collect_reviews_and_ci(
             if let Some(ref failures) = ci.failures_content {
                 files.push(section("failures", failures));
             }
+            if let Some(full) = ci.failures_full_file {
+                files.push(full);
+            }
             files.extend(ci.lint_files);
             failed_names = ci.failed_names;
         }
@@ -2254,10 +2484,10 @@ async fn collect_context_strings(branch_commits: &Option<String>, base_ref: &str
 
 fn build_files_index(files: &[TempFile], has_conflicts: bool, failed_names: &[String]) -> String {
     let failures_label = if failed_names.is_empty() {
-        "CI failure logs (error summary at top, full logs below)".into()
+        "CI failure logs (distilled summary; references full log below)".into()
     } else {
         format!(
-            "CI failure logs (error summary at top, full logs below): {}",
+            "CI failure logs (distilled summary; references full log below): {}",
             failed_names.join(", ")
         )
     };
@@ -2275,6 +2505,7 @@ fn build_files_index(files: &[TempFile], has_conflicts: bool, failed_names: &[St
         ("pr-meta", "PR title, body, review decision, requested reviewers".into()),
         ("ci", "CI check results".into()),
         ("failures", failures_label),
+        ("failures-full", "CI failure logs (full, untruncated raw)".into()),
         ("lint", "local lint failures".into()),
     ]);
 
@@ -2398,41 +2629,18 @@ fn pr_areas_cache_path(sha: &str) -> PathBuf {
     base.join("dragonfly").join("pr-areas").join(format!("{sha}.json"))
 }
 
-async fn analyze_pr_areas(
-    diff_files_str: &str,
-    changed_files_str: &str,
-    pr_commits_str: &str,
-) -> Option<serde_json::Value> {
-    let head_sha = sh("git rev-parse HEAD").await.unwrap_or_default();
-    let cache_path = if !head_sha.is_empty() {
-        Some(pr_areas_cache_path(&head_sha))
-    } else {
-        None
-    };
-    if let Some(path) = &cache_path {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                println!("   PR areas: cache hit ({}).", &head_sha[..head_sha.len().min(7)]);
-                return Some(v);
-            }
-        }
-    }
+const PR_AREAS_INSTRUCTIONS: &str = r#"You are given the diff of a pull request. Make a list of the high-level areas that the PR covers.
 
-    let prompt = format!(
-        r#"
-{pr_commits_str}
-{changed_files_str}
-
-Per-file diffs:
-{diff_files_str}
-
-# Instructions
-
-Explore the changes done in this PR and make a list of the high-level areas that are covered.
-Read the per-file diff files to understand the changes.
 If the PR is small, and there's only one area covered, then output only one area.
 For each area, list a name, a description (a few sentances), and list the files or directories that are the most relevant.
-Format the output as json. Include only json and nothing else.
+
+The PR should be split into areas such that a single reviewer will have full context on everything in that area and can review it mostly independently of the other areas. If two changes need to be understood together to be reviewed correctly, they belong in the same area; if a reviewer of one change wouldn't need to look at the other to judge it, they belong in different areas. For medium and large PRs (more than ~5 files or ~200 changed lines), expect multiple distinct areas — splitting them is the default, not the exception.
+
+# Output format
+
+Output ONLY raw JSON. Do NOT wrap your output in markdown code fences (no ```json, no ```). The first character of your output must be `{` and the last character must be `}`. Output nothing — no prose, no commentary, no summary — before or after the JSON.
+
+Every area object MUST contain ALL six required keys: `name`, `description`, `simplification_motivation`, `files`, `potential_for_bugs`, `potential_for_simplification`. Do not omit any key on any area, even if a value is short.
 
 Include a potential_for_bugs estimate according to the following scale examples:
 
@@ -2453,62 +2661,70 @@ Afterwards, add a potential_for_simplification estimate from 1 to 10, that summa
 
 ## Example
 
-```
-{{
+{
     "areas": [
-        {{
+        {
             "name": "Frontend SSE streaming",
             "description": "Refactored the streaming logic of agent and user messages from a long-polling http endpoint to use websockets...",
             "simplification_motivation": "The functions fetchHistory and loadOlderEvents could be refactored to reduce duplication and improve readability.",
             "files": ["app/src/lib/trajectory", "app/proto/generated_types.ts"],
             "potential_for_bugs": 8,
             "potential_for_simplification": 5
-        }},
-        {{
+        },
+        {
             "name": "Fixed off-by-one error in backend trajectory endpoint",
             "description": "The Limit parameter had an off-by-one error which resulted in too many results being returned...",
             "simplification_motivation": "Very little code is touched, so there's minimal opportunity for simplification.",
             "files": ["go/api/endpoints.go"],
             "potential_for_bugs": 3,
             "potential_for_simplification": 1
-        }},
-        {{
+        },
+        {
             "name": "Updated all test mocks to behave like the websocket stream",
             "description": "Several test mocks...",
             "simplification_motivation": "The mocks use the same pattern, and could be broken down into reusable components.",
             "files": ["go/pkg/trajectory/message_test.go", "go/pkg/trajectory/streaming_test.go", "go/pkg/trajectory/hitl_test.go"],
             "potential_for_bugs": 5,
             "potential_for_simplification": 9
-        }}
+        }
     ]
-}}
-```
-"#
+}
+"#;
+
+/// Analyze the PR diff via kit + Haiku 4.5. Caller provides `full_diff_str`
+/// containing inlined per-file `<diff name="…">…</diff>` blocks (no tool
+/// use needed — kit doesn't support tools). Cached on disk by HEAD SHA so
+/// repeated runs on the same commit are free.
+async fn analyze_pr_areas(
+    full_diff_str: &str,
+    changed_files_str: &str,
+    pr_commits_str: &str,
+) -> Option<serde_json::Value> {
+    let head_sha = sh("git rev-parse HEAD").await.unwrap_or_default();
+    let cache_path = if !head_sha.is_empty() {
+        Some(pr_areas_cache_path(&head_sha))
+    } else {
+        None
+    };
+    if let Some(path) = &cache_path {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                println!("   PR areas: cache hit ({}).", &head_sha[..head_sha.len().min(7)]);
+                return Some(v);
+            }
+        }
+    }
+
+    let content = format!(
+        "{pr_commits_str}\n{changed_files_str}\n\nPer-file diffs:\n{full_diff_str}\n"
     );
-
-    let settings = push_and_fix_settings_expanded();
-    let result = Command::new("claude")
-        .args([
-            "--print",
-            "--dangerously-skip-permissions",
-            "--model",
-            "haiku",
-            "--tools",
-            "Bash,Edit,Glob,Grep,Read,Write",
-            "--settings",
-            &settings,
-            "--system-prompt",
-            &prompt,
-            "Analyze the PR",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .ok()?;
-
-    let output = String::from_utf8_lossy(&result.stdout).trim().to_string();
-    let parsed = extract_json_from_end(&output)?;
+    let content_file = section("pr-areas-input", &content);
+    let raw = call_kit_llm(
+        "anthropic/claude-haiku-4-5",
+        PR_AREAS_INSTRUCTIONS,
+        &content_file.path,
+    ).await?;
+    let parsed = extract_json_from_end(&raw)?;
 
     if let Some(path) = &cache_path {
         if let Some(dir) = path.parent() {
@@ -2913,16 +3129,26 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
     }
     let branch_commits = sh(&format!("git log {base_ref}..HEAD --oneline")).await;
 
-    // Run area analysis in parallel with PR/CI checks
+    // Run area analysis in parallel with PR/CI checks. The PR-areas LLM
+    // call needs the inline diff content (kit has no tool-use, so we
+    // can't point it at file paths and ask it to Read). Meanwhile the
+    // main agent prompt only needs the file-paths index so it can choose
+    // which diffs to load — both are computed here.
     let branch_commits_clone = branch_commits.clone();
     let base_ref_clone = base_ref.clone();
     let mut areas_handle = Some(tokio::spawn(async move {
         let changed_files = get_changed_files(&base_ref_clone).await;
         let relevant_changed_files = filter_relevant_files(&changed_files);
         let diff_files_str = write_diff_files(&relevant_changed_files, &base_ref_clone).await;
+        let full_diffs = full_diffs(&relevant_changed_files, &base_ref_clone).await;
+        let full_diff_str = full_diffs
+            .iter()
+            .map(|(name, diff)| format!("<diff name=\"{name}\">\n{diff}\n</diff>"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let ctx = collect_context_strings(&branch_commits_clone, &base_ref_clone).await;
 
-        let pr_areas = analyze_pr_areas(&diff_files_str, &ctx.changed_files, &ctx.pr_commits).await;
+        let pr_areas = analyze_pr_areas(&full_diff_str, &ctx.changed_files, &ctx.pr_commits).await;
         (pr_areas, diff_files_str, ctx)
     }));
 
@@ -3082,11 +3308,12 @@ async fn main() {
             CliCommand::Ci { command } => {
                 let code = match command {
                     CiCommand::Status { all, pr } => ci_status_cmd(pr, all).await,
-                    CiCommand::Failures { pr, max_bytes } => ci_failures_cmd(pr, max_bytes).await,
+                    CiCommand::Failures { pr, max_bytes, raw } => ci_failures_cmd(pr, max_bytes, raw).await,
                     CiCommand::Watch { pr } => ci_watch_cmd(pr).await,
                     CiCommand::Flaky { name, limit } => ci_flaky_cmd(name, limit).await,
                     CiCommand::Retries { pr } => ci_retries_cmd(pr).await,
                     CiCommand::Rerun { name, pr } => ci_rerun_cmd(name, pr).await,
+                    CiCommand::Distill { file } => ci_distill_cmd(file).await,
                 };
                 std::process::exit(code);
             }
