@@ -452,7 +452,7 @@ async fn push(force: bool) -> (PushResult, ShResult) {
 
     // One merge-tree probe drives both the rebase decision below and the
     // prompt's "Merge Conflict Check" section (returned to the caller).
-    let bg_merge = sh_bg("git merge-tree --write-tree --name-only origin/main HEAD");
+    let bg_merge = sh_bg(MERGE_TREE_PROBE_CMD);
     let upstream = sh("git rev-parse --abbrev-ref @{upstream} 2>/dev/null").await;
     let merge_probe = sh3_wait(bg_merge).await;
 
@@ -1694,9 +1694,13 @@ async fn ci_status_cmd(pr: Option<String>, all: bool) -> i32 {
         eprintln!("No PR for current branch and --pr not supplied.");
         return 2;
     };
-    let r = sh3(&format!(
+    let checks_cmd = format!(
         "gh pr checks {pr_number} --json name,bucket,link,workflow,description"
-    )).await;
+    );
+    let (r, has_conflicts) = tokio::join!(
+        sh3(&checks_cmd),
+        check_origin_main_conflicts(),
+    );
     let mut checks: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
     // Dedup by name, keeping the highest-priority bucket: fail > pending > pass > skipping.
     let priority = |b: &str| match b { "fail" => 3, "pending" => 2, "pass" => 1, _ => 0 };
@@ -1731,6 +1735,9 @@ async fn ci_status_cmd(pr: Option<String>, all: bool) -> i32 {
 
     println!("PR #{pr_number} — {} fail, {} pending, {} pass, {} skip",
         failed, pending, passed_total, skipped_total);
+    if has_conflicts {
+        println!("⚠️  Merge conflicts with origin/main — some checks did not run.");
+    }
     for c in &checks {
         let icon = match c.bucket.as_str() {
             "fail" => "❌",
@@ -1792,6 +1799,9 @@ async fn ci_watch_cmd(pr: Option<String>) -> i32 {
         eprintln!("No PR for current branch and --pr not supplied.");
         return 2;
     };
+    if check_origin_main_conflicts().await {
+        println!("⚠️  Merge conflicts with origin/main — some checks did not run.");
+    }
     // Use --watch --fail-fast and retry on dropped connection up to 3 times.
     let mut attempts = 0;
     loop {
@@ -1982,6 +1992,25 @@ async fn ci_rerun_cmd(name: String, pr: Option<String>) -> i32 {
 
 // ── Merge conflict check ─────────────────────────────────────────────────────
 
+const MERGE_TREE_PROBE_CMD: &str =
+    "git merge-tree --write-tree --name-only origin/main HEAD";
+
+async fn merge_tree_probe() -> ShResult {
+    sh3(MERGE_TREE_PROBE_CMD).await
+}
+
+fn merge_probe_has_conflicts(r: &ShResult) -> bool {
+    r.code != 0
+}
+
+/// Fetch `origin/main` then probe HEAD for merge conflicts with it.
+/// Best-effort: a fetch or probe failure is reported as "no conflicts" so
+/// callers don't false-alarm on missing remotes or transient network errors.
+async fn check_origin_main_conflicts() -> bool {
+    let _ = sh3("git fetch origin main --quiet").await;
+    merge_probe_has_conflicts(&merge_tree_probe().await)
+}
+
 async fn build_merge_content(r: ShResult) -> MergeResult {
     println!("   Checking for merge conflicts with origin/main...");
     let mut content = format!("# Merge Conflict Check\n\nExit code: {}\n", r.code);
@@ -1992,7 +2021,7 @@ async fn build_merge_content(r: ShResult) -> MergeResult {
         content += &format!("Stderr:\n```\n{}\n```\n", r.stderr);
     }
 
-    let has_conflicts = r.code != 0;
+    let has_conflicts = merge_probe_has_conflicts(&r);
     if has_conflicts {
         println!("⚠️  Potential merge conflicts detected");
         if let Some(base) = sh("git merge-base HEAD origin/main").await {
