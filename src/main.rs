@@ -1609,6 +1609,14 @@ fn classify_provider_label(link: &str) -> &'static str {
     else { "unknown" }
 }
 
+fn strip_ansi(s: &str) -> String {
+    // GitHub Actions' log API returns ESC bytes rendered as literal "^[" pairs;
+    // normalize back to real ESC so strip_ansi_escapes handles them.
+    let normalized = s.replace("^[", "\x1b");
+    let stripped = strip_ansi_escapes::strip(normalized.as_bytes());
+    String::from_utf8(stripped).unwrap_or(normalized)
+}
+
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max { s }
     else {
@@ -1759,6 +1767,7 @@ async fn ci_failures_cmd(pr: Option<String>, max_bytes: usize) -> i32 {
             CheckProvider::Buildkite => fetch_buildkite_log(check, &head_sha).await,
             CheckProvider::External => fetch_external_log(check, &head_sha).await,
         };
+        let raw = strip_ansi(&raw);
         let body = if matches!(provider, CheckProvider::GitHubActions) {
             let s = extract_failure_summary(&raw);
             if s.is_empty() {
