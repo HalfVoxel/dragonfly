@@ -51,6 +51,17 @@
           }
         ]
       }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "review-agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__DRAGONFLY_HOOKS__/review-context.py"
+          }
+        ]
+      }
     ]
   }
 }
