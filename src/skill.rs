@@ -206,10 +206,11 @@ This guide complements the existing repo rule in `AGENTS.md`, but overrides it w
 Pick the ones that fit the change; skip ones that don't. Order them as listed below.
 
 - **`# Summary`** — 1-3 bullets. What changed and the headline why.
+- **`# Important behavioral changes`** — 0-3 bullets. If this PR is a refactor and it introduces some important behavioral change that reviewers may object to. Mention it here.
 - **`# Problem`** — 2-4 bullets. Motivation, prior behavior, what hurt without this.
+- **`# Example`** (or `# Examples`) — only when appropriate (CLI updates, new APIs, config changes that benefit from showing usage). Contains a fenced code block.
 - **`# What changed`** — 3-6 bullets. Concrete changes. One sentence per bullet.
 - **`# Who`** — If the features are behind a feature flag, list it here. E.g. "* All functionality gated behind the new-trajectory/constructPrompt feature flag (rolled out to 5%)".
-- **`# Example`** (or `# Examples`) — only when appropriate (CLI updates, new APIs, config changes that benefit from showing usage). Contains a fenced code block.
 - **`# Links`** — For bugfixes, it's useful to include grafana urls / braintrust trace links or similar that show the bug happening.
 
 #### PR examples
