@@ -3195,12 +3195,41 @@ async fn build_review_agent_context() -> String {
         write_diff_files(&r, &base_for_diffs).await
     };
 
+    let relevant_for_full = relevant.clone();
+    let base_for_full = base_ref.clone();
+    let full_diffs_fut = async move {
+        let r: Vec<&str> = relevant_for_full.iter().map(String::as_str).collect();
+        // full_diffs returns borrows tied to `r`; convert to owned
+        // strings so the result can outlive the async block.
+        full_diffs(&r, &base_for_full)
+            .await
+            .into_iter()
+            .map(|(name, diff)| (name.to_string(), diff))
+            .collect::<Vec<(String, String)>>()
+    };
+
     let base_for_rag = base_ref.clone();
     let rag_fut = async move { build_relevant_context(&base_for_rag).await };
 
     let ctx_fut = collect_context_strings(&branch_commits, &base_ref);
 
-    let (diff_files_str, relevant_context, ctx) = tokio::join!(diff_files_fut, rag_fut, ctx_fut);
+    let (diff_files_str, full_diffs_vec, relevant_context, ctx) =
+        tokio::join!(diff_files_fut, full_diffs_fut, rag_fut, ctx_fut);
+
+    // Reuse the SHA-keyed pr-areas cache populated by the main prompt
+    // build. When this runs standalone (no preceding push-and-check),
+    // it cold-builds once (~3-5 s) and writes the cache. analyze_pr_areas
+    // needs the inline diff content because kit has no tool-use.
+    let full_diff_str = full_diffs_vec
+        .iter()
+        .map(|(name, diff)| format!("<diff name=\"{name}\">\n{diff}\n</diff>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let pr_areas = if full_diff_str.trim().is_empty() {
+        None
+    } else {
+        analyze_pr_areas(&full_diff_str, &ctx.changed_files, &ctx.pr_commits).await
+    };
 
     let branch = branch.unwrap_or_default();
     let mut out = String::new();
@@ -3217,6 +3246,13 @@ async fn build_review_agent_context() -> String {
         out.push_str(&diff_files_str);
     } else {
         out.push_str("\n(no per-file diffs against base — review may be unnecessary)\n");
+    }
+    if let Some(v) = pr_areas {
+        if let Ok(pretty) = serde_json::to_string_pretty(&v) {
+            out.push_str("\n<pr-areas>\nPer-file `potential_for_bugs` and `potential_for_simplification` scores (1-10). Use to prioritise the assigned concern.\n```json\n");
+            out.push_str(&pretty);
+            out.push_str("\n```\n</pr-areas>\n");
+        }
     }
     if !relevant_context.is_empty() {
         out.push('\n');
