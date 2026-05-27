@@ -1,3 +1,5 @@
+pub const CODE_COMMENTS_GUIDE: &str = include_str!("../code-comments.md");
+
 pub const PUSH_AND_FIX_SKILL: &str = r#"# Push and Fix CI
 
 Push the current branch, monitor CI, and fix relevant issues that arise — including review bot comments.
@@ -5,6 +7,8 @@ Push the current branch, monitor CI, and fix relevant issues that arise — incl
 When thinking, always start by listing which phase you are on.
 Like: "Phase 4.1 Identify the failure".
 But no need to show this to the user.
+
+CODE_COMMENTS_PLACEHOLDER
 
 ## Phase 1: Safe Push
 

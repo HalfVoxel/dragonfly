@@ -1,5 +1,5 @@
 use chrono::DateTime;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -11,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
+mod guide_chunks;
+mod pr_score;
 mod sessions;
 mod skill;
 
@@ -46,10 +48,54 @@ enum CliCommand {
         #[command(subcommand)]
         command: CiCommand,
     },
-    /// Run the full flow (push, CI wait, data collection) but print the prompt
-    /// instead of invoking Claude Code. Useful for debugging / iterating on the
-    /// prompt itself.
-    Prompt,
+    /// Print a prompt instead of invoking the model. With no subcommand, runs
+    /// the full push-and-check flow (push, CI wait, data collection) and
+    /// prints the main agent prompt. With `initial-review`, prints just the
+    /// initial code review prompt (system + inlined diff).
+    Prompt {
+        #[command(subcommand)]
+        target: Option<PromptTarget>,
+    },
+    /// List CLAUDE.md / AGENTS.md guides relevant to the given file paths.
+    /// Walks parent dirs of each path up to the git toplevel, follows
+    /// `@`-references transitively, dedupes, and prints one absolute path per
+    /// line. Reads paths from stdin if none are provided.
+    #[command(hide = true)]
+    Guides {
+        /// File paths (relative or absolute). Reads stdin if empty.
+        paths: Vec<PathBuf>,
+    },
+    /// Score guide chunks for the current branch's PR via `lov rag score`.
+    /// Resolves changed files → relevant guides → per-heading chunks, then
+    /// asks the knowledge-RAG scorer to rate each chunk against the PR's
+    /// diff. Prints a TSV sorted by score (desc) so a threshold can be
+    /// eyeballed before committing to the production 7.5 default.
+    #[command(hide = true)]
+    ScoreGuides {
+        /// Write TSV to FILE instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Override the base ref for the diff. Default: auto-detected via
+        /// `pr_base_ref` (graphite stack parent or origin/main). Useful
+        /// when HEAD is a detached merge commit and origin/main already
+        /// contains it — pass `HEAD^1` (the pre-merge main) instead.
+        #[arg(long)]
+        base: Option<String>,
+        /// Only emit chunks scoring >= THRESHOLD, plus every ancestor
+        /// chunk (same file, prefix breadcrumbs) of those. Default: no
+        /// filter, all 0–10 rows kept.
+        #[arg(long)]
+        threshold: Option<f64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PromptTarget {
+    /// Print the initial-review prompt (system prompt + the inlined diff
+    /// that would be sent as the user message). Same content `pr review`
+    /// would feed the model — useful for iterating on the prompt without
+    /// burning a model call.
+    InitialReview,
 }
 
 #[derive(Subcommand)]
@@ -73,6 +119,40 @@ enum PrCommand {
         #[arg(long)]
         pr: Option<String>,
     },
+    /// Run an initial code review of the current branch (defaults to Gemini).
+    /// Same call that runs automatically inside `push-and-check` when no
+    /// prior review log exists for the PR. Gemini is weaker than Claude,
+    /// so output is best treated as a first-pass hint, not a final verdict.
+    Review {
+        /// Override the review model (default: gemini).
+        #[arg(long)]
+        model: Option<Model>,
+    },
+}
+
+/// Shorthand names for the LLMs the `--model` flag accepts. Resolved to
+/// the underlying `provider/model` string at call time so flags stay short.
+#[derive(Clone, Copy, ValueEnum)]
+enum Model {
+    /// vertex/gemini-3.1-flash-lite-preview — cheap/fast, weak on subtle bugs.
+    Gemini,
+    /// anthropic/claude-haiku-4-5
+    Haiku,
+    /// anthropic/claude-sonnet-4-6
+    Sonnet,
+    /// anthropic/claude-opus-4-7
+    Opus,
+}
+
+impl Model {
+    fn kit_id(self) -> &'static str {
+        match self {
+            Self::Gemini => "vertex/gemini-3.1-flash-lite-preview",
+            Self::Haiku => "anthropic/claude-haiku-4-5",
+            Self::Sonnet => "anthropic/claude-sonnet-4-6",
+            Self::Opus => "anthropic/claude-opus-4-7",
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -121,6 +201,9 @@ enum CiCommand {
         /// Skip the LLM distill step; print the raw per-check dump.
         #[arg(long)]
         raw: bool,
+        /// Override the distiller model (default: haiku).
+        #[arg(long)]
+        model: Option<Model>,
     },
     /// Wrap `gh pr checks --watch --fail-fast` with auto-reconnect; print a single
     /// final summary (same shape as `ci status`).
@@ -159,6 +242,9 @@ enum CiCommand {
     Distill {
         /// Path to a failure-log markdown file (e.g. /tmp/psc-failures-XXXX.md).
         file: PathBuf,
+        /// Override the distiller model (default: haiku).
+        #[arg(long)]
+        model: Option<Model>,
     },
 }
 
@@ -195,6 +281,10 @@ struct PrInfo {
     number: Option<String>,
     url: Option<String>,
     is_draft: bool,
+    /// GitHub login of the PR author. Empty when no PR exists or the field
+    /// wasn't available. Compared against the viewer's login to decide
+    /// whether the agent should run in review-only mode.
+    author_login: String,
 }
 
 struct CiResult {
@@ -396,12 +486,17 @@ fn submit_feedback(message: &str) {
 /// counterpart prompt first. Reuses the merge-tree probe that will later
 /// drive the "Merge Conflict Check" prompt section. Returns true if a rebase
 /// actually happened, so the caller can promote a normal push to a force-push.
-async fn maybe_rebase_on_main(has_upstream: bool, merge_probe: &ShResult) -> bool {
+async fn maybe_rebase_on_main(has_upstream: bool, merge_probe: &ShResult, review_only: bool) -> bool {
     let behind = sh("git rev-list --count HEAD..origin/main")
         .await
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
     if behind == 0 {
+        return false;
+    }
+
+    if review_only {
+        println!("   Branch is {behind} behind origin/main; skipping rebase prompt (review-only mode).");
         return false;
     }
 
@@ -453,7 +548,7 @@ async fn maybe_rebase_on_main(has_upstream: bool, merge_probe: &ShResult) -> boo
     false
 }
 
-async fn push(force: bool) -> (PushResult, ShResult) {
+async fn push(force: bool, review_only: bool) -> (PushResult, ShResult) {
     println!("   Fetching remote...");
     let bg_fetch = sh_bg("git fetch");
 
@@ -472,7 +567,7 @@ async fn push(force: bool) -> (PushResult, ShResult) {
     let upstream = sh("git rev-parse --abbrev-ref @{upstream} 2>/dev/null").await;
     let merge_probe = sh3_wait(bg_merge).await;
 
-    let rebased = maybe_rebase_on_main(upstream.is_some(), &merge_probe).await;
+    let rebased = maybe_rebase_on_main(upstream.is_some(), &merge_probe, review_only).await;
     let force = force || rebased;
     // After a successful rebase HEAD sits on top of origin/main, so the
     // pre-rebase merge probe is stale. The new state is trivially clean.
@@ -1503,22 +1598,19 @@ async fn call_kit_llm(
     None
 }
 
-/// Pipe a full failure-log dump through kit + Haiku 4.5 and return a
-/// terse, deduped markdown summary. Skips the LLM entirely for inputs
-/// under 5 KB. Returns `None` on invocation failure so callers can fall
-/// back to the raw content.
+/// Pipe a full failure-log dump through `model` (default Haiku 4.5) and
+/// return a terse, deduped markdown summary. Skips the LLM entirely for
+/// inputs under 5 KB. Returns `None` on invocation failure so callers
+/// can fall back to the raw content.
 ///
 /// The full untruncated log lives on disk at `full_log_path`; a footer
 /// pointing back at it is appended below.
-async fn distill_failure_logs(raw: &str, full_log_path: &std::path::Path) -> Option<String> {
-    if raw.len() < 5000 {
-        return None;
-    }
-    let mut output = call_kit_llm(
-        "anthropic/claude-haiku-4-5",
-        DISTILL_INSTRUCTIONS,
-        full_log_path,
-    ).await?;
+async fn distill_failure_logs(
+    raw: &str,
+    full_log_path: &std::path::Path,
+    model: Model,
+) -> Option<String> {
+    let mut output = call_kit_llm(model.kit_id(), DISTILL_INSTRUCTIONS, full_log_path).await?;
     output.push_str(&format!(
         "\n\nFull untruncated log ({} bytes): {}\n",
         raw.len(),
@@ -1828,7 +1920,7 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
         let full_file = section("failures-full", &raw_content);
         println!("   Distilling failure logs ({} bytes) via LLM...", raw_content.len());
         let distill_start = std::time::Instant::now();
-        match distill_failure_logs(&raw_content, &full_file.path).await {
+        match distill_failure_logs(&raw_content, &full_file.path, Model::Haiku).await {
             Some(distilled) => {
                 println!(
                     "   Distilled in {:.1}s ({} bytes → {} bytes).",
@@ -1918,7 +2010,13 @@ async fn ci_status_cmd(pr: Option<String>, all: bool) -> i32 {
     if failed > 0 { 1 } else { 0 }
 }
 
-async fn ci_failures_cmd(pr: Option<String>, max_bytes: usize, raw_only: bool) -> i32 {
+async fn ci_failures_cmd(
+    pr: Option<String>,
+    max_bytes: usize,
+    raw_only: bool,
+    model: Option<Model>,
+) -> i32 {
+    let model = model.unwrap_or(Model::Haiku);
     let Some(pr_number) = resolve_pr_number(pr).await else {
         eprintln!("No PR for current branch and --pr not supplied.");
         return 2;
@@ -1968,9 +2066,9 @@ async fn ci_failures_cmd(pr: Option<String>, max_bytes: usize, raw_only: bool) -
     }
 
     let full_file = section("ci-failures-full", &buf);
-    eprintln!("   Distilling failure logs ({} bytes) via LLM...", buf.len());
+    eprintln!("   Distilling failure logs ({} bytes) via {}...", buf.len(), model.kit_id());
     let start = std::time::Instant::now();
-    match distill_failure_logs(&buf, &full_file.path).await {
+    match distill_failure_logs(&buf, &full_file.path, model).await {
         Some(distilled) => {
             eprintln!(
                 "   Distilled in {:.1}s ({} bytes → {} bytes).",
@@ -2184,7 +2282,8 @@ async fn ci_rerun_cmd(name: String, pr: Option<String>) -> i32 {
     0
 }
 
-async fn ci_distill_cmd(file: PathBuf) -> i32 {
+async fn ci_distill_cmd(file: PathBuf, model: Option<Model>) -> i32 {
+    let model = model.unwrap_or(Model::Haiku);
     let raw = match std::fs::read_to_string(&file) {
         Ok(s) => s,
         Err(e) => {
@@ -2197,9 +2296,9 @@ async fn ci_distill_cmd(file: PathBuf) -> i32 {
         print!("{raw}");
         return 0;
     }
-    eprintln!("   Distilling failure logs ({} bytes) via LLM...", raw.len());
+    eprintln!("   Distilling failure logs ({} bytes) via {}...", raw.len(), model.kit_id());
     let start = std::time::Instant::now();
-    match distill_failure_logs(&raw, &file).await {
+    match distill_failure_logs(&raw, &file, model).await {
         Some(distilled) => {
             eprintln!(
                 "   Distilled in {:.1}s ({} bytes → {} bytes).",
@@ -2272,6 +2371,14 @@ struct PrData {
     url: String,
     #[serde(rename = "isDraft", default)]
     is_draft: bool,
+    #[serde(default)]
+    author: PrAuthor,
+}
+
+#[derive(Deserialize, Default)]
+struct PrAuthor {
+    #[serde(default)]
+    login: String,
 }
 
 async fn lookup_existing_pr(bg_pr: Child) -> Option<PrInfo> {
@@ -2282,6 +2389,7 @@ async fn lookup_existing_pr(bg_pr: Child) -> Option<PrInfo> {
             number: Some(pr.number.to_string()),
             url: Some(pr.url),
             is_draft: pr.is_draft,
+            author_login: pr.author.login,
         }
     })
 }
@@ -2347,7 +2455,7 @@ async fn create_pr_with_title(title: &str) -> PrInfo {
         .unwrap_or(1);
 
     if rc == 0 {
-        if let Some(data) = sh("gh pr view --json number,url,isDraft")
+        if let Some(data) = sh("gh pr view --json number,url,isDraft,author")
             .await
             .and_then(|s| parse_json::<PrData>(&s))
         {
@@ -2355,12 +2463,13 @@ async fn create_pr_with_title(title: &str) -> PrInfo {
                 number: Some(data.number.to_string()),
                 url: Some(data.url),
                 is_draft: true,
+                author_login: data.author.login,
             };
         }
     } else {
         println!("⚠️  PR creation failed");
     }
-    PrInfo { number: None, url: None, is_draft: false }
+    PrInfo { number: None, url: None, is_draft: false, author_login: String::new() }
 }
 
 // ── Reviews + CI collection ──────────────────────────────────────────────────
@@ -2579,6 +2688,165 @@ async fn full_diffs<'a>(changed_files: &[&'a str], base_ref: &str) -> Vec<(&'a s
 }
 
 
+// ── Guide file collection (CLAUDE.md / AGENTS.md) ───────────────────────────
+
+/// Collects every `CLAUDE.md`, `AGENTS.md`, and `AGENT.md` guide that
+/// applies to `paths`.
+///
+/// A guide applies when it sits in the directory of one of `paths` or in any
+/// ancestor up to and including the repository root (`git rev-parse
+/// --show-toplevel`). If the working directory isn't inside a git repo,
+/// walking continues to the filesystem root — only directories that actually
+/// hold a guide contribute anything anyway.
+///
+/// `@`-references inside collected guides are followed transitively. A
+/// reference may be absolute (`@/abs/path`), home-rooted (`@~/path`), or
+/// relative to the file containing the reference (`@./sibling.md`,
+/// `@subdir/file.md`, `@foo.md`). References that look path-like but fail to
+/// resolve emit a warning to stderr; non-path-looking matches (e.g.
+/// `@username` in prose) are ignored silently.
+///
+/// Returns absolute, canonicalized paths, deduplicated, in sorted order.
+#[allow(dead_code)]
+fn collect_relevant_guides<P: AsRef<std::path::Path>>(paths: &[P]) -> Vec<PathBuf> {
+    use std::collections::HashSet;
+    use std::path::Path;
+
+    const GUIDE_NAMES: &[&str] = &["CLAUDE.md", "AGENTS.md", "AGENT.md"];
+
+    let project_root = git_top_level();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
+    let mut found: HashSet<PathBuf> = HashSet::new();
+    let mut queue: Vec<PathBuf> = Vec::new();
+    let mut walked_dirs: HashSet<PathBuf> = HashSet::new();
+
+    // Phase 1: walk ancestor chains of each input.
+    for p in paths {
+        let abs = if p.as_ref().is_absolute() {
+            p.as_ref().to_path_buf()
+        } else {
+            cwd.join(p.as_ref())
+        };
+        let mut dir = if abs.is_dir() {
+            abs.clone()
+        } else {
+            abs.parent().map(Path::to_path_buf).unwrap_or(abs)
+        };
+        loop {
+            // Same chain visited via another input — every ancestor was too.
+            if !walked_dirs.insert(dir.clone()) {
+                break;
+            }
+            for name in GUIDE_NAMES {
+                let candidate = dir.join(name);
+                if candidate.is_file() {
+                    let canon = candidate.canonicalize().unwrap_or(candidate);
+                    if found.insert(canon.clone()) {
+                        queue.push(canon);
+                    }
+                }
+            }
+            if project_root.as_ref().is_some_and(|r| &dir == r) {
+                break;
+            }
+            let Some(parent) = dir.parent() else { break };
+            dir = parent.to_path_buf();
+        }
+    }
+
+    // Phase 2: follow @-references transitively. Cycle-safe via `found`.
+    static AT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    // `@` must follow start-of-line or a non-word, non-@, non-backtick char.
+    // Excluding backtick keeps inline code spans like `` `@types/react` ``
+    // (npm scope names mentioned in prose) from registering as references.
+    // Capture is `\S+`; trailing punctuation is stripped in the consumer.
+    let at_re =
+        AT_RE.get_or_init(|| Regex::new(r"(?m)(?:^|[^\w@`])@(\S+)").unwrap());
+
+    while let Some(file) = queue.pop() {
+        let content = match std::fs::read_to_string(&file) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warning: failed to read guide {}: {e}", file.display());
+                continue;
+            }
+        };
+        let file_dir = file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        for cap in at_re.captures_iter(&content) {
+            let raw = cap.get(1).unwrap().as_str().trim_end_matches(
+                |c: char| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '"' | '\''),
+            );
+            if raw.is_empty() {
+                continue;
+            }
+            match resolve_at_ref(raw, &file_dir) {
+                Some(p) => {
+                    let canon = p.canonicalize().unwrap_or(p);
+                    if found.insert(canon.clone()) {
+                        queue.push(canon);
+                    }
+                }
+                None if looks_like_path_ref(raw) => {
+                    eprintln!(
+                        "warning: unresolved @ reference '{raw}' in {}",
+                        file.display()
+                    );
+                }
+                None => {} // not path-like — likely prose, not a reference
+            }
+        }
+    }
+
+    let mut result: Vec<PathBuf> = found.into_iter().collect();
+    result.sort();
+    result
+}
+
+#[allow(dead_code)]
+fn git_top_level() -> Option<PathBuf> {
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if s.is_empty() { None } else { Some(PathBuf::from(s)) }
+}
+
+/// Expands an `@`-reference body (the text after `@`) and returns it iff the
+/// target exists. Relative references are resolved against `parent_dir`,
+/// which should be the directory of the file the reference was found in.
+#[allow(dead_code)]
+fn resolve_at_ref(raw: &str, parent_dir: &std::path::Path) -> Option<PathBuf> {
+    let expanded = if let Some(rest) = raw.strip_prefix("~/") {
+        home_dir().join(rest)
+    } else if raw == "~" {
+        home_dir()
+    } else if raw.starts_with('/') {
+        PathBuf::from(raw)
+    } else {
+        parent_dir.join(raw)
+    };
+    if expanded.is_file() { Some(expanded) } else { None }
+}
+
+/// Heuristic: true if `raw` looks intentional enough to warn about when it
+/// fails to resolve. Used to silence `@username`-style prose matches.
+#[allow(dead_code)]
+fn looks_like_path_ref(raw: &str) -> bool {
+    raw.contains('/')
+        || raw.starts_with('~')
+        || raw.starts_with('.')
+        || std::path::Path::new(raw).extension().is_some()
+}
+
+
 // ── Review log context ───────────────────────────────────────────────────────
 
 fn get_review_log_context(pr_number: &Option<String>) -> (String, String) {
@@ -2618,6 +2886,236 @@ fn get_review_log_context(pr_number: &Option<String>) -> (String, String) {
         log_dir.display()
     );
     (prior, instruction)
+}
+
+fn has_prior_review_logs(pr_number: &str) -> bool {
+    let log_dir = home_dir().join(format!(".dragonfly/pr-logs/{pr_number}"));
+    let Ok(entries) = std::fs::read_dir(&log_dir) else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.starts_with("review-") && n.ends_with(".md"))
+    })
+}
+
+// ── Initial code review (gemini) ─────────────────────────────────────────────
+
+/// Build the inline-diff content the initial-review LLM sees. Same shape as
+/// what `analyze_pr_areas` consumes — kit has no tool use, so the commit
+/// list, file-change summary, and diff blocks all have to be in the prompt
+/// itself rather than reachable via Read.
+async fn build_review_input(base_ref: &str) -> Option<String> {
+    let changed_files = get_changed_files(base_ref).await;
+    let relevant = filter_relevant_files(&changed_files);
+    if relevant.is_empty() {
+        return None;
+    }
+    let diffs = full_diffs(&relevant, base_ref).await;
+    let diff_body = diffs
+        .iter()
+        .map(|(name, diff)| format!("<diff name=\"{name}\">\n{diff}\n</diff>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if diff_body.trim().is_empty() {
+        return None;
+    }
+    let branch_commits = sh(&format!("git log {base_ref}..HEAD --oneline")).await;
+    let ctx = collect_context_strings(&branch_commits, base_ref).await;
+    Some(format!(
+        "{}{}\nPer-file diffs:\n{}\n",
+        ctx.pr_commits, ctx.changed_files, diff_body
+    ))
+}
+
+/// True if the initial-review output contains a HIGH severity marker.
+/// The prompt instructs the model to use `Severity: HIGH`, but we accept
+/// any casing and surrounding whitespace; word-boundary on `high` keeps
+/// us from matching `highest`, `highlight`, etc.
+fn review_has_high_severity(body: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"(?i)severity\s*:\s*high\b").unwrap());
+    re.is_match(body)
+}
+
+async fn run_initial_review(base_ref: &str, model: Model) -> Option<String> {
+    let diff = build_review_input(base_ref).await?;
+    let input = section("initial-review-input", &diff);
+    call_kit_llm(model.kit_id(), INITIAL_REVIEW_PROMPT, &input.path).await
+}
+
+async fn print_initial_review_prompt() {
+    let base_ref = pr_base_ref().await;
+    if base_ref != "origin/main" {
+        eprintln!("   Diffing against `{base_ref}` (stack parent).");
+    }
+    let diff = build_review_input(&base_ref).await.unwrap_or_default();
+    println!("# System prompt\n\n{INITIAL_REVIEW_PROMPT}");
+    if diff.is_empty() {
+        println!("# User content\n\n(no diff against {base_ref})");
+    } else {
+        println!("# User content\n\n{diff}");
+    }
+}
+
+/// Materialise relevant CLAUDE.md/AGENTS.md chunks for the current PR,
+/// score them via `lov rag score`, and dump a TSV the user can sort by
+/// score. Threshold tuning is a separate problem — this command is meant
+/// for exploration, not for filtering inside the kit-llm pipeline.
+async fn score_guides_cmd(
+    output_path: Option<PathBuf>,
+    base_override: Option<String>,
+    threshold: Option<f64>,
+) {
+    let base_ref = match base_override {
+        Some(b) => {
+            eprintln!("   Diffing against `{b}` (--base override).");
+            b
+        }
+        None => {
+            let r = pr_base_ref().await;
+            if r != "origin/main" {
+                eprintln!("   Diffing against `{r}` (stack parent).");
+            }
+            r
+        }
+    };
+
+    let Some(query) = build_review_input(&base_ref).await else {
+        eprintln!("No diff against {base_ref}.");
+        std::process::exit(1);
+    };
+
+    let changed = get_changed_files(&base_ref).await;
+    let guide_paths = collect_relevant_guides(&changed);
+    let chunks = guide_chunks::chunk_guides(&guide_paths);
+    if chunks.is_empty() {
+        eprintln!("No guide chunks resolved for {} changed files.", changed.len());
+        std::process::exit(1);
+    }
+    eprintln!(
+        "   Scoring {} chunks from {} guides via `lov rag score`...",
+        chunks.len(),
+        guide_paths.len(),
+    );
+
+    let start = std::time::Instant::now();
+    let scores = match pr_score::score_chunks(&chunks, &query).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("score-guides failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!("   Scored in {:.1}s.", start.elapsed().as_secs_f64());
+
+    let (out_chunks, out_scores): (Vec<guide_chunks::GuideChunk>, Vec<f64>) = match threshold {
+        Some(t) => {
+            let above: Vec<usize> = scores
+                .iter()
+                .enumerate()
+                .filter(|&(_, &s)| s >= t)
+                .map(|(i, _)| i)
+                .collect();
+            let kept = guide_chunks::with_ancestors(&chunks, &above);
+            eprintln!(
+                "   Threshold ≥{:.1}: {} chunks scored, {} above, {} after ancestor pull.",
+                t, chunks.len(), above.len(), kept.len(),
+            );
+            (
+                kept.iter().map(|&i| chunks[i].clone()).collect(),
+                kept.iter().map(|&i| scores[i]).collect(),
+            )
+        }
+        None => (chunks, scores),
+    };
+
+    let writer: Box<dyn std::io::Write> = match &output_path {
+        Some(p) => match std::fs::File::create(p) {
+            Ok(f) => Box::new(f),
+            Err(e) => {
+                eprintln!("failed to create {}: {e}", p.display());
+                std::process::exit(1);
+            }
+        },
+        None => Box::new(std::io::stdout()),
+    };
+    let mut writer = std::io::BufWriter::new(writer);
+    if let Err(e) = pr_score::write_scores_tsv(&mut writer, &out_chunks, &out_scores) {
+        eprintln!("failed to write TSV: {e}");
+        std::process::exit(1);
+    }
+    drop(writer);
+
+    if let Some(p) = output_path {
+        eprintln!("   TSV written to {}", p.display());
+    }
+}
+
+/// Score relevant guide chunks against the PR diff via `lov rag score`,
+/// keep those at or above [RELEVANT_CONTEXT_THRESHOLD] plus their heading
+/// ancestors, and render a `<relevant-context>` block. Returns an empty
+/// string on any failure (lov missing, auth error, empty diff) so the
+/// prompt still builds without the RAG section.
+const RELEVANT_CONTEXT_THRESHOLD: f64 = 5.0;
+
+async fn build_relevant_context(base_ref: &str) -> String {
+    let Some(query) = build_review_input(base_ref).await else {
+        return String::new();
+    };
+    let changed = get_changed_files(base_ref).await;
+    let guide_paths = collect_relevant_guides(&changed);
+    let chunks = guide_chunks::chunk_guides(&guide_paths);
+    if chunks.is_empty() {
+        return String::new();
+    }
+    let scores = match pr_score::score_chunks(&chunks, &query).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("   Skipping <relevant-context> ({e}).");
+            return String::new();
+        }
+    };
+    let above: Vec<usize> = scores
+        .iter()
+        .enumerate()
+        .filter(|&(_, &s)| s >= RELEVANT_CONTEXT_THRESHOLD)
+        .map(|(i, _)| i)
+        .collect();
+    let kept = guide_chunks::with_ancestors(&chunks, &above);
+    if kept.is_empty() {
+        return String::new();
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    eprintln!(
+        "   Including {} relevant-context chunks (threshold ≥{:.1}, +{} ancestor pulls).",
+        kept.len(),
+        RELEVANT_CONTEXT_THRESHOLD,
+        kept.len().saturating_sub(above.len()),
+    );
+    pr_score::render_relevant_context(&chunks, &kept, &cwd)
+}
+
+async fn pr_review_cmd(model: Option<Model>) -> i32 {
+    let model = model.unwrap_or(Model::Gemini);
+    let base_ref = pr_base_ref().await;
+    if base_ref != "origin/main" {
+        eprintln!("   Diffing against `{base_ref}` (stack parent).");
+    }
+    eprintln!("   Running initial code review via {}...", model.kit_id());
+    let start = std::time::Instant::now();
+    match run_initial_review(&base_ref, model).await {
+        Some(body) => {
+            eprintln!("   Reviewed in {:.1}s.", start.elapsed().as_secs_f64());
+            println!("{body}");
+            0
+        }
+        None => {
+            eprintln!("Initial review failed (kit/model unavailable, or no diff against {base_ref}).");
+            1
+        }
+    }
 }
 
 // ── PR area analysis ─────────────────────────────────────────────────────────
@@ -2691,10 +3189,10 @@ Afterwards, add a potential_for_simplification estimate from 1 to 10, that summa
 }
 "#;
 
-/// Analyze the PR diff via kit + Haiku 4.5. Caller provides `full_diff_str`
+/// Analyze the PR diff via Haiku 4.5. Caller provides `full_diff_str`
 /// containing inlined per-file `<diff name="…">…</diff>` blocks (no tool
-/// use needed — kit doesn't support tools). Cached on disk by HEAD SHA so
-/// repeated runs on the same commit are free.
+/// use is available, so the diff has to be in the prompt itself). Cached
+/// on disk by HEAD SHA so repeated runs on the same commit are free.
 async fn analyze_pr_areas(
     full_diff_str: &str,
     changed_files_str: &str,
@@ -2987,6 +3485,26 @@ fn load_dotenv() -> Vec<(String, String)> {
         .collect()
 }
 
+const INITIAL_REVIEW_PROMPT: &str = r#"You are reviewing a pull request. The diff is inlined below as `<diff name="…">…</diff>` blocks.
+
+Read the diff carefully and surface concrete issues a maintainer would want to know about before merging. Focus on correctness first — bugs, broken invariants, missing error/nil handling, subtle logic mistakes, resource leaks, race conditions, security holes. Then consider whether the change introduces unsafe edge cases, misuses an API, or breaks an assumption made elsewhere in the file. Note significant clarity or design problems if they're likely to cause real bugs, but don't pad the list with style nits.
+
+Use your judgement: if a line in the diff looks suspicious but you can't confirm it's wrong from the diff alone, say so and explain what would need to be true for it to be a bug. Don't invent issues just to fill space. If you find no real problems, say so plainly.
+
+For blocking issues (likely to make CI or testing fail or unambigiously need to be fixed), use severity "HIGH".
+
+# Output format
+
+A numbered markdown list. For each issue:
+
+1. `path/to/file.ext:LINE` — one-sentence description of the issue.
+   Why it matters: <one or two sentences>.
+   Severity: LOW | MED | HIGH,
+   Suggested fix: <one-line suggestion, or "needs investigation" if unclear>.
+
+Use the line numbers as they appear in the diff hunks. If you find no issues worth flagging, output exactly: `No issues found.` and nothing else.
+"#;
+
 const REVIEW_AGGRESSIVE: &str = "\
 This PR has high potential for bugs. Be thorough:
 Trace through ALL code paths touched by this PR. Follow the call chains — don't just read the diff in isolation.
@@ -3016,10 +3534,13 @@ fn build_prompt(
     diff_files_str: &str,
     prior_reviews_str: &str,
     review_instruction: &str,
+    initial_review_str: &str,
     pr_areas_str: &str,
     pr_areas: &Option<serde_json::Value>,
     graphite_str: &str,
     agent_sessions_str: &str,
+    relevant_context_str: &str,
+    review_only_note: Option<&str>,
 ) -> String {
     let notes = if let Some(reason) = skip_ci {
         format!(" CI was skipped due to {reason} — investigate those first.")
@@ -3056,18 +3577,21 @@ fn build_prompt(
     };
     let skill_text = skill::PUSH_AND_FIX_SKILL
         .replace("CUSTOM_REVIEW_PLACEHOLDER", review_instructions)
-        .replace("GRAFANA_DASHBOARDS_PATH", GRAFANA_DASHBOARDS_PATH);
+        .replace("GRAFANA_DASHBOARDS_PATH", GRAFANA_DASHBOARDS_PATH)
+        .replace("CODE_COMMENTS_PLACEHOLDER", skill::CODE_COMMENTS_GUIDE);
 
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z (%Z)").to_string();
+    let review_only_prefix = review_only_note.unwrap_or("");
 
     format!(
-        "{skill_text}{graphite_str}\n\n\
+        "{review_only_prefix}{skill_text}{graphite_str}\n\n\
          # Instructions\n\n\
          Current time: {now}\n\
          PR status: {pr_status}\n\
          {}{}{}\n\
          Per-file diffs:\n\
          {diff_files_str}{pr_areas_str}\n\
+         {relevant_context_str}\n\
          Phase 1 (push):\n\
          Already done.\n\n\
          Phase 2/3:\n\
@@ -3075,7 +3599,7 @@ fn build_prompt(
          Pre-collected data:\n\
          {files_index}\n\
          {agent_sessions_str}\
-         {prior_reviews_str}{review_instruction}\n\
+         {prior_reviews_str}{review_instruction}{initial_review_str}\n\
          Read only the files you need. Start with the smallest/most relevant ones.\n\n\
          Continue with the next relevant phase, and read the instructions carefully.\n",
         ctx.main_commits, ctx.pr_commits, ctx.changed_files,
@@ -3116,7 +3640,27 @@ struct ClaudeInvocation {
 }
 
 async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
-    let (push_result, merge_probe) = push(force).await;
+    // Resolve PR ownership before push() so the rebase prompt inside
+    // maybe_rebase_on_main can be suppressed when the PR belongs to
+    // someone else (review-only mode).
+    let bg_pr = sh_bg("gh pr view --json number,url,isDraft,author 2>/dev/null");
+    let bg_me = sh_bg("gh api user --jq .login 2>/dev/null");
+    let early_pr_info = lookup_existing_pr(bg_pr).await;
+    let viewer_login = sh_wait(bg_me).await.unwrap_or_default();
+    let review_only = early_pr_info.as_ref().is_some_and(|p| {
+        !p.author_login.is_empty()
+            && !viewer_login.is_empty()
+            && p.author_login != viewer_login
+    });
+    if review_only {
+        let pr = early_pr_info.as_ref().unwrap();
+        println!(
+            "👀 PR owned by @{} (you are @{}) — review-only mode (no auto-rebase, no fixes).",
+            pr.author_login, viewer_login,
+        );
+    }
+
+    let (push_result, merge_probe) = push(force, review_only).await;
     if push_result.code != 0 {
         println!("⚠️  Push had issues: {}", push_result.stderr);
     }
@@ -3128,6 +3672,14 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
         println!("   Diffing against `{base_ref}` (stack parent).");
     }
     let branch_commits = sh(&format!("git log {base_ref}..HEAD --oneline")).await;
+
+    // Score relevant CLAUDE.md/AGENTS.md chunks for the PR diff in
+    // parallel — `lov rag score` is the slowest leg (~10 s), worth
+    // overlapping with CI watch + area analysis.
+    let base_ref_for_rag = base_ref.clone();
+    let relevant_context_handle = tokio::spawn(async move {
+        build_relevant_context(&base_ref_for_rag).await
+    });
 
     // Run area analysis in parallel with PR/CI checks. The PR-areas LLM
     // call needs the inline diff content (kit has no tool-use, so we
@@ -3155,7 +3707,6 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
     // Launch independent checks in parallel. The merge-tree probe was
     // already run inside push() (it drives the rebase decision); reuse it.
     let bg_status = sh_bg("git status -b --porcelain=v2");
-    let bg_pr = sh_bg("gh pr view --json number,url,isDraft 2>/dev/null");
 
     let git_status = sh_wait(bg_status).await.unwrap_or_default();
     let push_content = build_push_content(&push_result, &git_status);
@@ -3166,7 +3717,7 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
 
     let mut pre_areas: Option<(Option<serde_json::Value>, String, ContextStrings)> = None;
     let mut pre_graphite: Option<Option<GraphiteInfo>> = None;
-    let pr_info = if let Some(pr) = lookup_existing_pr(bg_pr).await {
+    let pr_info = if let Some(pr) = early_pr_info {
         pr
     } else {
         println!("   No PR found — creating draft PR...");
@@ -3185,24 +3736,142 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
         }
         match title {
             Some(t) => create_pr_with_title(&t).await,
-            None => PrInfo { number: None, url: None, is_draft: false },
+            None => PrInfo { number: None, url: None, is_draft: false, author_login: String::new() },
         }
     };
 
-    let mut skip_ci = None;
-    let mut failed_names = Vec::new();
-    if let Some(ref pr_num) = pr_info.number {
-        if let Some(ref pr_url) = pr_info.url {
-            let ci = collect_reviews_and_ci(pr_num, pr_url, &push_result.branch, merge.has_conflicts, &base_ref).await;
-            files.extend(ci.files);
-            skip_ci = ci.skip_ci;
-            failed_names = ci.failed_names;
+    // Flip the agent into review-only mode when the PR belongs to someone
+    // else. Detected up front (see early_pr_info / viewer_login); the
+    // rebase prompt was already suppressed in push() when [review_only].
+    let review_only_note = if review_only {
+        Some(format!(
+            "⚠️ REVIEW-ONLY MODE\n\
+             This PR is owned by @{} — not you (@{}). Your job is to REVIEW it, not push fixes.\n\
+             - Do NOT implement fixes unless the user explicitly asks for them.\n\
+             - Focus on Phase 5 (review bot comments) and Phase 6 (custom review).\n\
+             - Surface findings as a numbered list; let the user pick which to post as a PR comment.\n\
+             - After user approves, post a single PR comment with the review findings. Group findings in red/orange/green sections (use colored dots).\n\
+             - Skip Phase 7 (PR description) and Phase 9 (ready for review).\n\
+             - When CI fails, report it; do not start fixing it.\n\n",
+            pr_info.author_login, viewer_login,
+        ))
+    } else {
+        None
+    };
+
+    // If this PR has no prior review log, kick off an initial code review
+    // via Gemini in parallel with collect_reviews_and_ci. Gemini is weaker
+    // than Claude, so its output is framed as a first-pass hint for the
+    // main agent — see the heading in build_prompt.
+    let initial_review_handle = match &pr_info.number {
+        Some(pr_num) if !has_prior_review_logs(pr_num) => {
+            println!("   No prior review log — running initial code review via gemini.");
+            let base_ref_clone = base_ref.clone();
+            Some(tokio::spawn(async move {
+                run_initial_review(&base_ref_clone, Model::Gemini).await
+            }))
         }
+        _ => None,
+    };
+
+    // Spawn the CI+review-thread collection as a separate task so the
+    // initial review can race it. If the review reports a HIGH severity
+    // issue while CI is still in flight, we abort the local watch (remote
+    // CI keeps running) so the agent goes straight to the blocker.
+    let ci_handle: Option<tokio::task::JoinHandle<CiResult>> = match (&pr_info.number, &pr_info.url) {
+        (Some(pr_num), Some(pr_url)) => {
+            let pr_num = pr_num.clone();
+            let pr_url = pr_url.clone();
+            let branch = push_result.branch.clone();
+            let base_ref_clone = base_ref.clone();
+            let has_conflicts = merge.has_conflicts;
+            Some(tokio::spawn(async move {
+                collect_reviews_and_ci(&pr_num, &pr_url, &branch, has_conflicts, &base_ref_clone).await
+            }))
+        }
+        _ => None,
+    };
+
+    let mut skip_ci: Option<String> = None;
+    let mut failed_names: Vec<String> = Vec::new();
+    let mut initial_review_body: Option<String> = None;
+    let mut ci_aborted_by_review = false;
+
+    match (initial_review_handle, ci_handle) {
+        (Some(mut review_h), Some(mut ci_h)) => {
+            tokio::select! {
+                review = &mut review_h => {
+                    let body = review.ok().flatten();
+                    if body.as_deref().is_some_and(review_has_high_severity) {
+                        println!("⚠️  Initial review uncovered blocking issue - skipping waiting for CI");
+                        ci_h.abort();
+                        ci_aborted_by_review = true;
+                        skip_ci = Some("initial review flagged a HIGH severity issue".into());
+                        files.push(section(
+                            "ci",
+                            "# CI\n\n⚠️ Local CI watch was aborted because the initial code review \
+                             flagged a HIGH severity issue. Address that issue first.\n\nRemote CI is \
+                             still running — the next push will collect fresh CI state.\n",
+                        ));
+                    } else if let Ok(ci) = ci_h.await {
+                        files.extend(ci.files);
+                        skip_ci = ci.skip_ci;
+                        failed_names = ci.failed_names;
+                    }
+                    initial_review_body = body;
+                }
+                ci = &mut ci_h => {
+                    if let Ok(ci) = ci {
+                        files.extend(ci.files);
+                        skip_ci = ci.skip_ci;
+                        failed_names = ci.failed_names;
+                    }
+                    initial_review_body = review_h.await.ok().flatten();
+                }
+            }
+        }
+        (Some(review_h), None) => {
+            initial_review_body = review_h.await.ok().flatten();
+        }
+        (None, Some(ci_h)) => {
+            if let Ok(ci) = ci_h.await {
+                files.extend(ci.files);
+                skip_ci = ci.skip_ci;
+                failed_names = ci.failed_names;
+            }
+        }
+        (None, None) => {}
     }
 
     let files_index = build_files_index(&files, merge.has_conflicts, &failed_names);
 
     let (prior_reviews, review_instruction) = get_review_log_context(&pr_info.number);
+    // The review prompt instructs the model to output exactly "No issues found."
+    // when it has nothing to flag — drop the heading and skip writing the file
+    // entirely in that case so the agent isn't distracted by a no-op section.
+    let initial_review_file = initial_review_body
+        .filter(|body| !body.contains("No issues found"))
+        .map(|body| section("initial-review", &body));
+    let abort_note = if ci_aborted_by_review {
+        "\n⚠️ This review flagged a HIGH severity issue and the local CI watch was \
+         aborted as a result. Investigate and fix the HIGH severity issue first — \
+         remote CI is still running and will be re-checked on the next push.\n"
+    } else {
+        ""
+    };
+    let initial_review_str = initial_review_file
+        .as_ref()
+        .map(|tf| format!(
+            "\n# Initial code review\n{abort_note}\n\
+             An initial code review has been done focusing on easy to surface bugs. Read this after you have understood the PR, but before running any other review agents.\n\
+             This will likely contain several 'obvious' bugs that are good to fix so that the review agents can focus on the deeper issues. Validate all bugs before trying to fix them. Handle like other bot feedback.\n\
+             Obviously incorrect code can be fixed immediately, but surface other issues to the user as a numbered list so that they can decide which to fix and which to leave.\n\
+             As this initial review is more surface level, skip surfacing false-positive review findings to the user. If all are false-positives, continue immediately to the next phase.\n\n\
+             - `{}` ({} lines) — initial code review\n",
+            tf.path.display(),
+            tf.lines,
+        ))
+        .unwrap_or_default();
     let pr_status = if pr_info.is_draft {
         "draft"
     } else if pr_info.number.is_some() {
@@ -3252,6 +3921,8 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
     }
     let agent_sessions_str = sessions::render_section(&agent_sessions, &push_result.branch);
 
+    let relevant_context_str = relevant_context_handle.await.unwrap_or_default();
+
     let prompt = build_prompt(
         pr_status,
         &files_index,
@@ -3261,10 +3932,13 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
         &diff_files_str,
         &prior_reviews,
         &review_instruction,
+        &initial_review_str,
         &pr_areas_str,
         &pr_areas,
         &graphite_str,
         &agent_sessions_str,
+        &relevant_context_str,
+        review_only_note.as_deref(),
     );
 
     // Put our own binary on PATH so the agent can call push-and-check subcommands
@@ -3305,21 +3979,48 @@ async fn main() {
             CliCommand::Pr { command: PrCommand::Comments { pr } } => {
                 pr_comments(pr).await;
             }
+            CliCommand::Pr { command: PrCommand::Review { model } } => {
+                let code = pr_review_cmd(model).await;
+                std::process::exit(code);
+            }
             CliCommand::Ci { command } => {
                 let code = match command {
                     CiCommand::Status { all, pr } => ci_status_cmd(pr, all).await,
-                    CiCommand::Failures { pr, max_bytes, raw } => ci_failures_cmd(pr, max_bytes, raw).await,
+                    CiCommand::Failures { pr, max_bytes, raw, model } => ci_failures_cmd(pr, max_bytes, raw, model).await,
                     CiCommand::Watch { pr } => ci_watch_cmd(pr).await,
                     CiCommand::Flaky { name, limit } => ci_flaky_cmd(name, limit).await,
                     CiCommand::Retries { pr } => ci_retries_cmd(pr).await,
                     CiCommand::Rerun { name, pr } => ci_rerun_cmd(name, pr).await,
-                    CiCommand::Distill { file } => ci_distill_cmd(file).await,
+                    CiCommand::Distill { file, model } => ci_distill_cmd(file, model).await,
                 };
                 std::process::exit(code);
             }
-            CliCommand::Prompt => {
+            CliCommand::Prompt { target: None } => {
                 let invocation = build_claude_invocation(cli.force).await;
                 println!("{}", invocation.prompt);
+            }
+            CliCommand::Prompt { target: Some(PromptTarget::InitialReview) } => {
+                print_initial_review_prompt().await;
+            }
+            CliCommand::Guides { paths } => {
+                let paths = if paths.is_empty() {
+                    let mut buf = String::new();
+                    use std::io::Read as _;
+                    let _ = std::io::stdin().read_to_string(&mut buf);
+                    buf.lines()
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(PathBuf::from)
+                        .collect::<Vec<_>>()
+                } else {
+                    paths
+                };
+                for g in collect_relevant_guides(&paths) {
+                    println!("{}", g.display());
+                }
+            }
+            CliCommand::ScoreGuides { output, base, threshold } => {
+                score_guides_cmd(output, base, threshold).await;
             }
         }
         return;
