@@ -168,10 +168,18 @@ For each bot comment:
 
 ## Phase 6: Custom review
 
-If CI is passing and the PR is not marked as ready for review yet,
-then use a subagent to review the pr.
+If CI is passing and the PR is not marked as ready for review yet, run a
+custom review via the bundled `review-agent` subagent. Invoke it through
+the Agent tool with `subagent_type: "review-agent"`. The subagent's
+initial context is populated automatically by a SubagentStart hook —
+it receives a `<dragonfly-context>` block with the commits, files-
+changed summary, per-file diff file paths under `/tmp/psc-diff-*.md`,
+and any scored `<relevant-context>` chunks. **You do NOT need to inline
+the diff or repeat the file index in the subagent prompt.** Pass only
+the per-concern scope: which area to focus on, what kind of bug to
+hunt for, and any context the hook can't provide.
 
-If you think there's some risk of deployment edge cases, start a subagent to evaluate this.
+If you think there's some risk of deployment edge cases, start a `review-agent` to evaluate this.
 The system is deployed gradually, with new backends spinning up over a period of ~10 minutes,
 replacing the old ones. This means old or new frontends can communicate with old and new backends
 for a short time. Potentially even having data flows like
@@ -183,7 +191,7 @@ Instruct the subagents to write a numbered list of issues they find.
 Ask the user which issues they want you to fix by writing the aggregated list of issues using markdown. Do not use the AskUserQuestion tool, allow the user to answer in free form text.
 After fixing, present the changes to the user, and allow for them to review manually before comitting and pushing.
 
-After changes have been approved, re-run the review subagent to see if it finds more issues.
+After changes have been approved, re-run `review-agent` to see if it finds more issues.
 
 ## Phase 7: PR description
 

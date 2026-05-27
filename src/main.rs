@@ -3652,6 +3652,73 @@ fn push_and_fix_settings_expanded() -> String {
     path.to_string_lossy().into_owned()
 }
 
+// ── Custom subagent definitions ─────────────────────────────────────────────
+
+// settings.json doesn't support an inline `agents` field — subagents have to
+// come from `.claude/agents/`, `~/.claude/agents/`, a plugin's agents dir, or
+// the `--agents` CLI flag. We use the CLI flag so a fresh checkout of any
+// repo gets the dragonfly review-agent without writing files into the user's
+// project. Agent body is bundled with the binary.
+const REVIEW_AGENT_MD: &str = include_str!("../agents/review-agent.md");
+
+/// Minimal YAML-frontmatter splitter for agent markdown files. Only handles
+/// the subset our agent files actually use: a leading `---\n...\n---\n`
+/// block of `key: value` lines (no nesting, no multi-line strings),
+/// followed by the body. Panics on malformed input — the input is a
+/// repo-bundled constant compiled in via [include_str!], so a parse failure
+/// would mean a programming error, not a runtime data issue.
+fn split_agent_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
+    let rest = text
+        .strip_prefix("---\n")
+        .expect("agent file must start with '---\\n'");
+    let end = rest
+        .find("\n---\n")
+        .expect("agent file frontmatter must close with '\\n---\\n'");
+    let yaml = &rest[..end];
+    let body = rest[end + "\n---\n".len()..].trim_start_matches('\n');
+    let mut fields = HashMap::new();
+    for line in yaml.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            fields.insert(k.trim().to_string(), v.trim().to_string());
+        }
+    }
+    (fields, body)
+}
+
+/// Builds the JSON value passed via `claude --agents '<json>'`. The
+/// outer object is keyed by agent name; each entry follows the same
+/// schema as the markdown frontmatter (description / prompt / model /
+/// color), with `prompt` carrying the markdown body. See
+/// https://code.claude.com/docs/en/sub-agents (CLI-defined subagents).
+fn build_agents_json() -> String {
+    let (meta, body) = split_agent_frontmatter(REVIEW_AGENT_MD);
+    let name = meta.get("name").expect("agent missing `name`").clone();
+    let mut entry = serde_json::Map::new();
+    entry.insert(
+        "description".into(),
+        serde_json::Value::String(
+            meta.get("description")
+                .expect("agent missing `description`")
+                .clone(),
+        ),
+    );
+    entry.insert("prompt".into(), serde_json::Value::String(body.to_string()));
+    if let Some(model) = meta.get("model") {
+        entry.insert("model".into(), serde_json::Value::String(model.clone()));
+    }
+    if let Some(color) = meta.get("color") {
+        entry.insert("color".into(), serde_json::Value::String(color.clone()));
+    }
+    let mut outer = serde_json::Map::new();
+    outer.insert(name, serde_json::Value::Object(entry));
+    serde_json::to_string(&serde_json::Value::Object(outer))
+        .expect("agent JSON must serialize")
+}
+
 fn load_dotenv() -> Vec<(String, String)> {
     let content = match std::fs::read_to_string(DOTENV_PATH) {
         Ok(s) => s,
@@ -3701,21 +3768,19 @@ Use the line numbers as they appear in the diff hunks. If you find no issues wor
 const REVIEW_AGGRESSIVE: &str = "\
 This PR has high potential for bugs. Be thorough:
 Trace through ALL code paths touched by this PR. Follow the call chains — don't just read the diff in isolation.
-Use multiple sub-agents in parallel to review different areas simultaneously.
+Spawn multiple `review-agent` subagents in parallel (one Agent tool call per concern) so different areas are reviewed simultaneously. Each subagent gets the <dragonfly-context> block via the SubagentStart hook — do NOT re-inline the diff or file index, just tell each subagent which area/concern to focus on.
 Look for subtle issues: race conditions, missing error handling, incorrect assumptions about state, edge cases in new logic.
 Leave no stone unturned — the goal is to be confident nothing was missed.
 
 Use the potential_for_bugs field in the area breakdown as a guide for what to focus on in particular.
-Include the paths to the precalculated diff files for files that are relevant for each subagent.
 
 One of the subagents should be dedicated to finding code that can be simplified. Guide it using the potential_for_simplification score in the PR areas breakdown — focus it on the areas with the highest simplification potential.
 ";
 
 const REVIEW_SIMPLIFICATION: &str = "\
 This PR has areas with high simplification potential.
-Spin up a dedicated sub-agent to review the code for simplification opportunities — duplicate code, large functions that should be broken down, or repetitive patterns that could be restructured.
-Guide it using the potential_for_simplification score in the PR areas breakdown — focus it on the areas with the highest simplification potential.
-Include the paths to the precalculated diff files for files that are relevant for that subagent.
+Spawn a dedicated `review-agent` subagent (subagent_type: review-agent) to review the code for simplification opportunities — duplicate code, large functions that should be broken down, or repetitive patterns that could be restructured.
+Guide it using the potential_for_simplification score in the PR areas breakdown — focus it on the areas with the highest simplification potential. The <dragonfly-context> hook delivers the diff files automatically; you only need to specify the focus.
 ";
 
 fn build_prompt(
@@ -3829,6 +3894,10 @@ async fn run_areas_only() {
 struct ClaudeInvocation {
     prompt: String,
     settings: String,
+    /// JSON value passed to `claude --agents`. Contains the bundled
+    /// review-agent definition so the parent agent can spawn it in
+    /// Phase 6 without the user having to install anything.
+    agents: String,
     path: String,
 }
 
@@ -4144,7 +4213,8 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
     };
 
     let settings = push_and_fix_settings_expanded();
-    ClaudeInvocation { prompt, settings, path }
+    let agents = build_agents_json();
+    ClaudeInvocation { prompt, settings, agents, path }
 }
 
 #[tokio::main]
@@ -4231,7 +4301,13 @@ async fn main() {
     let invocation = build_claude_invocation(cli.force).await;
     println!("   Launching Claude Code...\n");
     let mut cmd = std::process::Command::new("claude");
-    cmd.args(["--dangerously-skip-permissions", "--settings", &invocation.settings])
+    cmd.args([
+        "--dangerously-skip-permissions",
+        "--settings",
+        &invocation.settings,
+        "--agents",
+        &invocation.agents,
+    ])
         .arg(&invocation.prompt)
         .env("PATH", &invocation.path);
     for (k, v) in load_dotenv() {
