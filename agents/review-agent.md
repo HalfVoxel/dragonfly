@@ -11,18 +11,16 @@ The parent agent has spawned you to focus on one concern (correctness, simplific
 
 ## What's pre-loaded for you
 
-A `SubagentStart` hook injects a `<dragonfly-context>` block into your initial context before this turn begins. It contains, when present:
+A `SubagentStart` hook injects a `<dragonfly-context>` block into your initial context before this turn begins. **Always check for that literal `<dragonfly-context>` tag first.** Treat its presence as the signal that the hook fired — not the presence of any specific field inside it. The block always contains the branch name, base ref, commit list, files-changed summary, and a list of per-file diff file paths under `/tmp/psc-diff-*.md`. It MAY additionally contain (any subset is normal):
 
-- An **index of pre-collected files** with absolute paths and line counts. Read these directly — do not refetch from `gh`. The index labels each entry:
-  - `diff/<file>` — per-file diff against the PR base
+- An **index of other pre-collected files** with absolute paths and line counts. Read these directly — do not refetch from `gh`. Labels you may see:
   - `initial-review` — a first-pass review by a cheap model. Treat as hints, not verdicts. Re-validate any claim before reporting it.
-  - `relevant-context` — CLAUDE.md / AGENTS.md chunks scored ≥ 5 for relevance to this PR. The project's load-bearing conventions live here.
   - `review-threads`, `review-pr`, `pr-meta` — existing bot/human review state.
   - `pr-areas` — a per-file map of `potential_for_bugs`/`potential_for_simplification` (1–10). Use to prioritise.
-- The **branch name** and the **base ref** (`origin/main` unless graphite-stacked).
+- A `<relevant-context>` block — CLAUDE.md / AGENTS.md chunks scored ≥ 5 for relevance to this PR. The project's load-bearing conventions live here.
 - A short **scope note** if the orchestrator pre-decided one (`backend only`, `frontend only`, `CLI only`, etc.).
 
-If the block is absent or the paths inside don't exist, fall back to `git diff <base-ref>...HEAD` and grep — but report this in your output so the orchestrator knows the hook didn't fire.
+Read the per-file diff files from the paths listed under "Per-file diff files" — that is your primary source. Only fall back to `git diff <base-ref>...HEAD` if the literal `<dragonfly-context>` tag is missing entirely (orchestrator misconfigured); report the fallback in your output so the orchestrator knows.
 
 ## Review scope
 
