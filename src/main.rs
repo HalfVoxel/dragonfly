@@ -96,6 +96,14 @@ enum PromptTarget {
     /// would feed the model — useful for iterating on the prompt without
     /// burning a model call.
     InitialReview,
+    /// Print the dragonfly-context block injected into review-agent
+    /// subagents by the SubagentStart hook. Bundles commit list, changed
+    /// files, paths to per-file diff files (written under /tmp), and
+    /// the scored <relevant-context> block. Cached for 4 minutes per
+    /// cwd; concurrent callers serialize on a filesystem advisory lock
+    /// so a parallel review-agent fan-out only pays the build cost
+    /// once.
+    ReviewAgent,
 }
 
 #[derive(Subcommand)]
@@ -3118,6 +3126,191 @@ async fn pr_review_cmd(model: Option<Model>) -> i32 {
     }
 }
 
+// ── Review-agent context (SubagentStart hook target) ─────────────────────────
+
+/// TTL for the cached review-agent context. The Phase 6 fan-out spawns
+/// several review-agent subagents within a few seconds of each other,
+/// so a few-minute window is enough to serve them all from cache while
+/// still picking up new commits / diffs on the next review round.
+const REVIEW_CTX_TTL_SEC: u64 = 240;
+
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce4_84222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn review_ctx_paths() -> (PathBuf, PathBuf) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let key = fnv1a64(&cwd.to_string_lossy());
+    let cache = PathBuf::from(format!("/tmp/dragonfly-review-ctx-{key:016x}.md"));
+    let lock = PathBuf::from(format!("/tmp/dragonfly-review-ctx-{key:016x}.lock"));
+    (cache, lock)
+}
+
+/// Acquires an exclusive POSIX advisory lock (flock(2), LOCK_EX) on
+/// the given fd. Blocks until granted. The lock is released when the
+/// file is closed (i.e. when the [File] is dropped).
+///
+/// Used to serialize concurrent review-agent context builds across
+/// processes — when the parent agent spawns N review-agents in
+/// parallel, the SubagentStart hook fires N times; only the first one
+/// generates the cache, the others block here and then read it.
+fn flock_exclusive(f: &std::fs::File) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Builds the `<dragonfly-context>` block that gets injected into
+/// review-agent subagents. Includes commit list, files-changed summary,
+/// paths to per-file diff files under /tmp, and a scored
+/// `<relevant-context>` block for the changed files. Heavy: the
+/// relevant-context step shells out to `lov rag score`, which is the
+/// reason for the surrounding cache + lock.
+async fn build_review_agent_context() -> String {
+    let base_ref = pr_base_ref().await;
+    let log_cmd = format!("git log {base_ref}..HEAD --oneline");
+    let (branch, branch_commits) = tokio::join!(
+        sh("git branch --show-current"),
+        sh(&log_cmd),
+    );
+
+    let changed_files = get_changed_files(&base_ref).await;
+    let relevant: Vec<String> = filter_relevant_files(&changed_files)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let relevant_for_diffs = relevant.clone();
+    let base_for_diffs = base_ref.clone();
+    let diff_files_fut = async move {
+        let r: Vec<&str> = relevant_for_diffs.iter().map(String::as_str).collect();
+        write_diff_files(&r, &base_for_diffs).await
+    };
+
+    let base_for_rag = base_ref.clone();
+    let rag_fut = async move { build_relevant_context(&base_for_rag).await };
+
+    let ctx_fut = collect_context_strings(&branch_commits, &base_ref);
+
+    let (diff_files_str, relevant_context, ctx) = tokio::join!(diff_files_fut, rag_fut, ctx_fut);
+
+    let branch = branch.unwrap_or_default();
+    let mut out = String::new();
+    out.push_str("<dragonfly-context>\n");
+    out.push_str(&format!(
+        "Branch: `{}`  (base: `{}`)\n",
+        if branch.is_empty() { "(detached)".to_string() } else { branch },
+        base_ref,
+    ));
+    out.push_str(&ctx.pr_commits);
+    out.push_str(&ctx.changed_files);
+    if !diff_files_str.is_empty() {
+        out.push_str("\nPer-file diff files:\n");
+        out.push_str(&diff_files_str);
+    } else {
+        out.push_str("\n(no per-file diffs against base — review may be unnecessary)\n");
+    }
+    if !relevant_context.is_empty() {
+        out.push('\n');
+        out.push_str(&relevant_context);
+        if !relevant_context.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out.push_str("</dragonfly-context>\n");
+    out
+}
+
+/// Implementation of `prompt review-agent`. Serializes parallel callers
+/// via flock on a per-cwd lockfile; returns the cached body when it's
+/// less than [REVIEW_CTX_TTL_SEC] seconds old, otherwise rebuilds.
+async fn review_agent_prompt_cmd() -> i32 {
+    let (cache_path, lock_path) = review_ctx_paths();
+
+    // Open the lock file ahead of any work. Drop happens at end of fn,
+    // which releases the flock — the cache write must finish first.
+    let lock_file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("review-agent: failed to open lock {}: {e}", lock_path.display());
+            return 1;
+        }
+    };
+    if let Err(e) = flock_exclusive(&lock_file) {
+        eprintln!("review-agent: flock failed: {e}");
+        return 1;
+    }
+
+    // Cache hit? Read mtime; if within TTL, dump it.
+    if let Ok(meta) = std::fs::metadata(&cache_path) {
+        if let Ok(modified) = meta.modified() {
+            if let Ok(age) = SystemTime::now().duration_since(modified) {
+                if age.as_secs() < REVIEW_CTX_TTL_SEC {
+                    match std::fs::read_to_string(&cache_path) {
+                        Ok(body) => {
+                            eprintln!(
+                                "review-agent: cache hit ({}, {}s old)",
+                                cache_path.display(),
+                                age.as_secs(),
+                            );
+                            print!("{body}");
+                            return 0;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "review-agent: cache file unreadable ({e}); regenerating",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Cache miss / stale — rebuild.
+    eprintln!("review-agent: building context (cache miss/stale)...");
+    let start = std::time::Instant::now();
+    let body = build_review_agent_context().await;
+    eprintln!(
+        "review-agent: built in {:.1}s ({} bytes)",
+        start.elapsed().as_secs_f64(),
+        body.len(),
+    );
+
+    // Atomic write: tmp file + rename, so a concurrent reader (if a
+    // future change downgrades to LOCK_SH for the hot path) never sees
+    // a torn write.
+    let tmp_path = cache_path.with_extension(format!("md.tmp.{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp_path, &body) {
+        eprintln!("review-agent: failed to write {}: {e}", tmp_path.display());
+        return 1;
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &cache_path) {
+        eprintln!(
+            "review-agent: failed to rename {} -> {}: {e}",
+            tmp_path.display(),
+            cache_path.display(),
+        );
+        return 1;
+    }
+    print!("{body}");
+    0
+}
+
 // ── PR area analysis ─────────────────────────────────────────────────────────
 
 fn pr_areas_cache_path(sha: &str) -> PathBuf {
@@ -4001,6 +4194,10 @@ async fn main() {
             }
             CliCommand::Prompt { target: Some(PromptTarget::InitialReview) } => {
                 print_initial_review_prompt().await;
+            }
+            CliCommand::Prompt { target: Some(PromptTarget::ReviewAgent) } => {
+                let code = review_agent_prompt_cmd().await;
+                std::process::exit(code);
             }
             CliCommand::Guides { paths } => {
                 let paths = if paths.is_empty() {
