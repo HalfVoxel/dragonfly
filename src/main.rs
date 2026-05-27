@@ -2707,6 +2707,10 @@ async fn full_diffs<'a>(changed_files: &[&'a str], base_ref: &str) -> Vec<(&'a s
 /// walking continues to the filesystem root — only directories that actually
 /// hold a guide contribute anything anyway.
 ///
+/// `~/.claude/CLAUDE.md` is also always seeded when it exists, even though
+/// it sits outside the project root. The RAG scorer downstream is expected
+/// to drop irrelevant chunks per PR.
+///
 /// `@`-references inside collected guides are followed transitively. A
 /// reference may be absolute (`@/abs/path`), home-rooted (`@~/path`), or
 /// relative to the file containing the reference (`@./sibling.md`,
@@ -2760,6 +2764,19 @@ fn collect_relevant_guides<P: AsRef<std::path::Path>>(paths: &[P]) -> Vec<PathBu
             }
             let Some(parent) = dir.parent() else { break };
             dir = parent.to_path_buf();
+        }
+    }
+
+    // Phase 1b: seed with user-global ~/.claude/CLAUDE.md if present.
+    // It's outside any project's git toplevel so the ancestor walk above
+    // never reaches it, but the user's global instructions are often
+    // relevant — leave it to the RAG scorer to drop irrelevant chunks.
+    // @-references inside it are still followed transitively by phase 2.
+    let user_claude_md = home_dir().join(".claude").join("CLAUDE.md");
+    if user_claude_md.is_file() {
+        let canon = user_claude_md.canonicalize().unwrap_or(user_claude_md);
+        if found.insert(canon.clone()) {
+            queue.push(canon);
         }
     }
 
