@@ -166,6 +166,11 @@ For each bot comment:
     ```
     The thread IDs are available in the pre-collected review-threads data.
 
+    Prefer replying on an existing thread over a top-level comment — it keeps discussion next to the code. Only post a top-level comment when no thread fits (cross-cutting summary, meta question, review-only roll-up):
+    ```bash
+    push-and-check pr comment --body "..."   # or --body - to read from stdin
+    ```
+
 ## Phase 6: Custom review
 
 If CI is passing and the PR is not marked as ready for review yet, run a

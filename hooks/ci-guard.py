@@ -127,6 +127,17 @@ RULES = [
         "edit) and matches the description guide in the skill prompt.\n"
         "Other `gh pr edit` flags like `--add-reviewer` / `--add-label` are still fine.",
     ),
+
+    # 12) `gh pr comment ... --body / --body-file` — replaced by `pr comment`.
+    (
+        r"\bgh\s+pr\s+comment\b[^|]*--body(?:-file)?\b",
+        "Use `push-and-check pr comment --body \"<body>\"` (or `--body -` to read from\n"
+        "stdin) instead of `gh pr comment --body / --body-file`.\n"
+        "It defaults to the current branch's PR (`--pr <N>` for an explicit number)\n"
+        "and signs the comment with a Dragonfly footer so reviewers can tell\n"
+        "agent-authored comments from human ones.\n"
+        "For a review-thread reply, use `pr thread comment` instead.",
+    ),
 ]
 
 

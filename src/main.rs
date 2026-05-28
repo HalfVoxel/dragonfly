@@ -119,6 +119,17 @@ enum PrCommand {
         /// PR description body (markdown). Pass `-` to read from stdin.
         body: String,
     },
+    /// Post a top-level PR conversation comment on the current branch's PR.
+    /// This is the issue-comment thread (the main PR conversation), not a
+    /// review-thread reply — for that, use `pr thread comment`.
+    Comment {
+        /// Explicit PR number. Defaults to the current branch's PR.
+        #[arg(long)]
+        pr: Option<String>,
+        /// Comment body (markdown). Pass `-` to read from stdin.
+        #[arg(long)]
+        body: String,
+    },
     /// Print PR review threads, top-level reviews, and metadata in the same
     /// cleaned format used by the pre-collected data (review-threads,
     /// review-pr, pr-meta). Defaults to the current branch's PR.
@@ -1074,8 +1085,13 @@ fn format_pr_meta(json: &str) -> Option<String> {
     Some(out)
 }
 
+/// Footer appended to every PR comment / thread reply posted through this CLI.
+/// Lets reviewers tell agent-authored comments from human ones at a glance, and
+/// the link points back at the tool so a curious reader can find the source.
+const DRAGONFLY_FOOTER: &str = "\n\n<sup>via [Dragonfly](https://github.com/HalfVoxel/dragonfly) (Claude)</sup>";
+
 async fn pr_thread_comment(thread_id: &str, body: &str) {
-    let signed = format!("{body}\n\n<sup>via Dragonfly (Claude)</sup>");
+    let signed = format!("{body}{DRAGONFLY_FOOTER}");
     let r = sh3(&format!(
         "gh api graphql -f query='mutation($threadId: ID!, $body: String!) {{ \
             addPullRequestReviewThreadReply(input: {{pullRequestReviewThreadId: $threadId, body: $body}}) {{ \
@@ -1144,6 +1160,64 @@ async fn pr_set_description(body_arg: &str) {
         println!("Updated PR #{pr_number} description.");
     } else {
         eprintln!("gh pr edit failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        std::process::exit(out.status.code().unwrap_or(1));
+    }
+}
+
+async fn pr_comment(pr_arg: Option<String>, body_arg: &str) {
+    let body = if body_arg == "-" {
+        let mut s = String::new();
+        if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut s) {
+            eprintln!("Failed to read comment body from stdin: {e}");
+            std::process::exit(1);
+        }
+        s
+    } else {
+        body_arg.to_string()
+    };
+
+    let Some(pr_number) = resolve_pr_number(pr_arg).await else {
+        eprintln!("No PR for current branch and --pr not supplied.");
+        std::process::exit(2);
+    };
+
+    let signed = format!("{}{}", body.trim_end(), DRAGONFLY_FOOTER);
+
+    let mut child = match std::process::Command::new("gh")
+        .args(["pr", "comment", &pr_number, "--body-file", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to spawn gh: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(signed.as_bytes()) {
+            eprintln!("Failed to write body to gh stdin: {e}");
+            std::process::exit(1);
+        }
+    }
+    let out = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("Failed to wait for gh: {e}");
+            std::process::exit(1);
+        }
+    };
+    if out.status.success() {
+        let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if url.is_empty() {
+            println!("Commented on PR #{pr_number}.");
+        } else {
+            println!("Commented on PR #{pr_number}: {url}");
+        }
+    } else {
+        eprintln!("gh pr comment failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         std::process::exit(out.status.code().unwrap_or(1));
     }
 }
@@ -1496,13 +1570,36 @@ fn extract_failure_summary(log: &str) -> String {
         r"(?i)FAIL|--- FAIL|panic:|Error:|error:|ERROR|fatal:|undefined:|cannot |could not |timed out|exit status"
     ).unwrap();
 
-    log.lines()
-        .filter_map(|line| {
-            let text = line.splitn(4, '\t').last().unwrap_or(line);
-            if re.is_match(text) { Some(text.trim()) } else { None }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let lines: Vec<&str> = log.lines()
+        .map(|line| line.splitn(4, '\t').last().unwrap_or(line).trim_end())
+        .collect();
+
+    const CONTEXT: usize = 3;
+    let mut keep = vec![false; lines.len()];
+    for (i, line) in lines.iter().enumerate() {
+        if re.is_match(line) {
+            let lo = i.saturating_sub(CONTEXT);
+            let hi = (i + CONTEXT + 1).min(lines.len());
+            for slot in &mut keep[lo..hi] {
+                *slot = true;
+            }
+        }
+    }
+
+    let mut out: Vec<&str> = Vec::new();
+    let mut prev_kept = false;
+    for (i, &k) in keep.iter().enumerate() {
+        if k {
+            if !prev_kept && !out.is_empty() {
+                out.push("--");
+            }
+            out.push(lines[i]);
+            prev_kept = true;
+        } else {
+            prev_kept = false;
+        }
+    }
+    out.join("\n")
 }
 
 const DISTILL_INSTRUCTIONS: &str = r#"You are given CI failure logs collected from a GitHub PR. Extract the most relevant information so a developer can quickly understand what failed and why.
@@ -1709,8 +1806,8 @@ async fn list_failed_checks(pr_number: &str) -> Vec<PrCheck> {
 async fn fetch_gha_log(check: &PrCheck) -> String {
     let (run_id, job_id) = parse_gha_link(&check.link);
     let cmd = match job_id {
-        Some(j) => format!("gh run view --job={j} --log-failed"),
-        None if run_id != 0 => format!("gh run view {run_id} --log-failed"),
+        Some(j) => format!("gh run view --job={j} --log"),
+        None if run_id != 0 => format!("gh run view {run_id} --log"),
         _ => return String::new(),
     };
     let log = sh3(&cmd).await;
@@ -4065,7 +4162,7 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
              - Do NOT implement fixes unless the user explicitly asks for them.\n\
              - Focus on Phase 5 (review bot comments) and Phase 6 (custom review).\n\
              - Surface findings as a numbered list; let the user pick which to post as a PR comment.\n\
-             - After user approves, post a single PR comment with the review findings. Group findings in red/orange/green sections (use colored dots).\n\
+             - After user approves, post a single top-level PR comment with the review findings via `push-and-check pr comment --body -` (pipe the markdown on stdin to avoid shell-quoting the multi-line body). Group findings in red/orange/green sections (use colored dots).\n\
              - Skip Phase 7 (PR description) and Phase 9 (ready for review).\n\
              - When CI fails, report it; do not start fixing it.\n\n",
             pr_info.author_login, viewer_login,
@@ -4291,6 +4388,9 @@ async fn main() {
             },
             CliCommand::Pr { command: PrCommand::Description { body } } => {
                 pr_set_description(&body).await;
+            }
+            CliCommand::Pr { command: PrCommand::Comment { pr, body } } => {
+                pr_comment(pr, &body).await;
             }
             CliCommand::Pr { command: PrCommand::Comments { pr } } => {
                 pr_comments(pr).await;
