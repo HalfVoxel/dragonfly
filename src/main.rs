@@ -224,8 +224,9 @@ enum CiCommand {
         #[arg(long)]
         model: Option<Model>,
     },
-    /// Wrap `gh pr checks --watch --fail-fast` with auto-reconnect; print a single
-    /// final summary (same shape as `ci status`).
+    /// Poll PR checks until all pass or one fails (fail-fast), then print a final
+    /// summary (same shape as `ci status`). Waits for slow checks like test-e2e but
+    /// skips the Graphite mergeability check, deploy, and doc-review.
     Watch {
         /// Explicit PR number. Defaults to the current branch's PR.
         #[arg(long)]
@@ -1249,10 +1250,20 @@ fn run_id_from_url(url: &str) -> u64 {
         .unwrap_or(0)
 }
 
+// Graphite's mergeability check sits `pending` indefinitely — it never reports a
+// terminal state — so any path that waits on it hangs forever. Excluded from
+// every wait path, including `ci watch` (which otherwise waits for slow checks).
+const GRAPHITE_MERGEABILITY: &str = "Graphite / mergeability_check";
+
 // Checks that are slow, flaky, or non-blocking — exclude from the wait so they
 // don't keep `pending` above zero forever. Failures here are surfaced to the
 // user but not auto-fixed as part of dragonfly.
-const IGNORED_CHECKS: &[&str] = &["Cursor Bugbot", "test-e2e", "doc-review", "deploy", "Graphite / mergeability_check"];
+const IGNORED_CHECKS: &[&str] = &["Cursor Bugbot", "test-e2e", "doc-review", "deploy", GRAPHITE_MERGEABILITY];
+
+// `ci watch` waits for slow checks like test-e2e, but skips the never-terminating
+// Graphite check plus deploy and doc-review (non-blocking, not worth blocking the
+// watch on). See [GRAPHITE_MERGEABILITY].
+const WATCH_IGNORED_CHECKS: &[&str] = &["doc-review", "deploy", GRAPHITE_MERGEABILITY];
 
 /// Drop "skipping" rows from `gh pr checks` output. The agent doesn't need
 /// them in its CI temp file — they're already counted separately.
@@ -1266,13 +1277,13 @@ fn strip_skipping(out: &str) -> String {
         .join("\n")
 }
 
-fn parse_checks(out: &str) -> CheckCounts {
+fn parse_checks(out: &str, ignored: &[&str]) -> CheckCounts {
     let mut checks: HashMap<&str, (u64, &str)> = HashMap::new();
     for line in out.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() >= 2 {
             let name = parts[0].trim();
-            if IGNORED_CHECKS.contains(&name) {
+            if ignored.contains(&name) {
                 continue;
             }
             let status = parts[1].trim();
@@ -1406,7 +1417,7 @@ async fn wait_for_ci(
         (c, rc, o)
     } else {
         let r = sh3(&format!("gh pr checks {pr_number}")).await;
-        let mut c = parse_checks(&r.stdout);
+        let mut c = parse_checks(&r.stdout, IGNORED_CHECKS);
         let observed = c.passed + c.failed + c.pending + c.skipping;
         if r.code != 0 && c.failed == 0 && observed == 0 {
             c.pending = c.pending.max(1);
@@ -1493,7 +1504,7 @@ async fn wait_for_ci(
 
             sleep(std::time::Duration::from_secs(15)).await;
             let r = sh3(&format!("gh pr checks {pr_number}")).await;
-            counts = parse_checks(&r.stdout);
+            counts = parse_checks(&r.stdout, IGNORED_CHECKS);
             _check_rc = r.code;
             out = r.stdout;
             let observed = counts.passed + counts.failed + counts.pending + counts.skipping;
@@ -2052,7 +2063,7 @@ async fn resolve_pr_number(pr: Option<String>) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
-async fn ci_status_cmd(pr: Option<String>, all: bool) -> i32 {
+async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
     let Some(pr_number) = resolve_pr_number(pr).await else {
         eprintln!("No PR for current branch and --pr not supplied.");
         return 2;
@@ -2065,6 +2076,7 @@ async fn ci_status_cmd(pr: Option<String>, all: bool) -> i32 {
         check_origin_main_conflicts(),
     );
     let mut checks: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
+    checks.retain(|c| !ignored.contains(&c.name.as_str()));
     // Dedup by name, keeping the highest-priority bucket: fail > pending > pass > skipping.
     let priority = |b: &str| match b { "fail" => 3, "pending" => 2, "pass" => 1, _ => 0 };
     checks.sort_by(|a, b| priority(&b.bucket).cmp(&priority(&a.bucket)));
@@ -2082,7 +2094,7 @@ async fn ci_status_cmd(pr: Option<String>, all: bool) -> i32 {
     // Always count totals from full set.
     let all_checks: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
     let mut by_name: HashMap<String, &PrCheck> = HashMap::new();
-    for c in &all_checks {
+    for c in all_checks.iter().filter(|c| !ignored.contains(&c.name.as_str())) {
         // Keep the highest-priority row per name.
         let keep = by_name.get(&c.name).map(|p| priority(&c.bucket) > priority(&p.bucket)).unwrap_or(true);
         if keep { by_name.insert(c.name.clone(), c); }
@@ -2199,21 +2211,38 @@ async fn ci_watch_cmd(pr: Option<String>) -> i32 {
     if check_origin_main_conflicts().await {
         println!("⚠️  Merge conflicts with origin/main — some checks did not run.");
     }
-    // Use --watch --fail-fast and retry on dropped connection up to 3 times.
-    let mut attempts = 0;
-    loop {
-        let r = sh3(&format!("gh pr checks {pr_number} --watch --fail-fast")).await;
-        attempts += 1;
-        // gh exits 0 when all pass, 8 when some fail (and shows final state).
-        // Treat any other exit (1, broken pipe, etc.) as a dropped connection.
-        if r.code == 0 || r.code == 8 || attempts >= 4 {
-            // Print final summary in the ci-status shape, regardless of exit code.
-            let _ = ci_status_cmd(Some(pr_number.clone()), false).await;
-            return if r.code == 0 { 0 } else { 1 };
+    // Poll rather than `gh pr checks --watch`: gh's watch blocks until every check
+    // reaches a terminal state, so the perpetually-`pending` [GRAPHITE_MERGEABILITY]
+    // check would hang it forever. Filtering only happens in our own loop.
+    let branch = sh("git rev-parse --abbrev-ref HEAD").await.unwrap_or_default();
+    let head_sha = sh("git rev-parse HEAD").await.unwrap_or_default();
+    let ci_start = get_ci_start_epoch(&branch, &head_sha).await;
+    let mut prev_line = String::new();
+    let rc = loop {
+        let r = sh3(&format!("gh pr checks {pr_number}")).await;
+        let counts = parse_checks(&r.stdout, WATCH_IGNORED_CHECKS);
+
+        let line = format_ci_status(&counts, ci_start, 0);
+        if line != prev_line {
+            print!("\r{line}    ");
+            std::io::stdout().flush().ok();
+            prev_line = line;
         }
-        eprintln!("gh watch exited {} (attempt {attempts}/4); reconnecting in 5s...", r.code);
-        sleep(std::time::Duration::from_secs(5)).await;
-    }
+
+        if counts.failed > 0 {
+            println!();
+            break 1;
+        }
+        if counts.pending == 0 {
+            println!();
+            break 0;
+        }
+        sleep(std::time::Duration::from_secs(15)).await;
+    };
+    // Final summary in the ci-status shape, sharing the watch ignore list so the
+    // closing tally matches what the loop waited on.
+    let _ = ci_status_cmd(Some(pr_number), false, WATCH_IGNORED_CHECKS).await;
+    rc
 }
 
 async fn ci_flaky_cmd(name: String, limit: usize) -> i32 {
@@ -2623,7 +2652,7 @@ async fn collect_reviews_and_ci(
         } else {
             sh3(&format!("gh pr checks {pr_number}")).await
         };
-        let mut counts = parse_checks(&first.stdout);
+        let mut counts = parse_checks(&first.stdout, IGNORED_CHECKS);
         let observed = counts.passed + counts.failed + counts.pending + counts.skipping;
         if first.code != 0 && counts.failed == 0 && observed == 0 {
             counts.pending = counts.pending.max(1);
@@ -3679,7 +3708,7 @@ async fn branch_ci_status(branch: String, is_current: bool) -> String {
         return format!("- `{branch}`{marker} — no PR");
     };
 
-    let counts = parse_checks(&checks_r.stdout);
+    let counts = parse_checks(&checks_r.stdout, IGNORED_CHECKS);
     let mut parts = Vec::new();
     if counts.passed > 0 {
         parts.push(format!("{} passed", counts.passed));
@@ -4401,7 +4430,7 @@ async fn main() {
             }
             CliCommand::Ci { command } => {
                 let code = match command {
-                    CiCommand::Status { all, pr } => ci_status_cmd(pr, all).await,
+                    CiCommand::Status { all, pr } => ci_status_cmd(pr, all, &[]).await,
                     CiCommand::Failures { pr, max_bytes, raw, model } => ci_failures_cmd(pr, max_bytes, raw, model).await,
                     CiCommand::Watch { pr } => ci_watch_cmd(pr).await,
                     CiCommand::Flaky { name, limit } => ci_flaky_cmd(name, limit).await,
