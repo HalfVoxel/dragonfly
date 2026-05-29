@@ -12,7 +12,7 @@ include one in your own analysis. Common cases:
 - Investigating a hot path or anomaly while reviewing → grab the relevant timeseries.
 
 `GRAFANA_TOKEN` and `GRAFANA_HOST` are already exported in this environment by
-push-and-check — you do **not** need to set them yourself, just `curl` directly.
+dragonfly — you do **not** need to set them yourself, just `curl` directly.
 
 ## Rendering a panel as PNG
 

@@ -1,6 +1,6 @@
 pub const CODE_COMMENTS_GUIDE: &str = include_str!("../code-comments.md");
 
-pub const PUSH_AND_FIX_SKILL: &str = r#"# Push and Fix CI
+pub const DRAGONFLY_SKILL: &str = r#"# Dragonfly
 
 Push the current branch, monitor CI, and fix relevant issues that arise — including review bot comments.
 
@@ -60,14 +60,14 @@ After pushing, monitor CI checks:
 
 ```bash
 # Auto-reconnecting watch — prints a single final summary when CI settles
-push-and-check ci watch
+dragonfly ci watch
 ```
 
 For a one-shot poll instead of watching:
 
 ```bash
-push-and-check ci status            # failing + pending only (exits 1 if any failing)
-push-and-check ci status --all      # show every check (passed + skipped too)
+dragonfly ci status            # failing + pending only (exits 1 if any failing)
+dragonfly ci status --all      # show every check (passed + skipped too)
 ```
 
 Both subcommands print one line per check with a provider tag (`github`,
@@ -83,13 +83,13 @@ When checks fail:
 
 1. **Identify the failure**: Get the failed check details.
    ```bash
-   push-and-check ci status
+   dragonfly ci status
    ```
 
 2. **Get failure logs**: Fetch logs for **every** failed check, across providers
    (GitHub Actions, Buildkite, Spacelift, Wiz, etc.) in one shot.
    ```bash
-   push-and-check ci failures
+   dragonfly ci failures
    ```
    Each failed check gets its own section with extracted error lines and a link.
    Non-GHA providers fall back to the check-run output GitHub stores plus the URL,
@@ -100,13 +100,13 @@ When checks fail:
 
 3. **Decide if it's flaky or pre-existing on main**: don't fix unrelated regressions.
    ```bash
-   push-and-check ci flaky test-go   # checks the same name on the last 20 main commits
+   dragonfly ci flaky test-go   # checks the same name on the last 20 main commits
    ```
 
 4. **Check retry history before re-running**:
    ```bash
-   push-and-check ci retries         # lists this head's GHA runs + attempt counts
-   push-and-check ci rerun test-go   # rerun-failed-jobs for that named check
+   dragonfly ci retries         # lists this head's GHA runs + attempt counts
+   dragonfly ci rerun test-go   # rerun-failed-jobs for that named check
    ```
 
 3. **Diagnose and fix**: Read the relevant source files, understand the failure.
@@ -140,8 +140,8 @@ the pre-collected files (thread IDs included), so you don't need to write
 GraphQL by hand:
 
 ```bash
-push-and-check pr comments              # current branch's PR
-push-and-check pr comments --pr 12345   # explicit PR number
+dragonfly pr comments              # current branch's PR
+dragonfly pr comments --pr 12345   # explicit PR number
 ```
 
 ### Handling bot feedback
@@ -161,14 +161,14 @@ For each bot comment:
 7. **Offer to mark the specific bot threads as resolved**: Clearly state the titles of the threads you are resolving in bold.
     When resolving bot threads, first add a comment to each thread saying in which commit this was fixed, then resolve it:
     ```bash
-    push-and-check pr thread comment --thread-id PRRT_... --body "Fixed in abc1234"
-    push-and-check pr thread resolve --thread-id PRRT_...
+    dragonfly pr thread comment --thread-id PRRT_... --body "Fixed in abc1234"
+    dragonfly pr thread resolve --thread-id PRRT_...
     ```
     The thread IDs are available in the pre-collected review-threads data.
 
     Prefer replying on an existing thread over a top-level comment — it keeps discussion next to the code. Only post a top-level comment when no thread fits (cross-cutting summary, meta question, review-only roll-up):
     ```bash
-    push-and-check pr comment --body "..."   # or --body - to read from stdin
+    dragonfly pr comment --body "..."   # or --body - to read from stdin
     ```
 
 ## Phase 6: Custom review
@@ -203,7 +203,7 @@ After changes have been approved, re-run `review-agent` to see if it finds more 
 If the PR has no substantial description, write one using:
 
 ```
-push-and-check pr description "..."
+dragonfly pr description "..."
 ```
 
 This phase may be done in parallel with waiting on CI, if CI has passed at least once before.
@@ -312,8 +312,8 @@ If CI is failing due to a seemingly unrelated issue, it could be that:
 To check the test status on main:
 
 ```
-push-and-check ci flaky <check-name>           # default: last 20 commits
-push-and-check ci flaky test-go --limit 50
+dragonfly ci flaky <check-name>           # default: last 20 commits
+dragonfly ci flaky test-go --limit 50
 ```
 
 This prints pass/fail/skip counts for the named check on the last N commits of
@@ -329,7 +329,7 @@ flaky; clean → likely caused by this PR).
 ### Check retries for CI
 
 ```
-push-and-check ci retries
+dragonfly ci retries
 ```
 
 Lists the GitHub Actions runs for the current head SHA with attempt counts so
@@ -340,7 +340,7 @@ current PR. If so, ask the user before scheduling it yet another time.
 To rerun the failed jobs of a named check:
 
 ```
-push-and-check ci rerun <check-name>
+dragonfly ci rerun <check-name>
 ```
 
 This resolves the name to the right workflow run and calls `gh run rerun
@@ -381,7 +381,7 @@ While working through the phases, watch for friction that future runs could avoi
 When you notice one of these, submit a brief, concrete note via CLI:
 
 ```bash
-push-and-check --feedback "Spent 3 round-trips resolving review threads because thread IDs weren't in the pre-collected data for outdated threads. A `push-and-check pr thread list` subcommand would help."
+dragonfly --feedback "Spent 3 round-trips resolving review threads because thread IDs weren't in the pre-collected data for outdated threads. A `dragonfly pr thread list` subcommand would help."
 ```
 
 Keep each entry short and specific — describe the friction and (if obvious) what would fix it. Do NOT use this for PR-level issues or user-facing status; it's only for meta-feedback about your process.

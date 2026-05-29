@@ -21,7 +21,7 @@
       "Bash(lint*)",
       "Bash(format:*)",
       "Bash(test*)",
-      "Bash(push-and-check:*)",
+      "Bash(dragonfly:*)",
       "Bash(process-compose*)",
       "Bash(head:*)",
       "Bash(tail:*)",

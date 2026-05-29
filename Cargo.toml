@@ -1,10 +1,10 @@
 [package]
-name = "push-and-check"
+name = "dragonfly"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "push-and-check"
+name = "dragonfly"
 path = "src/main.rs"
 
 [dependencies]

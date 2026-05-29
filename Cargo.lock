@@ -209,6 +209,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "dragonfly"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "dialoguer",
+ "html-escape",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "strip-ansi-escapes",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -472,23 +489,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "push-and-check"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "dialoguer",
- "html-escape",
- "libc",
- "regex",
- "serde",
- "serde_json",
- "strip-ansi-escapes",
- "tempfile",
- "tokio",
 ]
 
 [[package]]

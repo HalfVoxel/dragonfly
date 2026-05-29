@@ -149,9 +149,9 @@ fn format_session(path: &Path, branch: &str) -> Option<SessionFile> {
                     continue;
                 }
                 if let Some(s) = v.pointer("/message/content").and_then(|c| c.as_str()) {
-                    // The first user message of a push-and-fix session is the
+                    // The first user message of a dragonfly session is the
                     // auto-generated prompt — collapse to a short placeholder.
-                    if user_messages == 0 && s.trim_start().starts_with("# Push and Fix CI") {
+                    if user_messages == 0 && s.trim_start().starts_with("# Dragonfly") {
                         out += "<user>...pull request review instructions...</user>\n";
                         user_messages += 1;
                         continue;
@@ -274,7 +274,7 @@ mod tests {
         );
     }
 
-    /// Ignored: requires a real push-and-fix session file on disk.
+    /// Ignored: requires a real dragonfly session file on disk.
     #[test]
     #[ignore]
     fn format_session_collapses_pnc_prompt() {

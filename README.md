@@ -13,7 +13,7 @@ The cli pushes the current branch, waits for CI, collects the failure logs and r
 1. **Push** — Pushes the latest commit.
 2. **Watch CI** — streams `gh pr checks` and pulls logs for any failing jobs.
 3. **Collect context** — changed files, commits, recent Claude Code sessions on the branch, unresolved PR review threads, and merge-conflict status against `origin/main`.
-4. **Hand off to Claude** — `exec`s `claude` with a curated prompt and the bundled push-and-fix skill, so the agent fixes failures and replies to review comments.
+4. **Hand off to Claude** — `exec`s `claude` with a curated prompt and the bundled dragonfly skill, so the agent fixes failures and replies to review comments.
 
 ## Benefits
 
@@ -33,28 +33,28 @@ Why use this instead of just letting claude do everything itself?
 cargo install --path .
 ```
 
-The binary is `push-and-check`.
+The binary is `dragonfly`.
 
 ## Usage
 
 ```bash
-push-and-check                  # push, wait for CI, launch Claude to fix
-push-and-check --force          # force-push (after rebase)
-push-and-check --areas          # print the PR area analysis and exit
-push-and-check prompt           # build & print the Claude prompt without launching
+dragonfly                  # push, wait for CI, launch Claude to fix
+dragonfly --force          # force-push (after rebase)
+dragonfly --areas          # print the PR area analysis and exit
+dragonfly prompt           # build & print the Claude prompt without launching
 ```
 
 PR review-thread helpers (used by the skill, but callable directly):
 
 ```bash
-push-and-check pr thread comment --thread-id <id> --body "..."
-push-and-check pr thread resolve --thread-id <id>
-push-and-check pr description -          # read body from stdin
-push-and-check pr comment --body "..."   # post a top-level PR comment (current branch's PR)
-push-and-check pr comment --body -       # ...or read the body from stdin
-push-and-check pr comments               # print review threads, reviews, and meta (cleaned)
-push-and-check pr comments --pr 12345    # explicit PR number
-push-and-check --feedback "..."  # append a note to ~/.dragonfly/feedback
+dragonfly pr thread comment --thread-id <id> --body "..."
+dragonfly pr thread resolve --thread-id <id>
+dragonfly pr description -          # read body from stdin
+dragonfly pr comment --body "..."   # post a top-level PR comment (current branch's PR)
+dragonfly pr comment --body -       # ...or read the body from stdin
+dragonfly pr comments               # print review threads, reviews, and meta (cleaned)
+dragonfly pr comments --pr 12345    # explicit PR number
+dragonfly --feedback "..."  # append a note to ~/.dragonfly/feedback
 ```
 
 ## Requirements

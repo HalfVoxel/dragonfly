@@ -17,7 +17,7 @@ mod sessions;
 mod skill;
 
 #[derive(Parser)]
-#[command(name = "push-and-check")]
+#[command(name = "dragonfly")]
 struct Cli {
     /// Force push (e.g. after rebase)
     #[arg(long)]
@@ -27,7 +27,7 @@ struct Cli {
     #[arg(long)]
     areas: bool,
 
-    /// Submit feedback about push-and-check itself (appended to ~/.dragonfly/feedback)
+    /// Submit feedback about dragonfly itself (appended to ~/.dragonfly/feedback)
     #[arg(long, value_name = "MESSAGE")]
     feedback: Option<String>,
 
@@ -49,7 +49,7 @@ enum CliCommand {
         command: CiCommand,
     },
     /// Print a prompt instead of invoking the model. With no subcommand, runs
-    /// the full push-and-check flow (push, CI wait, data collection) and
+    /// the full dragonfly flow (push, CI wait, data collection) and
     /// prints the main agent prompt. With `initial-review`, prints just the
     /// initial code review prompt (system + inlined diff).
     Prompt {
@@ -139,7 +139,7 @@ enum PrCommand {
         pr: Option<String>,
     },
     /// Run an initial code review of the current branch (defaults to Gemini).
-    /// Same call that runs automatically inside `push-and-check` when no
+    /// Same call that runs automatically inside `dragonfly` when no
     /// prior review log exists for the PR. Gemini is weaker than Claude,
     /// so output is best treated as a first-pass hint, not a final verdict.
     Review {
@@ -487,10 +487,10 @@ fn submit_feedback(message: &str) {
     let icon = concat!(env!("CARGO_MANIFEST_DIR"), "/logo-icon.png");
     let _ = std::process::Command::new("notify-send")
         .args([
-            "--app-name=push-and-check",
+            "--app-name=dragonfly",
             "--urgency=critical",
             &format!("--icon={icon}"),
-            "push-and-check feedback",
+            "dragonfly feedback",
             message,
         ])
         .status();
@@ -1251,7 +1251,7 @@ fn run_id_from_url(url: &str) -> u64 {
 
 // Checks that are slow, flaky, or non-blocking — exclude from the wait so they
 // don't keep `pending` above zero forever. Failures here are surfaced to the
-// user but not auto-fixed as part of push-and-check.
+// user but not auto-fixed as part of dragonfly.
 const IGNORED_CHECKS: &[&str] = &["Cursor Bugbot", "test-e2e", "doc-review", "deploy", "Graphite / mergeability_check"];
 
 /// Drop "skipping" rows from `gh pr checks` output. The agent doesn't need
@@ -1663,7 +1663,7 @@ Result: Fix the code issues above and remove the unused type, then the lint chec
 The "Result:" sentence is exactly what to AVOID — just stop after the error lines and affected-jobs list.
 "#;
 
-/// Hardcoded fallback so push-and-check picks up lovable's `kit` even when
+/// Hardcoded fallback so dragonfly picks up lovable's `kit` even when
 /// it isn't on PATH. PATH lookup is still tried first so the user can override.
 const KIT_FALLBACK_PATH: &str = "/Users/arong/projects/lovable/lovable/bin/kit";
 
@@ -2010,7 +2010,7 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
         // believed there were failures. Don't leave the file empty — point at
         // the live `gh pr checks` output.
         summaries.push("(no failing checks reported by `gh pr checks --json`; \
-                        run `push-and-check ci status` to investigate)".into());
+                        run `dragonfly ci status` to investigate)".into());
     }
 
     let raw_content = format!(
@@ -3331,7 +3331,7 @@ async fn build_review_agent_context() -> String {
         tokio::join!(diff_files_fut, full_diffs_fut, rag_fut, ctx_fut);
 
     // Reuse the SHA-keyed pr-areas cache populated by the main prompt
-    // build. When this runs standalone (no preceding push-and-check),
+    // build. When this runs standalone (no preceding dragonfly),
     // it cold-builds once (~3-5 s) and writes the cache. analyze_pr_areas
     // needs the inline diff content because kit has no tool-use.
     let full_diff_str = full_diffs_vec
@@ -3781,18 +3781,18 @@ fn graphite_section(info: &GraphiteInfo) -> String {
 // template's hook commands use `__DRAGONFLY_HOOKS__` as a placeholder we
 // substitute with the absolute hooks dir at runtime, so the file passed to
 // `claude --settings ...` always points at the hooks shipped alongside this
-// build of push-and-check.
-const PUSH_AND_FIX_SETTINGS_TEMPLATE: &str =
-    include_str!("../settings/push-and-check-settings.json");
+// build of dragonfly.
+const DRAGONFLY_SETTINGS_TEMPLATE: &str =
+    include_str!("../settings/dragonfly-settings.json");
 const DRAGONFLY_HOOKS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/hooks");
 
 const GRAFANA_DASHBOARDS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/grafana_dashboards.md");
 const DOTENV_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/.env");
 
-fn push_and_fix_settings_expanded() -> String {
-    let body = PUSH_AND_FIX_SETTINGS_TEMPLATE.replace("__DRAGONFLY_HOOKS__", DRAGONFLY_HOOKS_DIR);
+fn dragonfly_settings_expanded() -> String {
+    let body = DRAGONFLY_SETTINGS_TEMPLATE.replace("__DRAGONFLY_HOOKS__", DRAGONFLY_HOOKS_DIR);
     let f = tempfile::Builder::new()
-        .prefix("push-and-check-settings-")
+        .prefix("dragonfly-settings-")
         .suffix(".json")
         .tempfile_in("/tmp")
         .expect("failed to create settings tempfile");
@@ -3983,7 +3983,7 @@ fn build_prompt(
     } else {
         ""
     };
-    let skill_text = skill::PUSH_AND_FIX_SKILL
+    let skill_text = skill::DRAGONFLY_SKILL
         .replace("CUSTOM_REVIEW_PLACEHOLDER", review_instructions)
         .replace("GRAFANA_DASHBOARDS_PATH", GRAFANA_DASHBOARDS_PATH)
         .replace("CODE_COMMENTS_PLACEHOLDER", skill::CODE_COMMENTS_GUIDE);
@@ -4162,7 +4162,7 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
              - Do NOT implement fixes unless the user explicitly asks for them.\n\
              - Focus on Phase 5 (review bot comments) and Phase 6 (custom review).\n\
              - Surface findings as a numbered list; let the user pick which to post as a PR comment.\n\
-             - After user approves, post a single top-level PR comment with the review findings via `push-and-check pr comment --body -` (pipe the markdown on stdin to avoid shell-quoting the multi-line body). Group findings in red/orange/green sections (use colored dots).\n\
+             - After user approves, post a single top-level PR comment with the review findings via `dragonfly pr comment --body -` (pipe the markdown on stdin to avoid shell-quoting the multi-line body). Group findings in red/orange/green sections (use colored dots).\n\
              - Skip Phase 7 (PR description) and Phase 9 (ready for review).\n\
              - When CI fails, report it; do not start fixing it.\n\n",
             pr_info.author_login, viewer_login,
@@ -4353,7 +4353,7 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
         review_only_note.as_deref(),
     );
 
-    // Put our own binary on PATH so the agent can call push-and-check subcommands
+    // Put our own binary on PATH so the agent can call dragonfly subcommands
     let path = {
         let current = std::env::var("PATH").unwrap_or_default();
         match std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
@@ -4362,7 +4362,7 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
         }
     };
 
-    let settings = push_and_fix_settings_expanded();
+    let settings = dragonfly_settings_expanded();
     let agents = build_agents_json();
     ClaudeInvocation { prompt, settings, agents, path }
 }

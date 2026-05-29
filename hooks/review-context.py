@@ -2,8 +2,8 @@
 """SubagentStart hook for Claude Code.
 
 When a `review-agent` subagent (see agents/review-agent.md) is spawned by
-the parent push-and-fix flow, this hook shells out to
-    push-and-check prompt review-agent
+the parent dragonfly flow, this hook shells out to
+    dragonfly prompt review-agent
 and pipes stdout through to the subagent. Claude Code delivers a
 SubagentStart hook's stdout to the subagent as a system reminder before
 its first turn (documented for SessionStart / Setup / SubagentStart in
@@ -15,13 +15,13 @@ the Rust binary. That command serializes parallel callers behind a
 filesystem flock so a multi-agent fan-out only pays the build cost once
 within a four-minute TTL.
 
-`push-and-check` is expected to be on PATH (the orchestrator adds the
+`dragonfly` is expected to be on PATH (the orchestrator adds the
 binary's own dir before exec'ing `claude`). When the hook is run outside
 that context (manual `claude` invocation against this settings file)
 the subprocess will simply fail and we exit 0 — failing open is
 preferable to breaking the parent's review flow.
 
-The matcher in settings/push-and-check-settings.json gates this hook on
+The matcher in settings/dragonfly-settings.json gates this hook on
 agent_type == "review-agent", but we double-check here so an accidental
 wildcard matcher doesn't shell out for every subagent.
 """
@@ -32,7 +32,7 @@ import subprocess
 import sys
 
 EXPECTED_AGENT = "review-agent"
-BIN_NAME = "push-and-check"
+BIN_NAME = "dragonfly"
 
 
 def _debug(msg: str) -> None:
@@ -74,7 +74,7 @@ def main() -> int:
 
     try:
         # cwd defaults to the subagent's cwd (same as parent's main cwd),
-        # which is what `push-and-check prompt review-agent` keys its
+        # which is what `dragonfly prompt review-agent` keys its
         # cache by. Don't override it.
         result = subprocess.run(
             [bin_path, "prompt", "review-agent"],
