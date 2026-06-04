@@ -506,12 +506,22 @@ fn submit_feedback(message: &str) {
 /// counterpart prompt first. Reuses the merge-tree probe that will later
 /// drive the "Merge Conflict Check" prompt section. Returns true if a rebase
 /// actually happened, so the caller can promote a normal push to a force-push.
+///
+/// Graphite branches are skipped entirely: `git rebase origin/main` rewrites
+/// only the current branch and leaves Graphite's parent metadata and any
+/// descendant branches pointing at orphaned commits. Restacking is the user's
+/// job (`gt sync`), not this flow's.
 async fn maybe_rebase_on_main(has_upstream: bool, merge_probe: &ShResult, review_only: bool) -> bool {
     let behind = sh("git rev-list --count HEAD..origin/main")
         .await
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
     if behind == 0 {
+        return false;
+    }
+
+    if is_graphite_branch().await {
+        println!("   Branch is {behind} behind origin/main; skipping auto-rebase (Graphite branch — run `gt sync` to restack).");
         return false;
     }
 
@@ -3671,6 +3681,18 @@ fn parse_stack_branches(output: &str, trunk: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// True if the current branch is tracked by Graphite (single branch or stack).
+/// `gt log short --stack` exits non-zero on an untracked branch, so a clean exit
+/// with at least one non-trunk branch means Graphite owns this branch's parent.
+async fn is_graphite_branch() -> bool {
+    let r = sh3("gt log short --stack 2>/dev/null").await;
+    if r.code != 0 || r.stdout.is_empty() {
+        return false;
+    }
+    let trunk = get_graphite_trunk().await;
+    !parse_stack_branches(&r.stdout, &trunk).is_empty()
 }
 
 /// Returns (stack_viz, branches) if the current branch is part of a multi-branch
