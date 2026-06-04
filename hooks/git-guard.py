@@ -11,6 +11,8 @@ import sys
 
 RULES = [
     # (pattern, exclude_pattern, decision, reason)
+    (r"\bgit\s+add\b[^|&;]*?(\s--all\b|\s-[a-z]*A[a-z]*\b)", None, "deny",
+     "git add -A / --all is not allowed. Stage files explicitly by path (e.g. `git add path/to/file`) so unintended changes are never committed."),
     (r"\bgit\s+merge\s+", None, "deny", "git merge is not allowed. Rebase instead."),
     (r"\bgit\s+commit\b", None, "ask", "git commit requires confirmation"),
     (r"\bgit\s+(rebase|reset)\b", r"\bgit\s+rebase\s+--continue\b", "ask", "git rebase/reset requires confirmation"),
