@@ -224,11 +224,18 @@ enum CiCommand {
         #[arg(long)]
         model: Option<Model>,
     },
-    /// Poll PR checks until all pass or one fails (fail-fast), then print a final
-    /// summary (same shape as `ci status`). Waits for slow checks like test-e2e but
-    /// skips the Graphite mergeability check, deploy, and doc-review.
+    /// Poll the checks of the last-pushed commit until all pass or one fails
+    /// (fail-fast), then print a final summary (same shape as `ci status`).
+    ///
+    /// Anchors on the pushed SHA (`@{push}` / origin/<branch>, or the PR head
+    /// with --pr), so `git push && dragonfly ci watch` watches exactly what
+    /// was pushed even if someone else pushes mid-watch. Waits for slow
+    /// checks like test-e2e but skips the Graphite mergeability check,
+    /// deploy, and doc-review. Bounded to 4m30s: on timeout it prints
+    /// progress so far and exits 3 — re-run to continue watching.
     Watch {
-        /// Explicit PR number. Defaults to the current branch's PR.
+        /// Anchor on this PR's head commit instead of the current branch's
+        /// pushed commit.
         #[arg(long)]
         pr: Option<String>,
     },
@@ -2213,46 +2220,259 @@ async fn ci_failures_cmd(
     1
 }
 
+/// Resolve the commit `ci watch` anchors on: an explicit PR's head, or where
+/// the current branch was last pushed. `git push` updates the remote-tracking
+/// ref locally, so right after a push `@{push}` / `origin/<branch>` is exactly
+/// the pushed commit — no fetch or PR lookup needed. Returns (sha, branch).
+async fn resolve_watch_anchor(pr: Option<String>) -> Option<(String, String)> {
+    if let Some(pr) = pr {
+        let out = sh(&format!(
+            "gh pr view {pr} --json headRefOid,headRefName \
+             --jq '.headRefOid + \" \" + .headRefName'"
+        )).await?;
+        let mut parts = out.split_whitespace();
+        let sha = parts.next()?.to_string();
+        return Some((sha, parts.next().unwrap_or_default().to_string()));
+    }
+    let branch = sh("git branch --show-current").await.filter(|s| !s.is_empty())?;
+    // `@{push}` is the configured push destination; fall back to the
+    // conventional origin/<branch> when no upstream is configured.
+    let sha = match sh("git rev-parse @{push} 2>/dev/null").await {
+        Some(s) => s,
+        None => sh(&format!("git rev-parse origin/{branch} 2>/dev/null")).await?,
+    };
+    Some((sha, branch))
+}
+
 async fn ci_watch_cmd(pr: Option<String>) -> i32 {
-    let Some(pr_number) = resolve_pr_number(pr).await else {
-        eprintln!("No PR for current branch and --pr not supplied.");
+    let explicit_pr = pr.is_some();
+    let Some((sha, branch)) = resolve_watch_anchor(pr).await else {
+        eprintln!("Could not resolve a pushed commit to watch — push the branch first (or pass --pr).");
         return 2;
     };
+    // The anchor is what was pushed, not HEAD; flag the gap so unpushed local
+    // commits aren't silently mistaken for being under test.
+    if !explicit_pr {
+        let head = sh("git rev-parse HEAD").await.unwrap_or_default();
+        if !head.is_empty() && head != sha {
+            println!(
+                "⚠️  HEAD ({}) is not what was pushed — watching pushed commit {}.",
+                &head[..7.min(head.len())],
+                &sha[..7.min(sha.len())]
+            );
+        }
+    }
     if check_origin_main_conflicts().await {
         println!("⚠️  Merge conflicts with origin/main — some checks did not run.");
     }
-    // Poll rather than `gh pr checks --watch`: gh's watch blocks until every check
-    // reaches a terminal state, so the perpetually-`pending` [GRAPHITE_MERGEABILITY]
-    // check would hang it forever. Filtering only happens in our own loop.
-    let branch = sh("git rev-parse --abbrev-ref HEAD").await.unwrap_or_default();
-    let head_sha = sh("git rev-parse HEAD").await.unwrap_or_default();
-    let ci_start = get_ci_start_epoch(&branch, &head_sha).await;
-    let mut prev_line = String::new();
-    let rc = loop {
-        let r = sh3(&format!("gh pr checks {pr_number}")).await;
-        let counts = parse_checks(&r.stdout, WATCH_IGNORED_CHECKS);
+    ci_watch_sha(&sha, &branch).await
+}
 
-        let line = format_ci_status(&counts, ci_start, 0);
+// ── SHA-anchored CI watch ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RestCheckRuns {
+    check_runs: Vec<RestCheckRun>,
+}
+#[derive(Deserialize)]
+struct RestCheckRun {
+    id: u64,
+    name: String,
+    status: String,
+    conclusion: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+}
+#[derive(Deserialize)]
+struct RestCombinedStatus {
+    #[serde(default)]
+    statuses: Vec<RestStatus>,
+}
+#[derive(Deserialize)]
+struct RestStatus {
+    context: String,
+    state: String,
+    #[serde(default)]
+    target_url: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Check runs + commit statuses for one specific commit, mapped into the same
+/// name/bucket shape `gh pr checks --json` produces. Querying by SHA instead
+/// of by PR is what lets `push -w` watch exactly what it pushed.
+async fn checks_for_sha(sha: &str) -> Vec<PrCheck> {
+    let runs_cmd = format!(
+        "gh api 'repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100'"
+    );
+    // The combined-status endpoint covers providers that report commit
+    // statuses rather than check runs (Buildkite, Spacelift, Graphite, …).
+    let status_cmd = format!("gh api 'repos/{{owner}}/{{repo}}/commits/{sha}/status'");
+    let (runs, statuses) = tokio::join!(sh3(&runs_cmd), sh3(&status_cmd));
+    parse_sha_checks(&runs.stdout, &statuses.stdout)
+}
+
+fn parse_sha_checks(runs_json: &str, statuses_json: &str) -> Vec<PrCheck> {
+    // A re-triggered workflow creates a new check suite with same-named runs;
+    // keep only the newest run per name (mirrors [parse_checks]'s run-id dedup).
+    let mut latest: HashMap<String, (u64, PrCheck)> = HashMap::new();
+    if let Some(r) = parse_json::<RestCheckRuns>(runs_json) {
+        for run in r.check_runs {
+            let bucket = if run.status != "completed" {
+                "pending"
+            } else {
+                match run.conclusion.as_deref() {
+                    Some("success") => "pass",
+                    Some("skipped") | Some("neutral") => "skipping",
+                    // failure, timed_out, cancelled, action_required, stale, …
+                    _ => "fail",
+                }
+            };
+            let check = PrCheck {
+                name: run.name.clone(),
+                bucket: bucket.into(),
+                link: run.html_url.unwrap_or_default(),
+                workflow: String::new(),
+                description: String::new(),
+            };
+            if latest.get(&run.name).is_none_or(|(id, _)| run.id > *id) {
+                latest.insert(run.name, (run.id, check));
+            }
+        }
+    }
+    let mut checks: Vec<PrCheck> = latest.into_values().map(|(_, c)| c).collect();
+
+    if let Some(s) = parse_json::<RestCombinedStatus>(statuses_json) {
+        for st in s.statuses {
+            let bucket = match st.state.as_str() {
+                "success" => "pass",
+                "failure" | "error" => "fail",
+                _ => "pending",
+            };
+            checks.push(PrCheck {
+                name: st.context,
+                bucket: bucket.into(),
+                link: st.target_url.unwrap_or_default(),
+                workflow: String::new(),
+                description: st.description.unwrap_or_default(),
+            });
+        }
+    }
+    checks
+}
+
+fn counts_from_checks(checks: &[PrCheck], ignored: &[&str]) -> CheckCounts {
+    let mut counts = CheckCounts {
+        passed: 0,
+        failed: 0,
+        pending: 0,
+        skipping: 0,
+        pending_names: Vec::new(),
+    };
+    for c in checks.iter().filter(|c| !ignored.contains(&c.name.as_str())) {
+        match c.bucket.as_str() {
+            "pass" => counts.passed += 1,
+            "fail" => counts.failed += 1,
+            "skipping" => counts.skipping += 1,
+            _ => {
+                counts.pending += 1;
+                counts.pending_names.push(c.name.clone());
+            }
+        }
+    }
+    counts.pending_names.sort();
+    counts
+}
+
+/// Print pre-fetched checks in the `ci status` shape (tally header, then one
+/// line per failing/pending check). Returns 1 when any non-ignored check
+/// failed, else 0.
+fn print_checks_summary(label: &str, checks: &[PrCheck], ignored: &[&str]) -> i32 {
+    let counts = counts_from_checks(checks, ignored);
+    println!(
+        "{label} — {} fail, {} pending, {} pass, {} skip",
+        counts.failed, counts.pending, counts.passed, counts.skipping
+    );
+    let priority = |b: &str| match b {
+        "fail" => 3,
+        "pending" => 2,
+        "pass" => 1,
+        _ => 0,
+    };
+    let mut shown: Vec<&PrCheck> = checks
+        .iter()
+        .filter(|c| !ignored.contains(&c.name.as_str()))
+        .filter(|c| c.bucket == "fail" || c.bucket == "pending")
+        .collect();
+    shown.sort_by(|a, b| (priority(&b.bucket), &a.name).cmp(&(priority(&a.bucket), &b.name)));
+    for c in shown {
+        let icon = match c.bucket.as_str() {
+            "fail" => "❌",
+            "pending" => "⏳",
+            _ => "⏭",
+        };
+        let provider = classify_provider_label(&c.link);
+        let link = if c.link.is_empty() { String::new() } else { format!("  {}", c.link) };
+        println!("{icon} [{provider:>10}] {}{link}", c.name);
+    }
+    if counts.failed > 0 { 1 } else { 0 }
+}
+
+/// Poll the checks of one specific commit until all settle or one fails
+/// (fail-fast), bounded by a 4m30s budget. The budget sits deliberately just
+/// under the 5-minute LLM prompt-cache TTL: an agent blocked on a longer
+/// watch would return to a cold cache, so we hand back progress first and
+/// let it re-invoke `dragonfly ci watch` to continue.
+///
+/// Polls REST by SHA rather than `gh pr checks --watch`: gh's watch blocks
+/// until every check reaches a terminal state, so the perpetually-`pending`
+/// [GRAPHITE_MERGEABILITY] check would hang it forever, and the PR's head
+/// can move under a watch while a fixed SHA cannot.
+async fn ci_watch_sha(sha: &str, branch: &str) -> i32 {
+    const POLL: std::time::Duration = std::time::Duration::from_secs(15);
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(270);
+    let short = &sha[..7.min(sha.len())];
+    let start = std::time::Instant::now();
+    let ci_start = get_ci_start_epoch(branch, sha).await;
+    let mut prev_line = String::new();
+    loop {
+        let checks = checks_for_sha(sha).await;
+        let counts = counts_from_checks(&checks, WATCH_IGNORED_CHECKS);
+        let total = counts.passed + counts.failed + counts.pending + counts.skipping;
+
+        // Checks take a few seconds to register after a push; an empty list
+        // means "not started yet", never "all done".
+        let line = if total == 0 {
+            format!("  [{}m] ⏳ waiting for checks to appear...", start.elapsed().as_secs() / 60)
+        } else {
+            format_ci_status(&counts, ci_start, 0)
+        };
         if line != prev_line {
             print!("\r{line}    ");
             std::io::stdout().flush().ok();
             prev_line = line;
         }
 
-        if counts.failed > 0 {
+        if total > 0 && (counts.failed > 0 || counts.pending == 0) {
             println!();
-            break 1;
+            return print_checks_summary(&format!("Commit {short}"), &checks, WATCH_IGNORED_CHECKS);
         }
-        if counts.pending == 0 {
+
+        if start.elapsed() + POLL >= BUDGET {
             println!();
-            break 0;
+            print_checks_summary(
+                &format!("Commit {short} (still in progress)"),
+                &checks,
+                WATCH_IGNORED_CHECKS,
+            );
+            println!(
+                "\n⏳ Watch budget (4m30s) exhausted with checks still pending. \
+                 Re-run `dragonfly ci watch` to continue watching."
+            );
+            return 3;
         }
-        sleep(std::time::Duration::from_secs(15)).await;
-    };
-    // Final summary in the ci-status shape, sharing the watch ignore list so the
-    // closing tally matches what the loop waited on.
-    let _ = ci_status_cmd(Some(pr_number), false, WATCH_IGNORED_CHECKS).await;
-    rc
+        sleep(POLL).await;
+    }
 }
 
 async fn ci_flaky_cmd(name: String, limit: usize) -> i32 {
@@ -4520,4 +4740,68 @@ async fn main() {
     let err = cmd.exec();
     eprintln!("Failed to exec claude: {err}");
     std::process::exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sha_checks_buckets_and_dedup() {
+        let runs = r#"{"check_runs": [
+            {"id": 1, "name": "test-go", "status": "completed", "conclusion": "failure", "html_url": "https://github.com/x/y/actions/runs/1/job/1"},
+            {"id": 2, "name": "test-go", "status": "in_progress", "conclusion": null, "html_url": "https://github.com/x/y/actions/runs/2/job/2"},
+            {"id": 3, "name": "lint", "status": "completed", "conclusion": "success"},
+            {"id": 4, "name": "docs", "status": "completed", "conclusion": "skipped"},
+            {"id": 5, "name": "e2e", "status": "completed", "conclusion": "cancelled"},
+            {"id": 6, "name": "queued-job", "status": "queued", "conclusion": null}
+        ]}"#;
+        let statuses = r#"{"state": "pending", "statuses": [
+            {"context": "buildkite/app", "state": "pending", "target_url": "https://buildkite.com/o/p/builds/1"},
+            {"context": "wiz", "state": "success"},
+            {"context": "spacelift/stack", "state": "error"}
+        ]}"#;
+        let checks = parse_sha_checks(runs, statuses);
+        let bucket = |name: &str| {
+            checks.iter().find(|c| c.name == name).map(|c| c.bucket.as_str()).unwrap_or("missing")
+        };
+        // Newest run (id 2, in_progress) wins over the older failed attempt.
+        assert_eq!(bucket("test-go"), "pending");
+        assert_eq!(bucket("lint"), "pass");
+        assert_eq!(bucket("docs"), "skipping");
+        assert_eq!(bucket("e2e"), "fail");
+        assert_eq!(bucket("queued-job"), "pending");
+        assert_eq!(bucket("buildkite/app"), "pending");
+        assert_eq!(bucket("wiz"), "pass");
+        assert_eq!(bucket("spacelift/stack"), "fail");
+        assert_eq!(checks.len(), 8);
+    }
+
+    #[test]
+    fn parse_sha_checks_tolerates_api_errors() {
+        assert!(parse_sha_checks("", "").is_empty());
+        assert!(parse_sha_checks(r#"{"message": "Not Found"}"#, "gh: error").is_empty());
+    }
+
+    #[test]
+    fn counts_from_checks_respects_ignore_list() {
+        let mk = |name: &str, bucket: &str| PrCheck {
+            name: name.into(),
+            bucket: bucket.into(),
+            link: String::new(),
+            workflow: String::new(),
+            description: String::new(),
+        };
+        let checks = vec![
+            mk("test-go", "pass"),
+            mk("test-spanner", "pending"),
+            mk(GRAPHITE_MERGEABILITY, "pending"),
+            mk("deploy", "fail"),
+        ];
+        let counts = counts_from_checks(&checks, WATCH_IGNORED_CHECKS);
+        assert_eq!(counts.passed, 1);
+        assert_eq!(counts.failed, 0);
+        assert_eq!(counts.pending, 1);
+        assert_eq!(counts.pending_names, vec!["test-spanner".to_string()]);
+    }
 }

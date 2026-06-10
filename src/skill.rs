@@ -59,9 +59,13 @@ If they are easy to resolve, offer to rebase and fix the merge conflicts.
 After pushing, monitor CI checks:
 
 ```bash
-# Auto-reconnecting watch — prints a single final summary when CI settles
+# Watches the checks of the commit you just pushed (anchored to origin/<branch>)
 dragonfly ci watch
 ```
+
+The watch fail-fasts on the first failure and prints a final summary when CI
+settles. It times out after 4m30s with a progress summary and exit code 3 —
+just run `dragonfly ci watch` again to keep watching.
 
 For a one-shot poll instead of watching:
 
