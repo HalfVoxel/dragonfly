@@ -2251,6 +2251,10 @@ async fn resolve_watch_anchor(pr: Option<String>) -> Option<(String, String)> {
 }
 
 async fn ci_watch_cmd(pr: Option<String>) -> i32 {
+    // The conflict probe's `git fetch origin main` is the slowest startup
+    // call and depends on nothing below — start it before anchor resolution
+    // so it overlaps the gh round-trips.
+    let conflicts = tokio::spawn(check_origin_main_conflicts());
     let explicit_pr = pr.is_some();
     let Some((sha, branch)) = resolve_watch_anchor(pr).await else {
         eprintln!("Could not resolve a pushed commit to watch — push the branch first (or pass --pr).");
@@ -2268,10 +2272,17 @@ async fn ci_watch_cmd(pr: Option<String>) -> i32 {
             );
         }
     }
-    if check_origin_main_conflicts().await {
+    // The CI start epoch and first poll only feed display; fetch them
+    // alongside the conflict probe instead of after it.
+    let (conflicts, ci_start, first_checks) = tokio::join!(
+        conflicts,
+        get_ci_start_epoch(&branch, &sha),
+        checks_for_sha(&sha)
+    );
+    if conflicts.unwrap_or(false) {
         println!("⚠️  Merge conflicts with origin/main — some checks did not run.");
     }
-    ci_watch_sha(&sha, &branch).await
+    ci_watch_sha(&sha, ci_start, first_checks).await
 }
 
 // ── SHA-anchored CI watch ────────────────────────────────────────────────────
@@ -2434,15 +2445,14 @@ fn print_checks_summary(label: &str, checks: &[PrCheck], ignored: &[&str]) -> i3
 /// until every check reaches a terminal state, so the perpetually-`pending`
 /// [GRAPHITE_MERGEABILITY] check would hang it forever, and the PR's head
 /// can move under a watch while a fixed SHA cannot.
-async fn ci_watch_sha(sha: &str, branch: &str) -> i32 {
+async fn ci_watch_sha(sha: &str, ci_start: f64, first_checks: Vec<PrCheck>) -> i32 {
     const POLL: std::time::Duration = std::time::Duration::from_secs(15);
     const BUDGET: std::time::Duration = std::time::Duration::from_secs(270);
     let short = &sha[..7.min(sha.len())];
     let start = std::time::Instant::now();
-    let ci_start = get_ci_start_epoch(branch, sha).await;
     let mut prev_line = String::new();
+    let mut checks = first_checks;
     loop {
-        let checks = checks_for_sha(sha).await;
         let counts = counts_from_checks(&checks, WATCH_IGNORED_CHECKS);
         let total = counts.passed + counts.failed + counts.pending + counts.skipping;
 
@@ -2478,6 +2488,7 @@ async fn ci_watch_sha(sha: &str, branch: &str) -> i32 {
             return 3;
         }
         sleep(POLL).await;
+        checks = checks_for_sha(sha).await;
     }
 }
 
