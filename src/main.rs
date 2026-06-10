@@ -1272,15 +1272,21 @@ fn run_id_from_url(url: &str) -> u64 {
 // every wait path, including `ci watch` (which otherwise waits for slow checks).
 const GRAPHITE_MERGEABILITY: &str = "Graphite / mergeability_check";
 
+// The core-prompt-review gate (job name `review`) fails until a human from
+// @lovablelabs/ai approves the PR head — no CI fix can ever turn it green, so
+// waiting on or auto-fixing it is pointless.
+const CORE_PROMPT_REVIEW: &str = "review";
+
 // Checks that are slow, flaky, or non-blocking — exclude from the wait so they
 // don't keep `pending` above zero forever. Failures here are surfaced to the
 // user but not auto-fixed as part of dragonfly.
-const IGNORED_CHECKS: &[&str] = &["Cursor Bugbot", "test-e2e", "doc-review", "deploy", GRAPHITE_MERGEABILITY];
+const IGNORED_CHECKS: &[&str] =
+    &["Cursor Bugbot", "test-e2e", "doc-review", "deploy", GRAPHITE_MERGEABILITY, CORE_PROMPT_REVIEW];
 
 // `ci watch` waits for slow checks like test-e2e, but skips the never-terminating
-// Graphite check plus deploy and doc-review (non-blocking, not worth blocking the
-// watch on). See [GRAPHITE_MERGEABILITY].
-const WATCH_IGNORED_CHECKS: &[&str] = &["doc-review", "deploy", GRAPHITE_MERGEABILITY];
+// Graphite check plus deploy, doc-review, and the human-approval review gate
+// (non-blocking, not worth blocking the watch on). See [GRAPHITE_MERGEABILITY].
+const WATCH_IGNORED_CHECKS: &[&str] = &["doc-review", "deploy", GRAPHITE_MERGEABILITY, CORE_PROMPT_REVIEW];
 
 /// Drop "skipping" rows from `gh pr checks` output. The agent doesn't need
 /// them in its CI temp file — they're already counted separately.
