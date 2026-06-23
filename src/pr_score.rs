@@ -1,4 +1,4 @@
-//! Score guide chunks against a PR's diff via `lov rag score`. Drives the
+//! Score guide chunks against a PR's diff via `lov eval rag score`. Drives the
 //! Lovable knowledge-RAG scorer (`KnowledgeRAGService.ScoreFiles`) from
 //! arbitrary chunks instead of the registered knowledge-base.
 
@@ -15,7 +15,7 @@ struct LovScore {
     score: f64,
 }
 
-/// Spawn `lov rag score` once with every chunk materialized as a temp file,
+/// Spawn `lov eval rag score` once with every chunk materialized as a temp file,
 /// then return scores parallel to `chunks` (index-aligned). Chunks the
 /// scorer didn't return — same model that already drops files at 0 when
 /// parsing fails (`scores.go:327-361`) — come back as 0.0; treat 0 as drop.
@@ -52,7 +52,11 @@ pub async fn score_chunks(chunks: &[GuideChunk], query: &str) -> Result<Vec<f64>
 
     let lov = std::env::var_os("LOV_PATH").unwrap_or_else(|| "lov".into());
     let mut cmd = Command::new(&lov);
-    cmd.arg("rag").arg("score").arg("--query").arg(query);
+    cmd.arg("eval")
+        .arg("rag")
+        .arg("score")
+        .arg("--query")
+        .arg(query);
     for p in &chunk_paths {
         cmd.arg(p);
     }
@@ -71,11 +75,11 @@ pub async fn score_chunks(chunks: &[GuideChunk], query: &str) -> Result<Vec<f64>
     })?;
     if !output.status.success() {
         let err = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("lov rag score failed: {}", err.trim()));
+        return Err(format!("lov eval rag score failed: {}", err.trim()));
     }
 
-    let scored: Vec<LovScore> = serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("parse lov output: {e}"))?;
+    let scored: Vec<LovScore> =
+        serde_json::from_slice(&output.stdout).map_err(|e| format!("parse lov output: {e}"))?;
 
     let mut scores = vec![0.0_f64; chunks.len()];
     for s in scored {
@@ -100,11 +104,7 @@ pub async fn score_chunks(chunks: &[GuideChunk], query: &str) -> Result<Vec<f64>
 ///
 /// Returns an empty string when `kept` is empty so callers can splice
 /// the result unconditionally.
-pub fn render_relevant_context(
-    chunks: &[GuideChunk],
-    kept: &[usize],
-    cwd: &Path,
-) -> String {
+pub fn render_relevant_context(chunks: &[GuideChunk], kept: &[usize], cwd: &Path) -> String {
     if kept.is_empty() {
         return String::new();
     }
@@ -149,7 +149,11 @@ pub fn write_scores_tsv<W: Write>(
     scores: &[f64],
 ) -> io::Result<()> {
     let mut order: Vec<usize> = (0..chunks.len()).collect();
-    order.sort_by(|&a, &b| scores[b].partial_cmp(&scores[a]).unwrap_or(std::cmp::Ordering::Equal));
+    order.sort_by(|&a, &b| {
+        scores[b]
+            .partial_cmp(&scores[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     writeln!(writer, "score\tlevel\theading_chain\tpath\tlines\tpreview")?;
     for i in order {
@@ -187,7 +191,6 @@ fn tsv_sanitize(s: &str) -> String {
     s.replace(['\t', '\n', '\r'], " ")
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,7 +199,10 @@ mod tests {
     fn chunk(path: &str, level: u8, title: &str, body: &str) -> GuideChunk {
         GuideChunk {
             path: PathBuf::from(path),
-            breadcrumbs: vec![HeadingCrumb { level, title: title.into() }],
+            breadcrumbs: vec![HeadingCrumb {
+                level,
+                title: title.into(),
+            }],
             level,
             body: body.into(),
         }
@@ -206,9 +212,9 @@ mod tests {
     fn render_groups_by_file_concatenates_in_original_order_relative_paths() {
         let cwd = Path::new("/repo");
         let chunks = vec![
-            chunk("/repo/A.md", 1, "Alpha", "# Alpha\nintro\n"),       // 0
-            chunk("/repo/A.md", 2, "Beta",  "## Beta\nbody beta\n"),   // 1
-            chunk("/repo/B.md", 1, "Gamma", "# Gamma\nbody gamma\n"),  // 2
+            chunk("/repo/A.md", 1, "Alpha", "# Alpha\nintro\n"), // 0
+            chunk("/repo/A.md", 2, "Beta", "## Beta\nbody beta\n"), // 1
+            chunk("/repo/B.md", 1, "Gamma", "# Gamma\nbody gamma\n"), // 2
             chunk("/repo/A.md", 2, "Delta", "## Delta\nbody delta\n"), // 3
         ];
         // Mixed order: A's chunks should still appear in 0,1,3 order
@@ -238,7 +244,10 @@ body gamma
     #[test]
     fn render_empty_kept_returns_empty_string() {
         let chunks = vec![chunk("/repo/A.md", 1, "X", "# X\n")];
-        assert_eq!(render_relevant_context(&chunks, &[], Path::new("/repo")), "");
+        assert_eq!(
+            render_relevant_context(&chunks, &[], Path::new("/repo")),
+            ""
+        );
     }
 
     #[test]
