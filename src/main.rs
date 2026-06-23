@@ -23,6 +23,17 @@ struct Cli {
     #[arg(long)]
     force: bool,
 
+    /// Run unattended: accept the rebase default, derive the PR title
+    /// instead of prompting, run the agent via `claude -p`, and keep the
+    /// PR a draft (Phase 9 is skipped entirely).
+    #[arg(long)]
+    non_interactive: bool,
+
+    /// PR title used when --non-interactive needs to create a draft PR.
+    /// Falls back to the newest commit subject.
+    #[arg(long)]
+    title: Option<String>,
+
     /// Only run PR area analysis and print the result
     #[arg(long)]
     areas: bool,
@@ -65,7 +76,7 @@ enum CliCommand {
         /// File paths (relative or absolute). Reads stdin if empty.
         paths: Vec<PathBuf>,
     },
-    /// Score guide chunks for the current branch's PR via `lov rag score`.
+    /// Score guide chunks for the current branch's PR via `lov eval rag score`.
     /// Resolves changed files → relevant guides → per-heading chunks, then
     /// asks the knowledge-RAG scorer to rate each chunk against the PR's
     /// diff. Prints a TSV sorted by score (desc) so a threshold can be
@@ -87,6 +98,15 @@ enum CliCommand {
         #[arg(long)]
         threshold: Option<f64>,
     },
+    /// Print an agent markdown file's system prompt: frontmatter stripped and
+    /// `@`-imports inlined (resolved against the file's directory). Lets
+    /// scripts/compare-comment-reviewers.sh reuse the binary's @-expansion
+    /// instead of reimplementing it.
+    #[command(hide = true)]
+    ExpandAgent {
+        /// Path to an agent markdown file (e.g. agents/comment-reviewer.md).
+        file: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -98,12 +118,17 @@ enum PromptTarget {
     InitialReview,
     /// Print the dragonfly-context block injected into review-agent
     /// subagents by the SubagentStart hook. Bundles commit list, changed
-    /// files, paths to per-file diff files (written under /tmp), and
-    /// the scored <relevant-context> block. Cached for 4 minutes per
-    /// cwd; concurrent callers serialize on a filesystem advisory lock
-    /// so a parallel review-agent fan-out only pays the build cost
-    /// once.
-    ReviewAgent,
+    /// files, per-file diffs (as /tmp path references by default, or
+    /// inlined with --inline-diffs), and the scored <relevant-context>
+    /// block. Cached for 4 minutes per cwd+mode; concurrent callers
+    /// serialize on a filesystem advisory lock so a parallel review-agent
+    /// fan-out only pays the build cost once.
+    ReviewAgent {
+        /// Inline each changed file's full diff as `<diff name="...">...</diff>`
+        /// blocks instead of writing them to /tmp and referencing the paths.
+        #[arg(long)]
+        inline_diffs: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -231,8 +256,7 @@ enum CiCommand {
     /// with --pr), so `git push && dragonfly ci watch` watches exactly what
     /// was pushed even if someone else pushes mid-watch. Waits for slow
     /// checks like test-e2e but skips the Graphite mergeability check,
-    /// deploy, and doc-review. Bounded to 4m30s: on timeout it prints
-    /// progress so far and exits 3 — re-run to continue watching.
+    /// deploy, and doc-review.
     Watch {
         /// Anchor on this PR's head commit instead of the current branch's
         /// pushed commit.
@@ -429,7 +453,8 @@ fn write_section(prefix: &str, content: &str, suffix: &str) -> TempFile {
     let (mut file, path) = f.keep().expect("failed to persist temp file");
     file.write_all(content.as_bytes())
         .expect("failed to write temp file");
-    let lines = content.lines().count() + usize::from(!content.ends_with('\n') && !content.is_empty());
+    let lines =
+        content.lines().count() + usize::from(!content.ends_with('\n') && !content.is_empty());
     TempFile { path, lines }
 }
 
@@ -465,7 +490,9 @@ fn submit_feedback(message: &str) {
         std::process::exit(1);
     }
     let path = dir.join("feedback");
-    let now = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%z").to_string();
+    let now = chrono::Local::now()
+        .format("%Y-%m-%dT%H:%M:%S%z")
+        .to_string();
     let cwd = std::env::current_dir()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
@@ -479,7 +506,11 @@ fn submit_feedback(message: &str) {
         .unwrap_or_else(|| "-".into());
     let entry = format!("---\n{now} [{cwd} @ {branch}]\n{message}\n\n");
 
-    match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         Ok(mut f) => {
             if let Err(e) = f.write_all(entry.as_bytes()) {
                 eprintln!("Failed to write feedback: {e}");
@@ -518,7 +549,12 @@ fn submit_feedback(message: &str) {
 /// only the current branch and leaves Graphite's parent metadata and any
 /// descendant branches pointing at orphaned commits. Restacking is the user's
 /// job (`gt sync`), not this flow's.
-async fn maybe_rebase_on_main(has_upstream: bool, merge_probe: &ShResult, review_only: bool) -> bool {
+async fn maybe_rebase_on_main(
+    has_upstream: bool,
+    merge_probe: &ShResult,
+    review_only: bool,
+    non_interactive: bool,
+) -> bool {
     let behind = sh("git rev-list --count HEAD..origin/main")
         .await
         .and_then(|s| s.parse::<u64>().ok())
@@ -528,31 +564,47 @@ async fn maybe_rebase_on_main(has_upstream: bool, merge_probe: &ShResult, review
     }
 
     if is_graphite_branch().await {
-        println!("   Branch is {behind} behind origin/main; skipping auto-rebase (Graphite branch — run `gt sync` to restack).");
+        println!(
+            "   Branch is {behind} behind origin/main; skipping auto-rebase (Graphite branch — run `gt sync` to restack)."
+        );
         return false;
     }
 
     if review_only {
-        println!("   Branch is {behind} behind origin/main; skipping rebase prompt (review-only mode).");
+        println!(
+            "   Branch is {behind} behind origin/main; skipping rebase prompt (review-only mode)."
+        );
         return false;
     }
 
-    let dirty = sh("git status --porcelain --untracked-files=no").await.unwrap_or_default();
+    let dirty = sh("git status --porcelain --untracked-files=no")
+        .await
+        .unwrap_or_default();
     if !dirty.is_empty() {
-        println!("   Branch is {behind} behind origin/main; skipping auto-rebase (working tree dirty).");
+        println!(
+            "   Branch is {behind} behind origin/main; skipping auto-rebase (working tree dirty)."
+        );
         return false;
     }
 
     if merge_probe.code != 0 {
-        println!("   Branch is {behind} behind origin/main; skipping auto-rebase (would conflict).");
+        println!(
+            "   Branch is {behind} behind origin/main; skipping auto-rebase (would conflict)."
+        );
         return false;
     }
 
     let proceed = if !has_upstream {
         println!("   Branch is {behind} behind origin/main — rebasing (new branch)...");
         true
+    } else if non_interactive {
+        println!(
+            "   Branch is {behind} behind origin/main and rebase is clean — rebasing (non-interactive)."
+        );
+        true
     } else {
-        let prompt = format!("Branch is {behind} behind origin/main and rebase is clean. Rebase now?");
+        let prompt =
+            format!("Branch is {behind} behind origin/main and rebase is clean. Rebase now?");
         match dialoguer::Confirm::new()
             .with_prompt(prompt)
             .default(true)
@@ -585,7 +637,7 @@ async fn maybe_rebase_on_main(has_upstream: bool, merge_probe: &ShResult, review
     false
 }
 
-async fn push(force: bool, review_only: bool) -> (PushResult, ShResult) {
+async fn push(force: bool, review_only: bool, non_interactive: bool) -> (PushResult, ShResult) {
     println!("   Fetching remote...");
     let bg_fetch = sh_bg("git fetch");
 
@@ -604,12 +656,22 @@ async fn push(force: bool, review_only: bool) -> (PushResult, ShResult) {
     let upstream = sh("git rev-parse --abbrev-ref @{upstream} 2>/dev/null").await;
     let merge_probe = sh3_wait(bg_merge).await;
 
-    let rebased = maybe_rebase_on_main(upstream.is_some(), &merge_probe, review_only).await;
+    let rebased = maybe_rebase_on_main(
+        upstream.is_some(),
+        &merge_probe,
+        review_only,
+        non_interactive,
+    )
+    .await;
     let force = force || rebased;
     // After a successful rebase HEAD sits on top of origin/main, so the
     // pre-rebase merge probe is stale. The new state is trivially clean.
     let merge_probe = if rebased {
-        ShResult { code: 0, stdout: String::new(), stderr: String::new() }
+        ShResult {
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
     } else {
         merge_probe
     };
@@ -634,7 +696,10 @@ async fn push(force: bool, review_only: bool) -> (PushResult, ShResult) {
         .as_deref()
         .and_then(|s| {
             let mut parts = s.split_whitespace();
-            Some((parts.next()?.parse::<i64>().ok()?, parts.next()?.parse::<i64>().ok()?))
+            Some((
+                parts.next()?.parse::<i64>().ok()?,
+                parts.next()?.parse::<i64>().ok()?,
+            ))
         })
         .unwrap_or((0, 0));
 
@@ -669,13 +734,21 @@ async fn push(force: bool, review_only: bool) -> (PushResult, ShResult) {
         format!("{ahead} ahead")
     };
     let kind = if needs_force { "Force push" } else { "Push" };
-    let cmd = if needs_force { "git push --force-with-lease" } else { "git push" };
+    let cmd = if needs_force {
+        "git push --force-with-lease"
+    } else {
+        "git push"
+    };
     println!("   {kind} ({label})...");
     let r = sh3(cmd).await;
     (
         PushResult {
             branch,
-            strategy: if needs_force { "force-with-lease" } else { "fast-forward" },
+            strategy: if needs_force {
+                "force-with-lease"
+            } else {
+                "fast-forward"
+            },
             code: r.code,
             stdout: r.stdout,
             stderr: r.stderr,
@@ -761,7 +834,9 @@ struct GqlAuthor {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn cdata(s: &str) -> String {
@@ -787,7 +862,11 @@ fn format_pr_reviews(json: &str) -> Option<String> {
     let mut out = String::from("<pr-reviews>\n");
     let mut any = false;
     for r in &wrapper.reviews {
-        let author = r.author.as_ref().map(|a| a.login.as_str()).unwrap_or("unknown");
+        let author = r
+            .author
+            .as_ref()
+            .map(|a| a.login.as_str())
+            .unwrap_or("unknown");
         let body = r.body.trim();
 
         // Skip empty reviews unless they have a meaningful state (APPROVED, CHANGES_REQUESTED)
@@ -907,7 +986,11 @@ fn format_threads_xml(threads: &[GqlThread]) -> String {
         ));
         if let Some(comments) = &t.comments {
             for c in &comments.nodes {
-                let author = c.author.as_ref().map(|a| a.login.as_str()).unwrap_or("unknown");
+                let author = c
+                    .author
+                    .as_ref()
+                    .map(|a| a.login.as_str())
+                    .unwrap_or("unknown");
                 let time = c.created_at.as_deref().unwrap_or("");
                 let body = clean_bot_body(&c.body);
                 out.push_str(&format!(
@@ -1036,10 +1119,7 @@ async fn pr_comments(pr_arg: Option<String>) {
     if let Some(xml) = bundle.threads_xml {
         sections.push(("review-threads", xml));
     } else if let Some(raw) = bundle.threads_raw_json {
-        sections.push((
-            "review-threads (raw JSON — XML parse failed)",
-            raw,
-        ));
+        sections.push(("review-threads (raw JSON — XML parse failed)", raw));
     }
 
     if sections.is_empty() {
@@ -1080,7 +1160,11 @@ fn format_pr_meta(json: &str) -> Option<String> {
     let meta: PrViewMeta = serde_json::from_str(json).ok()?;
     let mut out = String::new();
     out.push_str(&format!("# PR\n\nTitle: {}\n", meta.title.trim()));
-    let decision = meta.review_decision.as_deref().filter(|s| !s.is_empty()).unwrap_or("none");
+    let decision = meta
+        .review_decision
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("none");
     out.push_str(&format!("Review decision: {decision}\n"));
 
     let requested: Vec<String> = meta
@@ -1106,7 +1190,8 @@ fn format_pr_meta(json: &str) -> Option<String> {
 /// Footer appended to every PR comment / thread reply posted through this CLI.
 /// Lets reviewers tell agent-authored comments from human ones at a glance, and
 /// the link points back at the tool so a curious reader can find the source.
-const DRAGONFLY_FOOTER: &str = "\n\n<sup>via [Dragonfly](https://github.com/HalfVoxel/dragonfly) (Claude)</sup>";
+const DRAGONFLY_FOOTER: &str =
+    "\n\n<sup>via [Dragonfly](https://github.com/HalfVoxel/dragonfly) (Claude)</sup>";
 
 async fn pr_thread_comment(thread_id: &str, body: &str) {
     let signed = format!("{body}{DRAGONFLY_FOOTER}");
@@ -1177,7 +1262,10 @@ async fn pr_set_description(body_arg: &str) {
     if out.status.success() {
         println!("Updated PR #{pr_number} description.");
     } else {
-        eprintln!("gh pr edit failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        eprintln!(
+            "gh pr edit failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
         std::process::exit(out.status.code().unwrap_or(1));
     }
 }
@@ -1235,7 +1323,10 @@ async fn pr_comment(pr_arg: Option<String>, body_arg: &str) {
             println!("Commented on PR #{pr_number}: {url}");
         }
     } else {
-        eprintln!("gh pr comment failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        eprintln!(
+            "gh pr comment failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
         std::process::exit(out.status.code().unwrap_or(1));
     }
 }
@@ -1277,16 +1368,36 @@ const GRAPHITE_MERGEABILITY: &str = "Graphite / mergeability_check";
 // waiting on or auto-fixing it is pointless.
 const CORE_PROMPT_REVIEW: &str = "review";
 
+// QA.tech posts an external PR-review check that stays `pending` until its bot
+// finishes (and never runs on many PRs), so no code change flips it green.
+// Waiting on it hangs `ci watch`; it's non-blocking like the other review bots.
+const QA_TECH_REVIEW: &str = "QA.tech / PR Review";
+
 // Checks that are slow, flaky, or non-blocking — exclude from the wait so they
 // don't keep `pending` above zero forever. Failures here are surfaced to the
 // user but not auto-fixed as part of dragonfly.
-const IGNORED_CHECKS: &[&str] =
-    &["Cursor Bugbot", "test-e2e", "doc-review", "deploy", GRAPHITE_MERGEABILITY, CORE_PROMPT_REVIEW];
+const IGNORED_CHECKS: &[&str] = &[
+    "Cursor Bugbot",
+    "test-e2e",
+    "doc-review",
+    "deploy",
+    GRAPHITE_MERGEABILITY,
+    CORE_PROMPT_REVIEW,
+    QA_TECH_REVIEW,
+    "depthfirst Bot",
+];
 
 // `ci watch` waits for slow checks like test-e2e, but skips the never-terminating
-// Graphite check plus deploy, doc-review, and the human-approval review gate
-// (non-blocking, not worth blocking the watch on). See [GRAPHITE_MERGEABILITY].
-const WATCH_IGNORED_CHECKS: &[&str] = &["doc-review", "deploy", GRAPHITE_MERGEABILITY, CORE_PROMPT_REVIEW];
+// Graphite check plus deploy, doc-review, the human-approval review gate, and the
+// QA.tech review bot (non-blocking, not worth blocking the watch on).
+// See [GRAPHITE_MERGEABILITY].
+const WATCH_IGNORED_CHECKS: &[&str] = &[
+    "doc-review",
+    "deploy",
+    GRAPHITE_MERGEABILITY,
+    CORE_PROMPT_REVIEW,
+    QA_TECH_REVIEW,
+];
 
 /// Drop "skipping" rows from `gh pr checks` output. The agent doesn't need
 /// them in its CI temp file — they're already counted separately.
@@ -1310,7 +1421,11 @@ fn parse_checks(out: &str, ignored: &[&str]) -> CheckCounts {
                 continue;
             }
             let status = parts[1].trim();
-            let run_id = if parts.len() >= 4 { run_id_from_url(parts[3]) } else { 0 };
+            let run_id = if parts.len() >= 4 {
+                run_id_from_url(parts[3])
+            } else {
+                0
+            };
             if checks.get(name).is_none_or(|prev| run_id > prev.0) {
                 checks.insert(name, (run_id, status));
             }
@@ -1368,7 +1483,10 @@ fn start_local_lints(changed_dirs: &std::collections::HashSet<&str>) -> Vec<(Str
         linters.push(("lint-go".into(), sh_bg("lint-go")));
     }
     if changed_dirs.contains("app") {
-        linters.push(("lint-web".into(), sh_bg("cd app && pnpm install --silent && lint-web")));
+        linters.push((
+            "lint-web".into(),
+            sh_bg("cd app && pnpm install --silent && lint-web"),
+        ));
     }
     linters
 }
@@ -1381,10 +1499,12 @@ async fn poll_linters(linters: Vec<(String, Child)>) -> (Vec<(String, Child)>, V
             Ok(Some(status)) => {
                 let out = proc.wait_with_output().await.ok();
                 let (stdout, stderr) = out
-                    .map(|o| (
-                        String::from_utf8_lossy(&o.stdout).trim().to_string(),
-                        String::from_utf8_lossy(&o.stderr).trim().to_string(),
-                    ))
+                    .map(|o| {
+                        (
+                            String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                            String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                        )
+                    })
                     .unwrap_or_default();
                 finished.push(LintResult {
                     name,
@@ -1467,10 +1587,8 @@ async fn wait_for_ci(
     let mut lint_results: Vec<LintResult> = Vec::new();
     if counts.pending > 0 && counts.failed == 0 {
         let changed = get_changed_files(base_ref).await;
-        let changed_dirs: std::collections::HashSet<&str> = changed
-            .iter()
-            .filter_map(|f| f.split('/').next())
-            .collect();
+        let changed_dirs: std::collections::HashSet<&str> =
+            changed.iter().filter_map(|f| f.split('/').next()).collect();
         linters = start_local_lints(&changed_dirs);
         if !linters.is_empty() {
             let names: Vec<_> = linters.iter().map(|(n, _)| n.as_str()).collect();
@@ -1480,7 +1598,10 @@ async fn wait_for_ci(
 
     let rc;
     if counts.failed > 0 {
-        println!("   ❌ {} failed, ✅ {} passed", counts.failed, counts.passed);
+        println!(
+            "   ❌ {} failed, ✅ {} passed",
+            counts.failed, counts.passed
+        );
         rc = 1;
     } else if counts.pending == 0 {
         println!("   ✅ {} passed", counts.passed);
@@ -1604,7 +1725,8 @@ fn extract_failure_summary(log: &str) -> String {
         r"(?i)FAIL|--- FAIL|panic:|Error:|error:|ERROR|fatal:|undefined:|cannot |could not |timed out|exit status"
     ).unwrap();
 
-    let lines: Vec<&str> = log.lines()
+    let lines: Vec<&str> = log
+        .lines()
         .map(|line| line.splitn(4, '\t').last().unwrap_or(line).trim_end())
         .collect();
 
@@ -1719,9 +1841,12 @@ async fn call_kit_llm(
         let result = Command::new(bin)
             .args([
                 "llm",
-                "--model", model,
-                "--system", system_prompt,
-                "--file", &path_str,
+                "--model",
+                model,
+                "--system",
+                system_prompt,
+                "--file",
+                &path_str,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -1729,9 +1854,13 @@ async fn call_kit_llm(
             .output()
             .await;
         let Ok(out) = result else { continue };
-        if !out.status.success() { continue; }
+        if !out.status.success() {
+            continue;
+        }
         let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if body.is_empty() { continue; }
+        if body.is_empty() {
+            continue;
+        }
         return Some(body);
     }
     None
@@ -1807,10 +1936,12 @@ fn classify_provider(link: &str) -> CheckProvider {
 /// `link` like `https://github.com/<owner>/<repo>/actions/runs/<run_id>[/job/<job_id>]`.
 /// Returns (run_id, optional job_id). Falls back to last numeric segment.
 fn parse_gha_link(link: &str) -> (u64, Option<u64>) {
-    let job = Regex::new(r"/job/(\d+)").unwrap()
+    let job = Regex::new(r"/job/(\d+)")
+        .unwrap()
         .captures(link)
         .and_then(|c| c.get(1)?.as_str().parse().ok());
-    let run = Regex::new(r"/actions/runs/(\d+)").unwrap()
+    let run = Regex::new(r"/actions/runs/(\d+)")
+        .unwrap()
         .captures(link)
         .and_then(|c| c.get(1)?.as_str().parse().ok())
         .unwrap_or_else(|| run_id_from_url(link));
@@ -1822,13 +1953,18 @@ fn parse_gha_link(link: &str) -> (u64, Option<u64>) {
 fn parse_buildkite_link(link: &str) -> Option<(String, String, u64)> {
     let re = Regex::new(r"buildkite\.com/([^/]+)/([^/]+)/builds/(\d+)").unwrap();
     let c = re.captures(link)?;
-    Some((c.get(1)?.as_str().into(), c.get(2)?.as_str().into(), c.get(3)?.as_str().parse().ok()?))
+    Some((
+        c.get(1)?.as_str().into(),
+        c.get(2)?.as_str().into(),
+        c.get(3)?.as_str().parse().ok()?,
+    ))
 }
 
 async fn list_failed_checks(pr_number: &str) -> Vec<PrCheck> {
     let r = sh3(&format!(
         "gh pr checks {pr_number} --json name,bucket,link,workflow,description"
-    )).await;
+    ))
+    .await;
     let mut all: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
     all.retain(|c| c.bucket == "fail" && !IGNORED_CHECKS.contains(&c.name.as_str()));
     all
@@ -1845,14 +1981,20 @@ async fn fetch_gha_log(check: &PrCheck) -> String {
         _ => return String::new(),
     };
     let log = sh3(&cmd).await;
-    if !log.stdout.is_empty() { log.stdout } else { log.stderr }
+    if !log.stdout.is_empty() {
+        log.stdout
+    } else {
+        log.stderr
+    }
 }
 
 /// Buildkite logs require `BUILDKITE_API_TOKEN`. Without one, surface the URL +
 /// any check-run output GitHub already stored, so the agent isn't left blind.
 async fn fetch_buildkite_log(check: &PrCheck, head_sha: &str) -> String {
     let parsed = parse_buildkite_link(&check.link);
-    let token = std::env::var("BUILDKITE_API_TOKEN").ok().filter(|t| !t.is_empty());
+    let token = std::env::var("BUILDKITE_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
 
     if let (Some((org, pipeline, number)), Some(tok)) = (parsed.clone(), token) {
         let api = format!(
@@ -1860,7 +2002,8 @@ async fn fetch_buildkite_log(check: &PrCheck, head_sha: &str) -> String {
         );
         let r = sh3(&format!(
             "curl -sf -H 'Authorization: Bearer {tok}' {api:?}"
-        )).await;
+        ))
+        .await;
         if r.code == 0 && !r.stdout.is_empty() {
             // Extract per-job logs for failing jobs.
             let logs = extract_buildkite_failed_logs(&r.stdout, &tok).await;
@@ -1884,10 +2027,15 @@ async fn fetch_buildkite_log(check: &PrCheck, head_sha: &str) -> String {
     if !cr.is_empty() {
         parts.push(cr);
     }
-    if std::env::var("BUILDKITE_API_TOKEN").ok().filter(|t| !t.is_empty()).is_none() {
+    if std::env::var("BUILDKITE_API_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .is_none()
+    {
         parts.push(
             "(Set BUILDKITE_API_TOKEN to fetch full Buildkite logs. \
-             Otherwise open the URL above.)".into(),
+             Otherwise open the URL above.)"
+                .into(),
         );
     }
     parts.join("\n")
@@ -1895,7 +2043,8 @@ async fn fetch_buildkite_log(check: &PrCheck, head_sha: &str) -> String {
 
 #[derive(Deserialize)]
 struct BkBuild {
-    #[allow(dead_code)] number: u64,
+    #[allow(dead_code)]
+    number: u64,
     jobs: Option<Vec<BkJob>>,
 }
 #[derive(Deserialize)]
@@ -1914,12 +2063,17 @@ async fn extract_buildkite_failed_logs(build_json: &str, token: &str) -> String 
     };
     let mut out = Vec::new();
     for j in build.jobs.into_iter().flatten() {
-        let failed = j.state.as_deref() == Some("failed")
-            || j.exit_status.map(|e| e != 0).unwrap_or(false);
-        if !failed { continue; }
+        let failed =
+            j.state.as_deref() == Some("failed") || j.exit_status.map(|e| e != 0).unwrap_or(false);
+        if !failed {
+            continue;
+        }
         let name = j.name.clone().unwrap_or_else(|| "unnamed".into());
         let log = if let Some(url) = j.raw_log_url.as_ref() {
-            let r = sh3(&format!("curl -sf -H 'Authorization: Bearer {token}' {url:?}")).await;
+            let r = sh3(&format!(
+                "curl -sf -H 'Authorization: Bearer {token}' {url:?}"
+            ))
+            .await;
             if r.code == 0 { r.stdout } else { String::new() }
         } else {
             String::new()
@@ -1928,8 +2082,14 @@ async fn extract_buildkite_failed_logs(build_json: &str, token: &str) -> String 
         out.push(format!(
             "### Buildkite job: {name} (id={})\nExit: {}\n```\n{}\n```\n",
             j.id.unwrap_or_default(),
-            j.exit_status.map(|e| e.to_string()).unwrap_or_else(|| "?".into()),
-            if summary.is_empty() { truncate(&log, 4000).to_string() } else { summary },
+            j.exit_status
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "?".into()),
+            if summary.is_empty() {
+                truncate(&log, 4000).to_string()
+            } else {
+                summary
+            },
         ));
     }
     out.join("\n")
@@ -1940,13 +2100,18 @@ async fn extract_buildkite_failed_logs(build_json: &str, token: &str) -> String 
 /// fallback so the agent always gets *something* even when we can't fetch the
 /// provider's full log.
 async fn fetch_check_run_output(head_sha: &str, name: &str) -> String {
-    if head_sha.is_empty() { return String::new(); }
+    if head_sha.is_empty() {
+        return String::new();
+    }
     let r = sh3(&format!(
         "gh api 'repos/{{owner}}/{{repo}}/commits/{head_sha}/check-runs?per_page=100' \
          --jq '.check_runs[] | select(.name == \"{}\")'",
         name.replace('"', "\\\"")
-    )).await;
-    if r.code != 0 || r.stdout.is_empty() { return String::new(); }
+    ))
+    .await;
+    if r.code != 0 || r.stdout.is_empty() {
+        return String::new();
+    }
     // Take the first check-run if there are multiple (retries).
     let first_obj = r.stdout.split("\n}\n{").next().unwrap_or(&r.stdout);
     let parsed: serde_json::Value = match serde_json::from_str(first_obj) {
@@ -1955,7 +2120,10 @@ async fn fetch_check_run_output(head_sha: &str, name: &str) -> String {
     };
     let mut parts = Vec::new();
     for k in ["title", "summary", "text"] {
-        if let Some(s) = parsed.pointer(&format!("/output/{k}")).and_then(|v| v.as_str()) {
+        if let Some(s) = parsed
+            .pointer(&format!("/output/{k}"))
+            .and_then(|v| v.as_str())
+        {
             if !s.is_empty() {
                 parts.push(format!("**{k}**: {}", truncate(s, 2000)));
             }
@@ -1965,23 +2133,37 @@ async fn fetch_check_run_output(head_sha: &str, name: &str) -> String {
 }
 
 async fn fetch_external_log(check: &PrCheck, head_sha: &str) -> String {
-    let mut parts = vec![format!("External check ({}): {}", classify_provider_label(&check.link), check.link)];
+    let mut parts = vec![format!(
+        "External check ({}): {}",
+        classify_provider_label(&check.link),
+        check.link
+    )];
     if !check.description.is_empty() {
         parts.push(check.description.clone());
     }
     let cr = fetch_check_run_output(head_sha, &check.name).await;
-    if !cr.is_empty() { parts.push(cr); }
+    if !cr.is_empty() {
+        parts.push(cr);
+    }
     parts.join("\n")
 }
 
 fn classify_provider_label(link: &str) -> &'static str {
-    if link.contains("buildkite.com/") { "buildkite" }
-    else if link.contains("spacelift.io") { "spacelift" }
-    else if link.contains("wiz.io") { "wiz" }
-    else if link.contains("mintlify.com") { "mintlify" }
-    else if link.contains("depthfirst.com") { "depthfirst" }
-    else if link.contains("github.com") { "github" }
-    else { "unknown" }
+    if link.contains("buildkite.com/") {
+        "buildkite"
+    } else if link.contains("spacelift.io") {
+        "spacelift"
+    } else if link.contains("wiz.io") {
+        "wiz"
+    } else if link.contains("mintlify.com") {
+        "mintlify"
+    } else if link.contains("depthfirst.com") {
+        "depthfirst"
+    } else if link.contains("github.com") {
+        "github"
+    } else {
+        "unknown"
+    }
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -1993,11 +2175,14 @@ fn strip_ansi(s: &str) -> String {
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max { s }
-    else {
+    if s.len() <= max {
+        s
+    } else {
         // Slice at a UTF-8 boundary.
         let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) { end -= 1; }
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
         &s[..end]
     }
 }
@@ -2015,7 +2200,10 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
     for check in &failed {
         let provider = classify_provider(&check.link);
         let provider_label = classify_provider_label(&check.link);
-        println!("      Fetching log for {} ({})...", check.name, provider_label);
+        println!(
+            "      Fetching log for {} ({})...",
+            check.name, provider_label
+        );
         let raw = match provider {
             CheckProvider::GitHubActions => fetch_gha_log(check).await,
             CheckProvider::Buildkite => fetch_buildkite_log(check, head_sha).await,
@@ -2030,9 +2218,19 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
             raw.clone()
         };
         let header = format!("### {} ({})", check.name, provider_label);
-        let link_line = if check.link.is_empty() { String::new() } else { format!("\nLink: {}", check.link) };
-        summaries.push(format!("{header}{link_line}\n```\n{}\n```",
-            if summary.trim().is_empty() { "(no extracted error lines)" } else { summary.trim() }));
+        let link_line = if check.link.is_empty() {
+            String::new()
+        } else {
+            format!("\nLink: {}", check.link)
+        };
+        summaries.push(format!(
+            "{header}{link_line}\n```\n{}\n```",
+            if summary.trim().is_empty() {
+                "(no extracted error lines)"
+            } else {
+                summary.trim()
+            }
+        ));
         if matches!(provider, CheckProvider::GitHubActions) && !raw.is_empty() {
             let body = truncate(&raw, 16000);
             full_logs.push(format!("## {} — full log\n```\n{}\n```", check.name, body));
@@ -2043,8 +2241,11 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
         // Defensive: gh pr checks --json returned nothing failed but caller
         // believed there were failures. Don't leave the file empty — point at
         // the live `gh pr checks` output.
-        summaries.push("(no failing checks reported by `gh pr checks --json`; \
-                        run `dragonfly ci status` to investigate)".into());
+        summaries.push(
+            "(no failing checks reported by `gh pr checks --json`; \
+                        run `dragonfly ci status` to investigate)"
+                .into(),
+        );
     }
 
     let raw_content = format!(
@@ -2057,7 +2258,10 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
     // with a distilled summary that points at the full log on disk.
     if raw_content.len() >= 1000 {
         let full_file = section("failures-full", &raw_content);
-        println!("   Distilling failure logs ({} bytes) via LLM...", raw_content.len());
+        println!(
+            "   Distilling failure logs ({} bytes) via LLM...",
+            raw_content.len()
+        );
         let distill_start = std::time::Instant::now();
         match distill_failure_logs(&raw_content, &full_file.path, Model::Haiku).await {
             Some(distilled) => {
@@ -2067,7 +2271,11 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
                     raw_content.len(),
                     distilled.len(),
                 );
-                return FailureLogs { content: distilled, names, full_file: Some(full_file) };
+                return FailureLogs {
+                    content: distilled,
+                    names,
+                    full_file: Some(full_file),
+                };
             }
             None => {
                 println!("   Distill failed; falling back to raw failure logs.");
@@ -2075,13 +2283,19 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
         }
     }
 
-    FailureLogs { content: raw_content, names, full_file: None }
+    FailureLogs {
+        content: raw_content,
+        names,
+        full_file: None,
+    }
 }
 
 // ── CI subcommands ───────────────────────────────────────────────────────────
 
 async fn resolve_pr_number(pr: Option<String>) -> Option<String> {
-    if let Some(p) = pr { return Some(p); }
+    if let Some(p) = pr {
+        return Some(p);
+    }
     let s = sh("gh pr view --json number --jq '.number'").await?;
     if s.is_empty() { None } else { Some(s) }
 }
@@ -2091,17 +2305,18 @@ async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
         eprintln!("No PR for current branch and --pr not supplied.");
         return 2;
     };
-    let checks_cmd = format!(
-        "gh pr checks {pr_number} --json name,bucket,link,workflow,description"
-    );
-    let (r, has_conflicts) = tokio::join!(
-        sh3(&checks_cmd),
-        check_origin_main_conflicts(),
-    );
+    let checks_cmd =
+        format!("gh pr checks {pr_number} --json name,bucket,link,workflow,description");
+    let (r, has_conflicts) = tokio::join!(sh3(&checks_cmd), check_origin_main_conflicts(),);
     let mut checks: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
     checks.retain(|c| !ignored.contains(&c.name.as_str()));
     // Dedup by name, keeping the highest-priority bucket: fail > pending > pass > skipping.
-    let priority = |b: &str| match b { "fail" => 3, "pending" => 2, "pass" => 1, _ => 0 };
+    let priority = |b: &str| match b {
+        "fail" => 3,
+        "pending" => 2,
+        "pass" => 1,
+        _ => 0,
+    };
     checks.sort_by(|a, b| priority(&b.bucket).cmp(&priority(&a.bucket)));
     let mut seen = std::collections::HashSet::new();
     checks.retain(|c| seen.insert(c.name.clone()));
@@ -2117,10 +2332,18 @@ async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
     // Always count totals from full set.
     let all_checks: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
     let mut by_name: HashMap<String, &PrCheck> = HashMap::new();
-    for c in all_checks.iter().filter(|c| !ignored.contains(&c.name.as_str())) {
+    for c in all_checks
+        .iter()
+        .filter(|c| !ignored.contains(&c.name.as_str()))
+    {
         // Keep the highest-priority row per name.
-        let keep = by_name.get(&c.name).map(|p| priority(&c.bucket) > priority(&p.bucket)).unwrap_or(true);
-        if keep { by_name.insert(c.name.clone(), c); }
+        let keep = by_name
+            .get(&c.name)
+            .map(|p| priority(&c.bucket) > priority(&p.bucket))
+            .unwrap_or(true);
+        if keep {
+            by_name.insert(c.name.clone(), c);
+        }
     }
     for c in by_name.values() {
         match c.bucket.as_str() {
@@ -2131,8 +2354,10 @@ async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
         }
     }
 
-    println!("PR #{pr_number} — {} fail, {} pending, {} pass, {} skip",
-        failed, pending, passed_total, skipped_total);
+    println!(
+        "PR #{pr_number} — {} fail, {} pending, {} pass, {} skip",
+        failed, pending, passed_total, skipped_total
+    );
     if has_conflicts {
         println!("⚠️  Merge conflicts with origin/main — some checks did not run.");
     }
@@ -2144,7 +2369,11 @@ async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
             _ => "⏭",
         };
         let provider = classify_provider_label(&c.link);
-        let link = if c.link.is_empty() { String::new() } else { format!("  {}", c.link) };
+        let link = if c.link.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", c.link)
+        };
         println!("{icon} [{provider:>10}] {}{link}", c.name);
     }
     if failed > 0 { 1 } else { 0 }
@@ -2171,12 +2400,17 @@ async fn ci_failures_cmd(
     // Build the full per-check dump into a buffer so we can optionally
     // pipe it through the distiller before printing.
     let mut buf = String::new();
-    buf.push_str(&format!("# Failing checks for PR #{pr_number} ({} total)\n\n", failed.len()));
+    buf.push_str(&format!(
+        "# Failing checks for PR #{pr_number} ({} total)\n\n",
+        failed.len()
+    ));
     for check in &failed {
         let provider = classify_provider(&check.link);
         let provider_label = classify_provider_label(&check.link);
         buf.push_str(&format!("## {} ({})\n", check.name, provider_label));
-        if !check.link.is_empty() { buf.push_str(&format!("Link: {}\n", check.link)); }
+        if !check.link.is_empty() {
+            buf.push_str(&format!("Link: {}\n", check.link));
+        }
         let raw = match provider {
             CheckProvider::GitHubActions => fetch_gha_log(check).await,
             CheckProvider::Buildkite => fetch_buildkite_log(check, &head_sha).await,
@@ -2206,7 +2440,11 @@ async fn ci_failures_cmd(
     }
 
     let full_file = section("ci-failures-full", &buf);
-    eprintln!("   Distilling failure logs ({} bytes) via {}...", buf.len(), model.kit_id());
+    eprintln!(
+        "   Distilling failure logs ({} bytes) via {}...",
+        buf.len(),
+        model.kit_id()
+    );
     let start = std::time::Instant::now();
     match distill_failure_logs(&buf, &full_file.path, model).await {
         Some(distilled) => {
@@ -2235,12 +2473,15 @@ async fn resolve_watch_anchor(pr: Option<String>) -> Option<(String, String)> {
         let out = sh(&format!(
             "gh pr view {pr} --json headRefOid,headRefName \
              --jq '.headRefOid + \" \" + .headRefName'"
-        )).await?;
+        ))
+        .await?;
         let mut parts = out.split_whitespace();
         let sha = parts.next()?.to_string();
         return Some((sha, parts.next().unwrap_or_default().to_string()));
     }
-    let branch = sh("git branch --show-current").await.filter(|s| !s.is_empty())?;
+    let branch = sh("git branch --show-current")
+        .await
+        .filter(|s| !s.is_empty())?;
     // `@{push}` is the configured push destination; fall back to the
     // conventional origin/<branch> when no upstream is configured.
     let sha = match sh("git rev-parse @{push} 2>/dev/null").await {
@@ -2257,7 +2498,9 @@ async fn ci_watch_cmd(pr: Option<String>) -> i32 {
     let conflicts = tokio::spawn(check_origin_main_conflicts());
     let explicit_pr = pr.is_some();
     let Some((sha, branch)) = resolve_watch_anchor(pr).await else {
-        eprintln!("Could not resolve a pushed commit to watch — push the branch first (or pass --pr).");
+        eprintln!(
+            "Could not resolve a pushed commit to watch — push the branch first (or pass --pr)."
+        );
         return 2;
     };
     // The anchor is what was pushed, not HEAD; flag the gap so unpushed local
@@ -2319,9 +2562,8 @@ struct RestStatus {
 /// name/bucket shape `gh pr checks --json` produces. Querying by SHA instead
 /// of by PR is what lets `push -w` watch exactly what it pushed.
 async fn checks_for_sha(sha: &str) -> Vec<PrCheck> {
-    let runs_cmd = format!(
-        "gh api 'repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100'"
-    );
+    let runs_cmd =
+        format!("gh api 'repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100'");
     // The combined-status endpoint covers providers that report commit
     // statuses rather than check runs (Buildkite, Spacelift, Graphite, …).
     let status_cmd = format!("gh api 'repos/{{owner}}/{{repo}}/commits/{sha}/status'");
@@ -2386,7 +2628,10 @@ fn counts_from_checks(checks: &[PrCheck], ignored: &[&str]) -> CheckCounts {
         skipping: 0,
         pending_names: Vec::new(),
     };
-    for c in checks.iter().filter(|c| !ignored.contains(&c.name.as_str())) {
+    for c in checks
+        .iter()
+        .filter(|c| !ignored.contains(&c.name.as_str()))
+    {
         match c.bucket.as_str() {
             "pass" => counts.passed += 1,
             "fail" => counts.failed += 1,
@@ -2429,17 +2674,18 @@ fn print_checks_summary(label: &str, checks: &[PrCheck], ignored: &[&str]) -> i3
             _ => "⏭",
         };
         let provider = classify_provider_label(&c.link);
-        let link = if c.link.is_empty() { String::new() } else { format!("  {}", c.link) };
+        let link = if c.link.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", c.link)
+        };
         println!("{icon} [{provider:>10}] {}{link}", c.name);
     }
     if counts.failed > 0 { 1 } else { 0 }
 }
 
 /// Poll the checks of one specific commit until all settle or one fails
-/// (fail-fast), bounded by a 4m30s budget. The budget sits deliberately just
-/// under the 5-minute LLM prompt-cache TTL: an agent blocked on a longer
-/// watch would return to a cold cache, so we hand back progress first and
-/// let it re-invoke `dragonfly ci watch` to continue.
+/// (fail-fast).
 ///
 /// Polls REST by SHA rather than `gh pr checks --watch`: gh's watch blocks
 /// until every check reaches a terminal state, so the perpetually-`pending`
@@ -2447,7 +2693,6 @@ fn print_checks_summary(label: &str, checks: &[PrCheck], ignored: &[&str]) -> i3
 /// can move under a watch while a fixed SHA cannot.
 async fn ci_watch_sha(sha: &str, ci_start: f64, first_checks: Vec<PrCheck>) -> i32 {
     const POLL: std::time::Duration = std::time::Duration::from_secs(15);
-    const BUDGET: std::time::Duration = std::time::Duration::from_secs(270);
     let short = &sha[..7.min(sha.len())];
     let start = std::time::Instant::now();
     let mut prev_line = String::new();
@@ -2459,7 +2704,10 @@ async fn ci_watch_sha(sha: &str, ci_start: f64, first_checks: Vec<PrCheck>) -> i
         // Checks take a few seconds to register after a push; an empty list
         // means "not started yet", never "all done".
         let line = if total == 0 {
-            format!("  [{}m] ⏳ waiting for checks to appear...", start.elapsed().as_secs() / 60)
+            format!(
+                "  [{}m] ⏳ waiting for checks to appear...",
+                start.elapsed().as_secs() / 60
+            )
         } else {
             format_ci_status(&counts, ci_start, 0)
         };
@@ -2474,19 +2722,6 @@ async fn ci_watch_sha(sha: &str, ci_start: f64, first_checks: Vec<PrCheck>) -> i
             return print_checks_summary(&format!("Commit {short}"), &checks, WATCH_IGNORED_CHECKS);
         }
 
-        if start.elapsed() + POLL >= BUDGET {
-            println!();
-            print_checks_summary(
-                &format!("Commit {short} (still in progress)"),
-                &checks,
-                WATCH_IGNORED_CHECKS,
-            );
-            println!(
-                "\n⏳ Watch budget (4m30s) exhausted with checks still pending. \
-                 Re-run `dragonfly ci watch` to continue watching."
-            );
-            return 3;
-        }
         sleep(POLL).await;
         checks = checks_for_sha(sha).await;
     }
@@ -2514,7 +2749,11 @@ async fn ci_flaky_cmd(name: String, limit: usize) -> i32 {
         let mut parts = r.splitn(2, ' ');
         let conclusion = parts.next().unwrap_or("").to_string();
         let url = parts.next().unwrap_or("").trim().to_string();
-        let conclusion = if conclusion.is_empty() { "no-run".to_string() } else { conclusion };
+        let conclusion = if conclusion.is_empty() {
+            "no-run".to_string()
+        } else {
+            conclusion
+        };
         match conclusion.as_str() {
             "success" => pass += 1,
             "failure" | "cancelled" | "timed_out" => fail += 1,
@@ -2522,11 +2761,22 @@ async fn ci_flaky_cmd(name: String, limit: usize) -> i32 {
             "no-run" => skip += 1,
             _ => other += 1,
         }
-        rows.push(format!("{} {}{}", &sha[..7.min(sha.len())], conclusion, if url.is_empty() { String::new() } else { format!("  {url}") }));
+        rows.push(format!(
+            "{} {}{}",
+            &sha[..7.min(sha.len())],
+            conclusion,
+            if url.is_empty() {
+                String::new()
+            } else {
+                format!("  {url}")
+            }
+        ));
     }
     println!("Check `{name}` on last {limit} commits of origin/main:");
     println!("  ✅ {pass} pass    ❌ {fail} fail    ⏭ {skip} skip/none    ? {other} other\n");
-    for row in &rows { println!("{row}"); }
+    for row in &rows {
+        println!("{row}");
+    }
     let verdict = if pass + fail == 0 {
         "No data — this check doesn't run on main commits. Compare against other PRs instead."
     } else if fail == 0 {
@@ -2561,10 +2811,14 @@ async fn ci_retries_cmd(pr: Option<String>) -> i32 {
     };
     let head_sha = sh(&format!(
         "gh pr view {pr_number} --json headRefOid --jq '.headRefOid'"
-    )).await.unwrap_or_default();
+    ))
+    .await
+    .unwrap_or_default();
     let branch = sh(&format!(
         "gh pr view {pr_number} --json headRefName --jq '.headRefName'"
-    )).await.unwrap_or_default();
+    ))
+    .await
+    .unwrap_or_default();
     if branch.is_empty() {
         eprintln!("Could not determine PR head branch.");
         return 2;
@@ -2572,12 +2826,15 @@ async fn ci_retries_cmd(pr: Option<String>) -> i32 {
     let r = sh3(&format!(
         "gh run list --branch {branch} --limit 50 \
          --json databaseId,name,headSha,conclusion,status,attempt,createdAt"
-    )).await;
+    ))
+    .await;
     let mut runs: Vec<GhRun> = parse_json(&r.stdout).unwrap_or_default();
     runs.retain(|r| r.head_sha == head_sha);
 
-    println!("# Workflow runs for PR #{pr_number} (head {})",
-        &head_sha[..7.min(head_sha.len())]);
+    println!(
+        "# Workflow runs for PR #{pr_number} (head {})",
+        &head_sha[..7.min(head_sha.len())]
+    );
     if runs.is_empty() {
         println!("(no GitHub Actions runs found for this head SHA)");
         return 0;
@@ -2592,12 +2849,16 @@ async fn ci_retries_cmd(pr: Option<String>) -> i32 {
         format!("{date} {time}")
     }
     fn result_str(r: &GhRun) -> String {
-        r.conclusion.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| r.status.clone())
+        r.conclusion
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| r.status.clone())
     }
 
     // Sort: retried runs (attempt > 1) first, then by name, then by createdAt desc.
     runs.sort_by(|a, b| {
-        b.attempt.cmp(&a.attempt)
+        b.attempt
+            .cmp(&a.attempt)
             .then_with(|| a.name.cmp(&b.name))
             .then_with(|| b.created_at.cmp(&a.created_at))
     });
@@ -2605,18 +2866,28 @@ async fn ci_retries_cmd(pr: Option<String>) -> i32 {
     let name_w = runs.iter().map(|r| r.name.len()).max().unwrap_or(4).min(50);
     let result_w = runs.iter().map(|r| result_str(r).len()).max().unwrap_or(7);
 
-    println!("{:<name_w$}  {:>3}  {:<result_w$}  {:<11}  {}",
-        "NAME", "ATT", "RESULT", "TIME", "RUN_ID");
+    println!(
+        "{:<name_w$}  {:>3}  {:<result_w$}  {:<11}  {}",
+        "NAME", "ATT", "RESULT", "TIME", "RUN_ID"
+    );
     for r in &runs {
         let marker = if r.attempt > 1 { " ← retried" } else { "" };
-        println!("{:<name_w$}  {:>3}  {:<result_w$}  {:<11}  {}{}",
-            r.name, r.attempt, result_str(r), short_time(&r.created_at),
-            r.database_id, marker);
+        println!(
+            "{:<name_w$}  {:>3}  {:<result_w$}  {:<11}  {}{}",
+            r.name,
+            r.attempt,
+            result_str(r),
+            short_time(&r.created_at),
+            r.database_id,
+            marker
+        );
     }
 
     let retried = runs.iter().filter(|r| r.attempt > 1).count();
     if retried > 0 {
-        println!("\n{retried} run(s) retried (attempt > 1). Avoid rerunning these without asking the user.");
+        println!(
+            "\n{retried} run(s) retried (attempt > 1). Avoid rerunning these without asking the user."
+        );
     }
     0
 }
@@ -2628,34 +2899,58 @@ async fn ci_rerun_cmd(name: String, pr: Option<String>) -> i32 {
     };
     let head_sha = sh(&format!(
         "gh pr view {pr_number} --json headRefOid --jq '.headRefOid'"
-    )).await.unwrap_or_default();
+    ))
+    .await
+    .unwrap_or_default();
     let branch = sh(&format!(
         "gh pr view {pr_number} --json headRefName --jq '.headRefName'"
-    )).await.unwrap_or_default();
+    ))
+    .await
+    .unwrap_or_default();
     // Match by check name → GHA run ID. We need to look up the workflow file
     // for the failing job, not the job ID, since rerun --failed acts on a run.
     let runs_json = sh3(&format!(
         "gh run list --branch {branch} --limit 50 \
          --json databaseId,name,headSha,conclusion \
          --jq '[.[] | select(.headSha == \"{head_sha}\" and .conclusion == \"failure\")]'"
-    )).await;
+    ))
+    .await;
     let runs: Vec<RunInfo> = parse_json(&runs_json.stdout).unwrap_or_default();
     if runs.is_empty() {
-        eprintln!("No failing GHA runs for {name} on head {head_sha}. \
-                   (Non-GHA checks like Buildkite cannot be rerun via this command.)");
+        eprintln!(
+            "No failing GHA runs for {name} on head {head_sha}. \
+                   (Non-GHA checks like Buildkite cannot be rerun via this command.)"
+        );
         return 2;
     }
     // Try exact match first, then prefix.
-    let target = runs.iter().find(|r| r.name.as_deref() == Some(name.as_str()))
-        .or_else(|| runs.iter().find(|r| r.name.as_deref().map(|n| n.contains(&name)).unwrap_or(false)));
+    let target = runs
+        .iter()
+        .find(|r| r.name.as_deref() == Some(name.as_str()))
+        .or_else(|| {
+            runs.iter().find(|r| {
+                r.name
+                    .as_deref()
+                    .map(|n| n.contains(&name))
+                    .unwrap_or(false)
+            })
+        });
     let Some(run) = target else {
         eprintln!("No failing run named `{name}`. Failing runs:");
-        for r in &runs { eprintln!("  - {}", r.name.as_deref().unwrap_or("?")); }
+        for r in &runs {
+            eprintln!("  - {}", r.name.as_deref().unwrap_or("?"));
+        }
         return 2;
     };
-    println!("Re-running failed jobs in {} (run {})...", run.name.as_deref().unwrap_or("?"), run.database_id);
+    println!(
+        "Re-running failed jobs in {} (run {})...",
+        run.name.as_deref().unwrap_or("?"),
+        run.database_id
+    );
     let r = sh3(&format!("gh run rerun {} --failed", run.database_id)).await;
-    if !r.stdout.is_empty() { println!("{}", r.stdout); }
+    if !r.stdout.is_empty() {
+        println!("{}", r.stdout);
+    }
     if r.code != 0 {
         eprintln!("{}", r.stderr);
         return r.code;
@@ -2673,11 +2968,18 @@ async fn ci_distill_cmd(file: PathBuf, model: Option<Model>) -> i32 {
         }
     };
     if raw.len() < 1000 {
-        eprintln!("Input is only {} bytes; distill skipped (raw printed as-is).", raw.len());
+        eprintln!(
+            "Input is only {} bytes; distill skipped (raw printed as-is).",
+            raw.len()
+        );
         print!("{raw}");
         return 0;
     }
-    eprintln!("   Distilling failure logs ({} bytes) via {}...", raw.len(), model.kit_id());
+    eprintln!(
+        "   Distilling failure logs ({} bytes) via {}...",
+        raw.len(),
+        model.kit_id()
+    );
     let start = std::time::Instant::now();
     match distill_failure_logs(&raw, &file, model).await {
         Some(distilled) => {
@@ -2699,8 +3001,7 @@ async fn ci_distill_cmd(file: PathBuf, model: Option<Model>) -> i32 {
 
 // ── Merge conflict check ─────────────────────────────────────────────────────
 
-const MERGE_TREE_PROBE_CMD: &str =
-    "git merge-tree --write-tree --name-only origin/main HEAD";
+const MERGE_TREE_PROBE_CMD: &str = "git merge-tree --write-tree --name-only origin/main HEAD";
 
 async fn merge_tree_probe() -> ShResult {
     sh3(MERGE_TREE_PROBE_CMD).await
@@ -2733,15 +3034,17 @@ async fn build_merge_content(r: ShResult) -> MergeResult {
         println!("⚠️  Potential merge conflicts detected");
         if let Some(base) = sh("git merge-base HEAD origin/main").await {
             if let Some(commits) = sh(&format!("git log --oneline {base}..origin/main")).await {
-                content += &format!(
-                    "\n## Recent commits on main since merge-base\n```\n{commits}\n```\n"
-                );
+                content +=
+                    &format!("\n## Recent commits on main since merge-base\n```\n{commits}\n```\n");
             }
         }
     } else {
         println!("✅ No merge conflicts");
     }
-    MergeResult { content, has_conflicts }
+    MergeResult {
+        content,
+        has_conflicts,
+    }
 }
 
 // ── PR handling ──────────────────────────────────────────────────────────────
@@ -2799,7 +3102,12 @@ fn prompt_pr_title(branch_commits: &Option<String>) -> Option<String> {
         .as_deref()
         .unwrap_or("")
         .lines()
-        .map(|line| line.split_once(' ').map(|(_, t)| t).unwrap_or(line).to_string())
+        .map(|line| {
+            line.split_once(' ')
+                .map(|(_, t)| t)
+                .unwrap_or(line)
+                .to_string()
+        })
         .collect();
     if !commit_subjects.is_empty() {
         println!("   Commits on this branch:");
@@ -2828,6 +3136,38 @@ fn prompt_pr_title(branch_commits: &Option<String>) -> Option<String> {
     Some(title)
 }
 
+/// Title resolution for --non-interactive PR creation: the --title flag,
+/// else the newest commit subject. None aborts PR creation, matching the
+/// cancelled-prompt path in [prompt_pr_title].
+fn non_interactive_pr_title(flag: Option<&str>, branch_commits: &Option<String>) -> Option<String> {
+    if let Some(t) = flag {
+        let t = t.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    let subject = branch_commits
+        .as_deref()
+        .unwrap_or("")
+        .lines()
+        .next()
+        .map(|line| {
+            line.split_once(' ')
+                .map(|(_, t)| t)
+                .unwrap_or(line)
+                .trim()
+                .to_string()
+        })
+        .filter(|s| !s.is_empty());
+    match &subject {
+        Some(t) => println!("   PR title (from commit subject): {t}"),
+        None => {
+            println!("⚠️  No --title and no commits to derive a title from — skipping PR creation.")
+        }
+    }
+    subject
+}
+
 async fn create_pr_with_title(title: &str) -> PrInfo {
     let rc = std::process::Command::new("gh")
         .args(["pr", "create", "--draft", "--title", title, "--body", ""])
@@ -2850,7 +3190,12 @@ async fn create_pr_with_title(title: &str) -> PrInfo {
     } else {
         println!("⚠️  PR creation failed");
     }
-    PrInfo { number: None, url: None, is_draft: false, author_login: String::new() }
+    PrInfo {
+        number: None,
+        url: None,
+        is_draft: false,
+        author_login: String::new(),
+    }
 }
 
 // ── Reviews + CI collection ──────────────────────────────────────────────────
@@ -2911,11 +3256,18 @@ async fn collect_reviews_and_ci(
             let ci_content = format!(
                 "# CI Checks\n\nPR: #{pr_number}\nExit code: {}\n\
                  Note: CI wait skipped due to unresolved review comments.\n```\n{}\n```\n",
-                first.code, strip_skipping(&first.stdout)
+                first.code,
+                strip_skipping(&first.stdout)
             );
             files.push(section("ci", &ci_content));
         } else {
-            let ci = wait_for_ci(pr_number, branch, Some((counts, first.code, first.stdout)), base_ref).await;
+            let ci = wait_for_ci(
+                pr_number,
+                branch,
+                Some((counts, first.code, first.stdout)),
+                base_ref,
+            )
+            .await;
             files.push(section("ci", &ci.ci_content));
             if let Some(ref failures) = ci.failures_content {
                 files.push(section("failures", failures));
@@ -2928,16 +3280,26 @@ async fn collect_reviews_and_ci(
         }
     }
 
-    CiResult { files, has_unresolved, skip_ci, failed_names }
+    CiResult {
+        files,
+        has_unresolved,
+        skip_ci,
+        failed_names,
+    }
 }
 
 // ── Context collection ───────────────────────────────────────────────────────
 
-async fn collect_context_strings(branch_commits: &Option<String>, base_ref: &str) -> ContextStrings {
+async fn collect_context_strings(
+    branch_commits: &Option<String>,
+    base_ref: &str,
+) -> ContextStrings {
     let diff_cmd = format!("git diff --stat {base_ref}...HEAD");
     let (diff, main) = tokio::join!(
         sh(&diff_cmd),
-        sh("git log HEAD..origin/main --oneline --grep='build: automatic update of go-api' --invert-grep"),
+        sh(
+            "git log HEAD..origin/main --oneline --grep='build: automatic update of go-api' --invert-grep"
+        ),
     );
 
     let changed_files = diff
@@ -2967,7 +3329,11 @@ async fn collect_context_strings(branch_commits: &Option<String>, base_ref: &str
         .map(|s| format!("\nCommits in this PR:\n```\n{s}\n```\n"))
         .unwrap_or_default();
 
-    ContextStrings { changed_files, main_commits, pr_commits }
+    ContextStrings {
+        changed_files,
+        main_commits,
+        pr_commits,
+    }
 }
 
 // ── Build files index ────────────────────────────────────────────────────────
@@ -2990,12 +3356,21 @@ fn build_files_index(files: &[TempFile], has_conflicts: bool, failed_names: &[St
     let labels: HashMap<&str, String> = HashMap::from([
         ("push", "push result + git status".into()),
         ("merge", merge_label.into()),
-        ("review-threads", "review threads — inline review + bot comments)".into()),
+        (
+            "review-threads",
+            "review threads — inline review + bot comments)".into(),
+        ),
         ("review-pr", "top-level PR reviews".into()),
-        ("pr-meta", "PR title, body, review decision, requested reviewers".into()),
+        (
+            "pr-meta",
+            "PR title, body, review decision, requested reviewers".into(),
+        ),
         ("ci", "CI check results".into()),
         ("failures", failures_label),
-        ("failures-full", "CI failure logs (full, untruncated raw)".into()),
+        (
+            "failures-full",
+            "CI failure logs (full, untruncated raw)".into(),
+        ),
         ("lint", "local lint failures".into()),
     ]);
 
@@ -3009,7 +3384,10 @@ fn build_files_index(files: &[TempFile], has_conflicts: bool, failed_names: &[St
         } else {
             name.to_string()
         };
-        let label = labels.get(prefix.as_str()).map(|s| s.as_str()).unwrap_or(&prefix);
+        let label = labels
+            .get(prefix.as_str())
+            .map(|s| s.as_str())
+            .unwrap_or(&prefix);
         index += &format!("- `{}` ({} lines) — {label}\n", f.path.display(), f.lines);
     }
     index
@@ -3052,7 +3430,7 @@ async fn write_diff_files(changed_files: &[&str], base_ref: &str) -> String {
 }
 
 async fn full_diffs<'a>(changed_files: &[&'a str], base_ref: &str) -> Vec<(&'a str, String)> {
-    let mut result  = Vec::<(&str,String)>::new();
+    let mut result = Vec::<(&str, String)>::new();
     for &fname in changed_files {
         let res = if let Some(diff) = sh(&format!("git diff {base_ref}...HEAD -- {fname}")).await {
             if !diff.is_empty() {
@@ -3068,6 +3446,49 @@ async fn full_diffs<'a>(changed_files: &[&'a str], base_ref: &str) -> Vec<(&'a s
     result
 }
 
+/// Parses the new-file start line from a unified-diff hunk header body (the
+/// text after the leading `@@`). For `@@ -a,b +c,d @@ ...` it returns `c`.
+fn parse_hunk_new_start(hunk_rest: &str) -> Option<usize> {
+    hunk_rest
+        .split_whitespace()
+        .find(|t| t.starts_with('+'))
+        .and_then(|t| t[1..].split(',').next())
+        .and_then(|n| n.parse::<usize>().ok())
+}
+
+/// Prefixes each added or context line of a unified diff with its line number
+/// in the new (post-change) file, e.g. `58: +// foo`. Deleted lines get no
+/// number, since they are absent from the new file. Hunk and file headers
+/// pass through unchanged; the counter is reseeded from each `@@` header's
+/// `+c` start.
+fn annotate_diff_new_line_numbers(diff: &str) -> String {
+    let mut out = String::with_capacity(diff.len() + diff.len() / 4);
+    let mut new_line: usize = 0;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("@@") {
+            new_line = parse_hunk_new_start(rest).unwrap_or(new_line);
+            out.push_str(line);
+        } else if line.is_empty()
+            || line.starts_with("diff ")
+            || line.starts_with("index ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+            || line.starts_with('\\')
+        {
+            // File/metadata headers and "\ No newline at end of file": no number.
+            out.push_str(line);
+        } else if line.starts_with('-') {
+            // Deleted line: absent from the new file, so no number.
+            out.push_str(line);
+        } else {
+            // Added (`+`) or context (leading space) line: number it.
+            out.push_str(&format!("{new_line}: {line}"));
+            new_line += 1;
+        }
+        out.push('\n');
+    }
+    out
+}
 
 // ── Guide file collection (CLAUDE.md / AGENTS.md) ───────────────────────────
 
@@ -3159,8 +3580,7 @@ fn collect_relevant_guides<P: AsRef<std::path::Path>>(paths: &[P]) -> Vec<PathBu
     // Excluding backtick keeps inline code spans like `` `@types/react` ``
     // (npm scope names mentioned in prose) from registering as references.
     // Capture is `\S+`; trailing punctuation is stripped in the consumer.
-    let at_re =
-        AT_RE.get_or_init(|| Regex::new(r"(?m)(?:^|[^\w@`])@(\S+)").unwrap());
+    let at_re = AT_RE.get_or_init(|| Regex::new(r"(?m)(?:^|[^\w@`])@(\S+)").unwrap());
 
     while let Some(file) = queue.pop() {
         let content = match std::fs::read_to_string(&file) {
@@ -3175,9 +3595,9 @@ fn collect_relevant_guides<P: AsRef<std::path::Path>>(paths: &[P]) -> Vec<PathBu
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         for cap in at_re.captures_iter(&content) {
-            let raw = cap.get(1).unwrap().as_str().trim_end_matches(
-                |c: char| matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '"' | '\''),
-            );
+            let raw = cap.get(1).unwrap().as_str().trim_end_matches(|c: char| {
+                matches!(c, '.' | ',' | ';' | ':' | ')' | ']' | '}' | '"' | '\'')
+            });
             if raw.is_empty() {
                 continue;
             }
@@ -3214,7 +3634,11 @@ fn git_top_level() -> Option<PathBuf> {
         return None;
     }
     let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if s.is_empty() { None } else { Some(PathBuf::from(s)) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(s))
+    }
 }
 
 /// Expands an `@`-reference body (the text after `@`) and returns it iff the
@@ -3231,7 +3655,11 @@ fn resolve_at_ref(raw: &str, parent_dir: &std::path::Path) -> Option<PathBuf> {
     } else {
         parent_dir.join(raw)
     };
-    if expanded.is_file() { Some(expanded) } else { None }
+    if expanded.is_file() {
+        Some(expanded)
+    } else {
+        None
+    }
 }
 
 /// Heuristic: true if `raw` looks intentional enough to warn about when it
@@ -3243,7 +3671,6 @@ fn looks_like_path_ref(raw: &str) -> bool {
         || raw.starts_with('.')
         || std::path::Path::new(raw).extension().is_some()
 }
-
 
 // ── Review log context ───────────────────────────────────────────────────────
 
@@ -3358,7 +3785,7 @@ async fn print_initial_review_prompt() {
 }
 
 /// Materialise relevant CLAUDE.md/AGENTS.md chunks for the current PR,
-/// score them via `lov rag score`, and dump a TSV the user can sort by
+/// score them via `lov eval rag score`, and dump a TSV the user can sort by
 /// score. Threshold tuning is a separate problem — this command is meant
 /// for exploration, not for filtering inside the kit-llm pipeline.
 async fn score_guides_cmd(
@@ -3389,11 +3816,14 @@ async fn score_guides_cmd(
     let guide_paths = collect_relevant_guides(&changed);
     let chunks = guide_chunks::chunk_guides(&guide_paths);
     if chunks.is_empty() {
-        eprintln!("No guide chunks resolved for {} changed files.", changed.len());
+        eprintln!(
+            "No guide chunks resolved for {} changed files.",
+            changed.len()
+        );
         std::process::exit(1);
     }
     eprintln!(
-        "   Scoring {} chunks from {} guides via `lov rag score`...",
+        "   Scoring {} chunks from {} guides via `lov eval rag score`...",
         chunks.len(),
         guide_paths.len(),
     );
@@ -3419,7 +3849,10 @@ async fn score_guides_cmd(
             let kept = guide_chunks::with_ancestors(&chunks, &above);
             eprintln!(
                 "   Threshold ≥{:.1}: {} chunks scored, {} above, {} after ancestor pull.",
-                t, chunks.len(), above.len(), kept.len(),
+                t,
+                chunks.len(),
+                above.len(),
+                kept.len(),
             );
             (
                 kept.iter().map(|&i| chunks[i].clone()).collect(),
@@ -3451,7 +3884,7 @@ async fn score_guides_cmd(
     }
 }
 
-/// Score relevant guide chunks against the PR diff via `lov rag score`,
+/// Score relevant guide chunks against the PR diff via `lov eval rag score`,
 /// keep those at or above [RELEVANT_CONTEXT_THRESHOLD] plus their heading
 /// ancestors, and render a `<relevant-context>` block. Returns an empty
 /// string on any failure (lov missing, auth error, empty diff) so the
@@ -3510,7 +3943,9 @@ async fn pr_review_cmd(model: Option<Model>) -> i32 {
             0
         }
         None => {
-            eprintln!("Initial review failed (kit/model unavailable, or no diff against {base_ref}).");
+            eprintln!(
+                "Initial review failed (kit/model unavailable, or no diff against {base_ref})."
+            );
             1
         }
     }
@@ -3533,9 +3968,14 @@ fn fnv1a64(s: &str) -> u64 {
     h
 }
 
-fn review_ctx_paths() -> (PathBuf, PathBuf) {
+fn review_ctx_paths(inline_diffs: bool) -> (PathBuf, PathBuf) {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let key = fnv1a64(&cwd.to_string_lossy());
+    // Key by mode too: the inline and reference forms differ, so they must
+    // not share a cache entry.
+    let key = fnv1a64(&format!(
+        "{}\u{0}inline={inline_diffs}",
+        cwd.to_string_lossy()
+    ));
     let cache = PathBuf::from(format!("/tmp/dragonfly-review-ctx-{key:016x}.md"));
     let lock = PathBuf::from(format!("/tmp/dragonfly-review-ctx-{key:016x}.lock"));
     (cache, lock)
@@ -3562,15 +4002,12 @@ fn flock_exclusive(f: &std::fs::File) -> std::io::Result<()> {
 /// review-agent subagents. Includes commit list, files-changed summary,
 /// paths to per-file diff files under /tmp, and a scored
 /// `<relevant-context>` block for the changed files. Heavy: the
-/// relevant-context step shells out to `lov rag score`, which is the
+/// relevant-context step shells out to `lov eval rag score`, which is the
 /// reason for the surrounding cache + lock.
-async fn build_review_agent_context() -> String {
+async fn build_review_agent_context(inline_diffs: bool) -> String {
     let base_ref = pr_base_ref().await;
     let log_cmd = format!("git log {base_ref}..HEAD --oneline");
-    let (branch, branch_commits) = tokio::join!(
-        sh("git branch --show-current"),
-        sh(&log_cmd),
-    );
+    let (branch, branch_commits) = tokio::join!(sh("git branch --show-current"), sh(&log_cmd),);
 
     let changed_files = get_changed_files(&base_ref).await;
     let relevant: Vec<String> = filter_relevant_files(&changed_files)
@@ -3626,12 +4063,39 @@ async fn build_review_agent_context() -> String {
     out.push_str("<dragonfly-context>\n");
     out.push_str(&format!(
         "Branch: `{}`  (base: `{}`)\n",
-        if branch.is_empty() { "(detached)".to_string() } else { branch },
+        if branch.is_empty() {
+            "(detached)".to_string()
+        } else {
+            branch
+        },
         base_ref,
     ));
     out.push_str(&ctx.pr_commits);
     out.push_str(&ctx.changed_files);
-    if !diff_files_str.is_empty() {
+    if inline_diffs {
+        // Self-contained context: inline each changed file's diff as a
+        // <diff name=".."> block instead of a /tmp path reference. Every
+        // added/context line is prefixed with its new-file line number so the
+        // reviewer can cite file:line without counting from the hunk header.
+        let inlined = full_diffs_vec
+            .iter()
+            .filter(|(_, diff)| diff != "<empty>")
+            .map(|(name, diff)| {
+                format!(
+                    "<diff name=\"{name}\">\n{}\n</diff>",
+                    annotate_diff_new_line_numbers(diff)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if inlined.trim().is_empty() {
+            out.push_str("\n(no per-file diffs against base — review may be unnecessary)\n");
+        } else {
+            out.push_str("\n<diffs>\n");
+            out.push_str(&inlined);
+            out.push_str("\n</diffs>\n");
+        }
+    } else if !diff_files_str.is_empty() {
         out.push_str("\nPer-file diff files:\n");
         out.push_str(&diff_files_str);
     } else {
@@ -3658,8 +4122,8 @@ async fn build_review_agent_context() -> String {
 /// Implementation of `prompt review-agent`. Serializes parallel callers
 /// via flock on a per-cwd lockfile; returns the cached body when it's
 /// less than [REVIEW_CTX_TTL_SEC] seconds old, otherwise rebuilds.
-async fn review_agent_prompt_cmd() -> i32 {
-    let (cache_path, lock_path) = review_ctx_paths();
+async fn review_agent_prompt_cmd(inline_diffs: bool) -> i32 {
+    let (cache_path, lock_path) = review_ctx_paths(inline_diffs);
 
     // Open the lock file ahead of any work. Drop happens at end of fn,
     // which releases the flock — the cache write must finish first.
@@ -3672,7 +4136,10 @@ async fn review_agent_prompt_cmd() -> i32 {
     {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("review-agent: failed to open lock {}: {e}", lock_path.display());
+            eprintln!(
+                "review-agent: failed to open lock {}: {e}",
+                lock_path.display()
+            );
             return 1;
         }
     };
@@ -3697,9 +4164,7 @@ async fn review_agent_prompt_cmd() -> i32 {
                             return 0;
                         }
                         Err(e) => {
-                            eprintln!(
-                                "review-agent: cache file unreadable ({e}); regenerating",
-                            );
+                            eprintln!("review-agent: cache file unreadable ({e}); regenerating",);
                         }
                     }
                 }
@@ -3710,7 +4175,7 @@ async fn review_agent_prompt_cmd() -> i32 {
     // Cache miss / stale — rebuild.
     eprintln!("review-agent: building context (cache miss/stale)...");
     let start = std::time::Instant::now();
-    let body = build_review_agent_context().await;
+    let body = build_review_agent_context(inline_diffs).await;
     eprintln!(
         "review-agent: built in {:.1}s ({} bytes)",
         start.elapsed().as_secs_f64(),
@@ -3743,7 +4208,9 @@ fn pr_areas_cache_path(sha: &str) -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".cache"));
-    base.join("dragonfly").join("pr-areas").join(format!("{sha}.json"))
+    base.join("dragonfly")
+        .join("pr-areas")
+        .join(format!("{sha}.json"))
 }
 
 const PR_AREAS_INSTRUCTIONS: &str = r#"You are given the diff of a pull request. Make a list of the high-level areas that the PR covers.
@@ -3826,21 +4293,24 @@ async fn analyze_pr_areas(
     if let Some(path) = &cache_path {
         if let Ok(content) = std::fs::read_to_string(path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                println!("   PR areas: cache hit ({}).", &head_sha[..head_sha.len().min(7)]);
+                println!(
+                    "   PR areas: cache hit ({}).",
+                    &head_sha[..head_sha.len().min(7)]
+                );
                 return Some(v);
             }
         }
     }
 
-    let content = format!(
-        "{pr_commits_str}\n{changed_files_str}\n\nPer-file diffs:\n{full_diff_str}\n"
-    );
+    let content =
+        format!("{pr_commits_str}\n{changed_files_str}\n\nPer-file diffs:\n{full_diff_str}\n");
     let content_file = section("pr-areas-input", &content);
     let raw = call_kit_llm(
         "anthropic/claude-haiku-4-5",
         PR_AREAS_INSTRUCTIONS,
         &content_file.path,
-    ).await?;
+    )
+    .await?;
     let parsed = extract_json_from_end(&raw)?;
 
     if let Some(path) = &cache_path {
@@ -4009,7 +4479,10 @@ async fn build_graphite_info() -> Option<GraphiteInfo> {
     let (stack_viz, branches) = detect_graphite_stack(&trunk).await?;
     let current = sh("git branch --show-current").await.unwrap_or_default();
     let stack_ci_status = collect_stack_ci_status(&branches, &current).await;
-    Some(GraphiteInfo { stack_viz, stack_ci_status })
+    Some(GraphiteInfo {
+        stack_viz,
+        stack_ci_status,
+    })
 }
 
 /// Returns the git ref to compare HEAD against for "what's in this PR" diffs.
@@ -4034,13 +4507,23 @@ async fn pr_base_ref() -> String {
         return default;
     };
     // Sanity: parent must be an ancestor of HEAD.
-    if sh3(&format!("git merge-base --is-ancestor {parent} HEAD")).await.code != 0 {
+    if sh3(&format!("git merge-base --is-ancestor {parent} HEAD"))
+        .await
+        .code
+        != 0
+    {
         return default;
     }
     let remote = format!("origin/{parent}");
-    if sh(&format!("git rev-parse --verify {remote}")).await.is_some() {
+    if sh(&format!("git rev-parse --verify {remote}"))
+        .await
+        .is_some()
+    {
         remote
-    } else if sh(&format!("git rev-parse --verify {parent}")).await.is_some() {
+    } else if sh(&format!("git rev-parse --verify {parent}"))
+        .await
+        .is_some()
+    {
         parent.clone()
     } else {
         default
@@ -4070,8 +4553,7 @@ fn graphite_section(info: &GraphiteInfo) -> String {
 // substitute with the absolute hooks dir at runtime, so the file passed to
 // `claude --settings ...` always points at the hooks shipped alongside this
 // build of dragonfly.
-const DRAGONFLY_SETTINGS_TEMPLATE: &str =
-    include_str!("../settings/dragonfly-settings.json");
+const DRAGONFLY_SETTINGS_TEMPLATE: &str = include_str!("../settings/dragonfly-settings.json");
 const DRAGONFLY_HOOKS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/hooks");
 
 const GRAFANA_DASHBOARDS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/grafana_dashboards.md");
@@ -4095,9 +4577,18 @@ fn dragonfly_settings_expanded() -> String {
 // settings.json doesn't support an inline `agents` field — subagents have to
 // come from `.claude/agents/`, `~/.claude/agents/`, a plugin's agents dir, or
 // the `--agents` CLI flag. We use the CLI flag so a fresh checkout of any
-// repo gets the dragonfly review-agent without writing files into the user's
-// project. Agent body is bundled with the binary.
+// repo gets the dragonfly review subagents without writing files into the
+// user's project. Agent bodies are bundled with the binary.
 const REVIEW_AGENT_MD: &str = include_str!("../agents/review-agent.md");
+const COMMENT_REVIEWER_MD: &str = include_str!("../agents/comment-reviewer.md");
+// Bundled so the `@../code-comments.md` reference in agent bodies can be
+// inlined at registration time. See [expand_bundled_refs].
+const CODE_COMMENTS_MD: &str = include_str!("../code-comments.md");
+
+/// Subagent definitions registered via `claude --agents`. Each is keyed in
+/// the resulting object by its frontmatter `name`, which is the
+/// `subagent_type` the parent agent passes to the Agent tool.
+const BUNDLED_AGENTS: &[&str] = &[REVIEW_AGENT_MD, COMMENT_REVIEWER_MD];
 
 /// Minimal YAML-frontmatter splitter for agent markdown files. Only handles
 /// the subset our agent files actually use: a leading `---\n...\n---\n`
@@ -4127,13 +4618,94 @@ fn split_agent_frontmatter(text: &str) -> (HashMap<String, String>, &str) {
     (fields, body)
 }
 
-/// Builds the JSON value passed via `claude --agents '<json>'`. The
-/// outer object is keyed by agent name; each entry follows the same
-/// schema as the markdown frontmatter (description / prompt / model /
-/// color), with `prompt` carrying the markdown body. See
-/// https://code.claude.com/docs/en/sub-agents (CLI-defined subagents).
-fn build_agents_json() -> String {
-    let (meta, body) = split_agent_frontmatter(REVIEW_AGENT_MD);
+/// Expands `@<path>` references in `body`, replacing each with the content
+/// `resolve(path)` returns, inlined between `--- begin/end <path> ---` markers.
+/// A token whose `resolve` returns None is left verbatim (e.g. `@username` in
+/// prose, or a path that points at no readable file).
+///
+/// Single source of truth for @-expansion. The bundled `--agents` registration
+/// resolves against compiled-in [include_str!] content via
+/// [expand_bundled_refs]; the `expand-agent` CLI resolves against on-disk files
+/// via [expand_agent_file] for scripts/compare-comment-reviewers.sh.
+fn expand_at_refs(body: &str, resolve: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut rest = body;
+    while let Some(at) = rest.find('@') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let end = after
+            .find(|c: char| {
+                !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '~' | '/' | '-'))
+            })
+            .unwrap_or(after.len());
+        let path = &after[..end];
+        match resolve(path) {
+            Some(content) if !path.is_empty() => out.push_str(&format!(
+                "{path} (inlined below)\n\n--- begin {path} ---\n{}\n--- end {path} ---",
+                content.trim_end(),
+            )),
+            // Bare `@`, or a token that resolves to nothing: keep verbatim.
+            _ => {
+                out.push('@');
+                out.push_str(path);
+            }
+        }
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Inlines the `@`-imports in a bundled agent body against compiled-in content.
+///
+/// Claude Code resolves a relative `@`-path against the subagent's cwd (the PR
+/// repo being reviewed), not this repo's agents dir, so without this the
+/// comment-reviewer's `Read: @../code-comments.md` misses and it burns turns
+/// hunting for its guidelines. Bodies without the reference (review-agent) pass
+/// through unchanged.
+fn expand_bundled_refs(body: &str) -> String {
+    expand_at_refs(body, |path| match path {
+        "../code-comments.md" => Some(CODE_COMMENTS_MD.to_string()),
+        _ => None,
+    })
+}
+
+/// Resolves an `@`-reference path against `base`, honoring `~/` and absolute
+/// paths; relative paths join `base` (the referencing file's directory).
+fn resolve_ref_path(p: &str, base: &std::path::Path) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    if p.starts_with('/') {
+        return PathBuf::from(p);
+    }
+    base.join(p)
+}
+
+/// Reads an agent markdown file, strips its frontmatter, and inlines every
+/// `@`-import (resolved against the file's own directory). Backs the hidden
+/// `expand-agent` CLI so the comparison harness reuses [expand_at_refs] rather
+/// than reimplementing it.
+fn expand_agent_file(path: &std::path::Path) -> std::io::Result<String> {
+    let text = std::fs::read_to_string(path)?;
+    let (_, body) = split_agent_frontmatter(&text);
+    let base = path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    Ok(expand_at_refs(body, |ref_path| {
+        std::fs::read_to_string(resolve_ref_path(ref_path, &base)).ok()
+    }))
+}
+
+/// Parses one bundled agent markdown into its `(name, entry)` pair for the
+/// `--agents` object. The entry follows the same schema as the frontmatter
+/// (description / prompt / model / color), with `prompt` carrying the body
+/// (after [expand_bundled_refs] inlines any `@`-import).
+fn agent_json_entry(md: &str) -> (String, serde_json::Value) {
+    let (meta, body) = split_agent_frontmatter(md);
     let name = meta.get("name").expect("agent missing `name`").clone();
     let mut entry = serde_json::Map::new();
     entry.insert(
@@ -4144,17 +4716,30 @@ fn build_agents_json() -> String {
                 .clone(),
         ),
     );
-    entry.insert("prompt".into(), serde_json::Value::String(body.to_string()));
+    entry.insert(
+        "prompt".into(),
+        serde_json::Value::String(expand_bundled_refs(body)),
+    );
     if let Some(model) = meta.get("model") {
         entry.insert("model".into(), serde_json::Value::String(model.clone()));
     }
     if let Some(color) = meta.get("color") {
         entry.insert("color".into(), serde_json::Value::String(color.clone()));
     }
+    (name, serde_json::Value::Object(entry))
+}
+
+/// Builds the JSON value passed via `claude --agents '<json>'`. The outer
+/// object is keyed by agent name; each [BUNDLED_AGENTS] entry follows the
+/// markdown-frontmatter schema, with `prompt` carrying the body. See
+/// https://code.claude.com/docs/en/sub-agents (CLI-defined subagents).
+fn build_agents_json() -> String {
     let mut outer = serde_json::Map::new();
-    outer.insert(name, serde_json::Value::Object(entry));
-    serde_json::to_string(&serde_json::Value::Object(outer))
-        .expect("agent JSON must serialize")
+    for md in BUNDLED_AGENTS {
+        let (name, entry) = agent_json_entry(md);
+        outer.insert(name, entry);
+    }
+    serde_json::to_string(&serde_json::Value::Object(outer)).expect("agent JSON must serialize")
 }
 
 fn load_dotenv() -> Vec<(String, String)> {
@@ -4240,7 +4825,10 @@ fn build_prompt(
 ) -> String {
     let notes = if let Some(reason) = skip_ci {
         format!(" CI was skipped due to {reason} — investigate those first.")
-    } else if files.iter().any(|f| f.path.to_string_lossy().contains("failures")) {
+    } else if files
+        .iter()
+        .any(|f| f.path.to_string_lossy().contains("failures"))
+    {
         " CI stopped at first failure; other checks may still be running.".into()
     } else {
         String::new()
@@ -4276,7 +4864,9 @@ fn build_prompt(
         .replace("GRAFANA_DASHBOARDS_PATH", GRAFANA_DASHBOARDS_PATH)
         .replace("CODE_COMMENTS_PLACEHOLDER", skill::CODE_COMMENTS_GUIDE);
 
-    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z (%Z)").to_string();
+    let now = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S %:z (%Z)")
+        .to_string();
     let review_only_prefix = review_only_note.unwrap_or("");
 
     format!(
@@ -4303,7 +4893,11 @@ fn build_prompt(
 }
 
 fn filter_relevant_files(paths: &[String]) -> Vec<&str> {
-    paths.iter().filter(|p| !p.ends_with("_gen.go") && !p.ends_with("_pb.ts")).map(|s| s.as_str()).collect()
+    paths
+        .iter()
+        .filter(|p| !p.ends_with("_gen.go") && !p.ends_with("_pb.ts"))
+        .map(|s| s.as_str())
+        .collect()
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -4318,7 +4912,11 @@ async fn run_areas_only() {
     let branch_commits = sh(&format!("git log {base_ref}..HEAD --oneline")).await;
     let ctx = collect_context_strings(&branch_commits, &base_ref).await;
 
-    let full_diff_str = full_diff.iter().map(|(name, diff)| format!("<diff name=\"{name}\">\n{diff}\n</diff>")).collect::<Vec<_>>().join("\n");
+    let full_diff_str = full_diff
+        .iter()
+        .map(|(name, diff)| format!("<diff name=\"{name}\">\n{diff}\n</diff>"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     println!("Analyzing PR areas...");
     let pr_areas = analyze_pr_areas(&full_diff_str, &ctx.changed_files, &ctx.pr_commits).await;
@@ -4329,17 +4927,36 @@ async fn run_areas_only() {
     println!("\nCompleted in {:.1}s", start.elapsed().as_secs_f64());
 }
 
+/// Prepended to the agent prompt in --non-interactive mode. Overrides the
+/// skill's ask-the-user choreography; phase numbers refer to skill.rs.
+const NON_INTERACTIVE_NOTE: &str = "\
+# ⚠️ NON-INTERACTIVE MODE\n\n\
+No user is watching this session. Never ask the user anything or wait for approval — every \
+instruction below that says to ask, offer, or wait for the user is overridden by these rules:\n\
+- Ambiguous push state (Phase 1): stop and report instead of asking. Never force-push unless the listed conditions are unambiguously met.\n\
+- CI failures (Phase 4): fix failures caused by this PR. Leave unrelated/pre-existing failures alone and note them in the final summary.\n\
+- Review findings (Phases 5/6): fix only findings you are highly confident are real and in scope. Post the remaining uncertain findings as ONE top-level PR comment via `dragonfly pr comment --body -` (markdown on stdin), grouped in red/orange/green sections — do not wait for the user to pick.\n\
+- After fixing, commit and push immediately; re-run the review-agent at most once.\n\
+- PR description (Phase 7): write or update it as instructed, without asking.\n\
+- Phase 9 (ready for review): SKIP ENTIRELY. Never run `gh pr ready` and never add reviewers — the PR must remain a draft for manual review.\n\
+- No AI-attribution footers: no `Co-Authored-By: Claude...` in commit messages, no \"Generated with Claude Code\" in PR bodies or comments.\n\
+- Finish with the Phase 8 summary as your final message.\n";
+
 struct ClaudeInvocation {
     prompt: String,
     settings: String,
     /// JSON value passed to `claude --agents`. Contains the bundled
-    /// review-agent definition so the parent agent can spawn it in
+    /// review subagent definitions so the parent agent can spawn them in
     /// Phase 6 without the user having to install anything.
     agents: String,
     path: String,
 }
 
-async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
+async fn build_claude_invocation(
+    force: bool,
+    non_interactive: bool,
+    title_flag: Option<String>,
+) -> ClaudeInvocation {
     // Resolve PR ownership before push() so the rebase prompt inside
     // maybe_rebase_on_main can be suppressed when the PR belongs to
     // someone else (review-only mode).
@@ -4348,9 +4965,7 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
     let early_pr_info = lookup_existing_pr(bg_pr).await;
     let viewer_login = sh_wait(bg_me).await.unwrap_or_default();
     let review_only = early_pr_info.as_ref().is_some_and(|p| {
-        !p.author_login.is_empty()
-            && !viewer_login.is_empty()
-            && p.author_login != viewer_login
+        !p.author_login.is_empty() && !viewer_login.is_empty() && p.author_login != viewer_login
     });
     if review_only {
         let pr = early_pr_info.as_ref().unwrap();
@@ -4360,7 +4975,7 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
         );
     }
 
-    let (push_result, merge_probe) = push(force, review_only).await;
+    let (push_result, merge_probe) = push(force, review_only, non_interactive).await;
     if push_result.code != 0 {
         println!("⚠️  Push had issues: {}", push_result.stderr);
     }
@@ -4374,12 +4989,11 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
     let branch_commits = sh(&format!("git log {base_ref}..HEAD --oneline")).await;
 
     // Score relevant CLAUDE.md/AGENTS.md chunks for the PR diff in
-    // parallel — `lov rag score` is the slowest leg (~10 s), worth
+    // parallel — `lov eval rag score` is the slowest leg (~10 s), worth
     // overlapping with CI watch + area analysis.
     let base_ref_for_rag = base_ref.clone();
-    let relevant_context_handle = tokio::spawn(async move {
-        build_relevant_context(&base_ref_for_rag).await
-    });
+    let relevant_context_handle =
+        tokio::spawn(async move { build_relevant_context(&base_ref_for_rag).await });
 
     // Run area analysis in parallel with PR/CI checks. The PR-areas LLM
     // call needs the inline diff content (kit has no tool-use, so we
@@ -4424,7 +5038,11 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
         // Prompt for the title first so the user isn't blocked by the
         // subagent. `prompt_pr_title` masks SIGCHLD on the prompt thread so
         // a background child exiting won't interrupt dialoguer's read(2).
-        let title = prompt_pr_title(&branch_commits);
+        let title = if non_interactive {
+            non_interactive_pr_title(title_flag.as_deref(), &branch_commits)
+        } else {
+            prompt_pr_title(&branch_commits)
+        };
         // Drain the subagent and graphite handles after the prompt; the
         // results are needed by the rest of build_claude_invocation either
         // way, and waiting now keeps the later `pre_*` paths tidy.
@@ -4436,7 +5054,12 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
         }
         match title {
             Some(t) => create_pr_with_title(&t).await,
-            None => PrInfo { number: None, url: None, is_draft: false, author_login: String::new() },
+            None => PrInfo {
+                number: None,
+                url: None,
+                is_draft: false,
+                author_login: String::new(),
+            },
         }
     };
 
@@ -4478,7 +5101,8 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
     // initial review can race it. If the review reports a HIGH severity
     // issue while CI is still in flight, we abort the local watch (remote
     // CI keeps running) so the agent goes straight to the blocker.
-    let ci_handle: Option<tokio::task::JoinHandle<CiResult>> = match (&pr_info.number, &pr_info.url) {
+    let ci_handle: Option<tokio::task::JoinHandle<CiResult>> = match (&pr_info.number, &pr_info.url)
+    {
         (Some(pr_num), Some(pr_url)) => {
             let pr_num = pr_num.clone();
             let pr_url = pr_url.clone();
@@ -4486,7 +5110,8 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
             let base_ref_clone = base_ref.clone();
             let has_conflicts = merge.has_conflicts;
             Some(tokio::spawn(async move {
-                collect_reviews_and_ci(&pr_num, &pr_url, &branch, has_conflicts, &base_ref_clone).await
+                collect_reviews_and_ci(&pr_num, &pr_url, &branch, has_conflicts, &base_ref_clone)
+                    .await
             }))
         }
         _ => None,
@@ -4640,11 +5265,19 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
         &relevant_context_str,
         review_only_note.as_deref(),
     );
+    let prompt = if non_interactive {
+        format!("{NON_INTERACTIVE_NOTE}\n{prompt}")
+    } else {
+        prompt
+    };
 
     // Put our own binary on PATH so the agent can call dragonfly subcommands
     let path = {
         let current = std::env::var("PATH").unwrap_or_default();
-        match std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+        match std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
             Some(dir) => format!("{}:{current}", dir.display()),
             None => current,
         }
@@ -4652,7 +5285,12 @@ async fn build_claude_invocation(force: bool) -> ClaudeInvocation {
 
     let settings = dragonfly_settings_expanded();
     let agents = build_agents_json();
-    ClaudeInvocation { prompt, settings, agents, path }
+    ClaudeInvocation {
+        prompt,
+        settings,
+        agents,
+        path,
+    }
 }
 
 #[tokio::main]
@@ -4666,7 +5304,9 @@ async fn main() {
 
     if let Some(command) = cli.command {
         match command {
-            CliCommand::Pr { command: PrCommand::Thread { command } } => match command {
+            CliCommand::Pr {
+                command: PrCommand::Thread { command },
+            } => match command {
                 ThreadCommand::Comment { thread_id, body } => {
                     pr_thread_comment(&thread_id, &body).await;
                 }
@@ -4674,23 +5314,38 @@ async fn main() {
                     pr_thread_resolve(&thread_id).await;
                 }
             },
-            CliCommand::Pr { command: PrCommand::Description { body } } => {
+            CliCommand::Pr {
+                command: PrCommand::Description { body },
+            } => {
                 pr_set_description(&body).await;
             }
-            CliCommand::Pr { command: PrCommand::Comment { pr, body } } => {
+            CliCommand::Pr {
+                command: PrCommand::Comment { pr, body },
+            } => {
                 pr_comment(pr, &body).await;
             }
-            CliCommand::Pr { command: PrCommand::Comments { pr } } => {
+            CliCommand::Pr {
+                command: PrCommand::Comments { pr },
+            } => {
                 pr_comments(pr).await;
             }
-            CliCommand::Pr { command: PrCommand::Review { model } } => {
+            CliCommand::Pr {
+                command: PrCommand::Review { model },
+            } => {
                 let code = pr_review_cmd(model).await;
                 std::process::exit(code);
             }
             CliCommand::Ci { command } => {
                 let code = match command {
-                    CiCommand::Status { all, pr } => ci_status_cmd(pr, all, &[]).await,
-                    CiCommand::Failures { pr, max_bytes, raw, model } => ci_failures_cmd(pr, max_bytes, raw, model).await,
+                    CiCommand::Status { all, pr } => {
+                        ci_status_cmd(pr, all, &[QA_TECH_REVIEW]).await
+                    }
+                    CiCommand::Failures {
+                        pr,
+                        max_bytes,
+                        raw,
+                        model,
+                    } => ci_failures_cmd(pr, max_bytes, raw, model).await,
                     CiCommand::Watch { pr } => ci_watch_cmd(pr).await,
                     CiCommand::Flaky { name, limit } => ci_flaky_cmd(name, limit).await,
                     CiCommand::Retries { pr } => ci_retries_cmd(pr).await,
@@ -4700,14 +5355,19 @@ async fn main() {
                 std::process::exit(code);
             }
             CliCommand::Prompt { target: None } => {
-                let invocation = build_claude_invocation(cli.force).await;
+                let invocation =
+                    build_claude_invocation(cli.force, cli.non_interactive, cli.title).await;
                 println!("{}", invocation.prompt);
             }
-            CliCommand::Prompt { target: Some(PromptTarget::InitialReview) } => {
+            CliCommand::Prompt {
+                target: Some(PromptTarget::InitialReview),
+            } => {
                 print_initial_review_prompt().await;
             }
-            CliCommand::Prompt { target: Some(PromptTarget::ReviewAgent) } => {
-                let code = review_agent_prompt_cmd().await;
+            CliCommand::Prompt {
+                target: Some(PromptTarget::ReviewAgent { inline_diffs }),
+            } => {
+                let code = review_agent_prompt_cmd(inline_diffs).await;
                 std::process::exit(code);
             }
             CliCommand::Guides { paths } => {
@@ -4727,9 +5387,20 @@ async fn main() {
                     println!("{}", g.display());
                 }
             }
-            CliCommand::ScoreGuides { output, base, threshold } => {
+            CliCommand::ScoreGuides {
+                output,
+                base,
+                threshold,
+            } => {
                 score_guides_cmd(output, base, threshold).await;
             }
+            CliCommand::ExpandAgent { file } => match expand_agent_file(&file) {
+                Ok(s) => print!("{s}"),
+                Err(e) => {
+                    eprintln!("expand-agent: {}: {e}", file.display());
+                    std::process::exit(1);
+                }
+            },
         }
         return;
     }
@@ -4739,7 +5410,37 @@ async fn main() {
         return;
     }
 
-    let invocation = build_claude_invocation(cli.force).await;
+    let non_interactive = cli.non_interactive;
+    let invocation = build_claude_invocation(cli.force, non_interactive, cli.title).await;
+
+    if non_interactive {
+        println!("   Running Claude Code (print mode, non-interactive)...\n");
+        let mut cmd = std::process::Command::new("claude");
+        cmd.args([
+            "-p",
+            "--dangerously-skip-permissions",
+            "--settings",
+            &invocation.settings,
+            "--agents",
+            &invocation.agents,
+        ])
+        .arg(&invocation.prompt)
+        .env("PATH", &invocation.path);
+        for (k, v) in load_dotenv() {
+            cmd.env(k, v);
+        }
+        // Exit code is the contract with orchestrators driving this mode:
+        // claude's own failure (or a missing binary) must not read as success.
+        let code = match cmd.status() {
+            Ok(s) => s.code().unwrap_or(1),
+            Err(e) => {
+                eprintln!("Failed to run claude: {e}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
+
     println!("   Launching Claude Code...\n");
     let mut cmd = std::process::Command::new("claude");
     cmd.args([
@@ -4749,8 +5450,8 @@ async fn main() {
         "--agents",
         &invocation.agents,
     ])
-        .arg(&invocation.prompt)
-        .env("PATH", &invocation.path);
+    .arg(&invocation.prompt)
+    .env("PATH", &invocation.path);
     for (k, v) in load_dotenv() {
         cmd.env(k, v);
     }
@@ -4780,7 +5481,11 @@ mod tests {
         ]}"#;
         let checks = parse_sha_checks(runs, statuses);
         let bucket = |name: &str| {
-            checks.iter().find(|c| c.name == name).map(|c| c.bucket.as_str()).unwrap_or("missing")
+            checks
+                .iter()
+                .find(|c| c.name == name)
+                .map(|c| c.bucket.as_str())
+                .unwrap_or("missing")
         };
         // Newest run (id 2, in_progress) wins over the older failed attempt.
         assert_eq!(bucket("test-go"), "pending");
@@ -4792,6 +5497,69 @@ mod tests {
         assert_eq!(bucket("wiz"), "pass");
         assert_eq!(bucket("spacelift/stack"), "fail");
         assert_eq!(checks.len(), 8);
+    }
+
+    #[test]
+    fn annotate_diff_numbers_new_lines_only() {
+        // Two hunks; deleted lines unnumbered, added/context lines carry their
+        // new-file number, and the counter reseeds from the second @@ header.
+        let diff = "\
+diff --git a/f.rs b/f.rs
+index 111..222 100644
+--- a/f.rs
++++ b/f.rs
+@@ -10,3 +10,3 @@ fn f() {
+ ctx a
+-old line
++new line
+@@ -40,2 +50,3 @@ fn g() {
+ ctx b
++added tail";
+        let got = annotate_diff_new_line_numbers(diff);
+        let expected = "\
+diff --git a/f.rs b/f.rs
+index 111..222 100644
+--- a/f.rs
++++ b/f.rs
+@@ -10,3 +10,3 @@ fn f() {
+10:  ctx a
+-old line
+11: +new line
+@@ -40,2 +50,3 @@ fn g() {
+50:  ctx b
+51: +added tail
+";
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn bundled_comment_reviewer_inlines_code_comments() {
+        let v: serde_json::Value = serde_json::from_str(&build_agents_json()).unwrap();
+        let prompt = v["comment-reviewer"]["prompt"].as_str().unwrap();
+        // Regression: the relative @-import must be inlined, not left dangling
+        // (Claude Code would resolve it against the PR repo's cwd and miss).
+        assert!(
+            !prompt.contains("@../code-comments.md"),
+            "dangling @-ref left in comment-reviewer prompt"
+        );
+        assert!(
+            prompt.contains("Explain why, never what"),
+            "code-comments.md not inlined into comment-reviewer prompt"
+        );
+        // review-agent carries no such ref and is registered unchanged.
+        assert!(
+            v["review-agent"]["prompt"]
+                .as_str()
+                .unwrap()
+                .contains("review")
+        );
+    }
+
+    #[test]
+    fn parse_hunk_new_start_reads_plus_side() {
+        assert_eq!(parse_hunk_new_start(" -10,3 +50,3 @@ fn g() {"), Some(50));
+        assert_eq!(parse_hunk_new_start(" -1 +1 @@"), Some(1));
+        assert_eq!(parse_hunk_new_start(" garbage"), None);
     }
 
     #[test]

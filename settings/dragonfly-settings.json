@@ -61,6 +61,15 @@
             "command": "__DRAGONFLY_HOOKS__/review-context.py"
           }
         ]
+      },
+      {
+        "matcher": "comment-reviewer",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "__DRAGONFLY_HOOKS__/review-context.py"
+          }
+        ]
       }
     ]
   }

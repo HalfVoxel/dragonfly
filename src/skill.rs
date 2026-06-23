@@ -64,8 +64,7 @@ dragonfly ci watch
 ```
 
 The watch fail-fasts on the first failure and prints a final summary when CI
-settles. It times out after 4m30s with a progress summary and exit code 3 —
-just run `dragonfly ci watch` again to keep watching.
+settles.
 
 For a one-shot poll instead of watching:
 
@@ -187,6 +186,10 @@ and any scored `<relevant-context>` chunks. **You do NOT need to inline
 the diff or repeat the file index in the subagent prompt.** Pass only
 the per-concern scope: which area to focus on, what kind of bug to
 hunt for, and any context the hook can't provide.
+
+Also spawn a single `comment-reviewer` subagent for comment and
+documentation quality. Like the review-agent, its context arrives via the
+hook; it typically needs no additional instructions.
 
 If you think there's some risk of deployment edge cases, start a `review-agent` to evaluate this.
 The system is deployed gradually, with new backends spinning up over a period of ~10 minutes,

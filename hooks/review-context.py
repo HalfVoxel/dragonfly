@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """SubagentStart hook for Claude Code.
 
-When a `review-agent` subagent (see agents/review-agent.md) is spawned by
-the parent dragonfly flow, this hook shells out to
-    dragonfly prompt review-agent
+When a `review-agent` or `comment-reviewer` subagent (see agents/) is
+spawned by the parent dragonfly flow, this hook shells out to
+    dragonfly prompt review-agent [--inline-diffs]
 and pipes stdout through to the subagent. Claude Code delivers a
 SubagentStart hook's stdout to the subagent as a system reminder before
 its first turn (documented for SessionStart / Setup / SubagentStart in
 [hooks docs](https://code.claude.com/docs/en/hooks)).
+
+`comment-reviewer` gets `--inline-diffs` (full diffs inlined in the
+context); `review-agent` gets the default /tmp diff-file references.
 
 The orchestration heavy-lifting — assembling commit list, changed files,
 per-file diff files, and the scored <relevant-context> block — lives in
@@ -21,9 +24,9 @@ that context (manual `claude` invocation against this settings file)
 the subprocess will simply fail and we exit 0 — failing open is
 preferable to breaking the parent's review flow.
 
-The matcher in settings/dragonfly-settings.json gates this hook on
-agent_type == "review-agent", but we double-check here so an accidental
-wildcard matcher doesn't shell out for every subagent.
+Two matchers in settings/dragonfly-settings.json gate this hook on
+agent_type "review-agent" and "comment-reviewer"; the hook keys the
+--inline-diffs flag off that same agent_type.
 """
 
 import json
@@ -31,7 +34,6 @@ import shutil
 import subprocess
 import sys
 
-EXPECTED_AGENT = "review-agent"
 BIN_NAME = "dragonfly"
 
 
@@ -39,6 +41,7 @@ def _debug(msg: str) -> None:
     # Debug trace for development; harmless in prod. Set
     # DRAGONFLY_HOOK_DEBUG=1 in the environment to enable.
     import os
+
     if os.environ.get("DRAGONFLY_HOOK_DEBUG"):
         with open("/tmp/dragonfly-hook.log", "a") as fh:
             fh.write(msg + "\n")
@@ -61,8 +64,6 @@ def main() -> int:
 
     if payload.get("hook_event_name") != "SubagentStart":
         return 0
-    if payload.get("agent_type") != EXPECTED_AGENT:
-        return 0
 
     bin_path = shutil.which(BIN_NAME)
     if bin_path is None:
@@ -72,12 +73,19 @@ def main() -> int:
         )
         return 0
 
+    # comment-reviewer is tuned to read full diffs inlined in its prompt;
+    # review-agent reads the /tmp diff-file references. Pick the mode by
+    # agent_type so only the comment reviewer pays the larger inlined context.
+    cmd = [bin_path, "prompt", "review-agent"]
+    if payload.get("agent_type") == "comment-reviewer":
+        cmd.append("--inline-diffs")
+
     try:
         # cwd defaults to the subagent's cwd (same as parent's main cwd),
         # which is what `dragonfly prompt review-agent` keys its
         # cache by. Don't override it.
         result = subprocess.run(
-            [bin_path, "prompt", "review-agent"],
+            cmd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
