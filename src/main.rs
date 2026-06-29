@@ -143,6 +143,9 @@ enum PrCommand {
     Description {
         /// PR description body (markdown). Pass `-` to read from stdin.
         body: String,
+        /// Explicit PR number. Defaults to the current branch's PR.
+        #[arg(long)]
+        pr: Option<String>,
     },
     /// Post a top-level PR conversation comment on the current branch's PR.
     /// This is the issue-comment thread (the main PR conversation), not a
@@ -231,10 +234,11 @@ enum CiCommand {
         pr: Option<String>,
     },
     /// For each failed check (GitHub Actions, Buildkite, Spacelift, Wiz, …), print
-    /// a per-check section with extracted error lines, then the link. Output is
-    /// piped through an LLM (claude --model haiku) to distill into a terse summary
-    /// when the raw dump is non-trivial (>=1000 bytes); the full untruncated log is
-    /// saved to /tmp/psc-ci-failures-full-*.md and referenced in the footer.
+    /// a per-check section with per-step conclusions and extracted error lines,
+    /// then the link. Output is piped through an LLM (claude --model haiku) to
+    /// distill into a terse summary when the dump is non-trivial (>=1000 bytes);
+    /// the per-check raw logs (truncated at 16k each) are saved to
+    /// /tmp/psc-ci-failures-full-*.md and referenced in the footer.
     Failures {
         /// Explicit PR number. Defaults to the current branch's PR.
         #[arg(long)]
@@ -326,6 +330,14 @@ struct CheckCounts {
     pending: usize,
     skipping: usize,
     pending_names: Vec<String>,
+    /// Conclusion=`cancelled` runs. Held apart from `failed` because a
+    /// cancellation usually means the run was superseded (cancel-superseded
+    /// after a re-trigger); `ci watch` debounces these for a poll rather than
+    /// fail-fasting on a phantom. Sorted, for cross-poll settle comparison.
+    cancelled_names: Vec<String>,
+    /// Conclusion=`stale` runs — a queued check the GHA scheduler abandoned
+    /// when a newer run for the same head superseded it. Never a code failure.
+    stale: usize,
 }
 
 struct PrInfo {
@@ -676,9 +688,27 @@ async fn push(force: bool, review_only: bool, non_interactive: bool) -> (PushRes
         merge_probe
     };
 
-    if upstream.is_none() {
-        println!("   No upstream — pushing with -u...");
-        let r = sh3("git push -u origin HEAD").await;
+    // A bare `git push` only does the right thing when @{upstream} is
+    // origin/<branch>. With no upstream, or an upstream pointing elsewhere
+    // (a branch cut from main keeps @{upstream} = origin/main), bare push
+    // targets the wrong ref and 128s against protected main. Both cases push
+    // -u to the same-name branch instead. --force-with-lease when a rebase
+    // moved HEAD so an existing same-name branch fast-forwards safely.
+    let proper_upstream = upstream
+        .as_deref()
+        .is_some_and(|u| u == format!("origin/{branch}"));
+    if !proper_upstream {
+        let why = match upstream.as_deref() {
+            Some(u) => format!("upstream is {u}, not origin/{branch}"),
+            None => "no upstream".to_string(),
+        };
+        let cmd = if force {
+            format!("git push -u --force-with-lease origin HEAD:{branch}")
+        } else {
+            format!("git push -u origin HEAD:{branch}")
+        };
+        println!("   {why} — pushing -u to origin/{branch}...");
+        let r = sh3(&cmd).await;
         return (
             PushResult {
                 branch,
@@ -1011,8 +1041,108 @@ struct PrCommentsBundle {
     /// Raw JSON from `gh api graphql`, kept only when XML parsing failed.
     threads_raw_json: Option<String>,
     reviews_xml: Option<String>,
+    /// Top-level PR conversation (issue) comments — human-written and bot
+    /// status alike. Review threads + reviews miss these entirely, so a
+    /// failing Lovmesh Plan Preview (a CI-equivalent ❌) was invisible.
+    issue_comments_xml: Option<String>,
     meta: Option<String>,
     has_unresolved: bool,
+}
+
+#[derive(Deserialize)]
+struct RestIssueComment {
+    #[serde(default)]
+    user: Option<RestUser>,
+    #[serde(default)]
+    body: String,
+    #[serde(rename = "created_at", default)]
+    created_at: String,
+    #[serde(rename = "html_url", default)]
+    html_url: String,
+}
+#[derive(Deserialize)]
+struct RestUser {
+    #[serde(default)]
+    login: String,
+}
+
+/// Classify a PR conversation (issue) comment so output can collapse bot
+/// boilerplate while keeping substantive comments. Returns (kind, collapse):
+/// `collapse` true ⇒ render a one-line stub instead of the full body.
+///
+/// Actionable bot status (Lovmesh Plan Preview — a CI-equivalent warehouse
+/// apply signal) is kept in full; codecov tables, catalog-freshness, the
+/// claude review-trigger prompt, and pr-classification are collapsed. Anything
+/// unrecognised (human comments) is kept in full.
+fn classify_issue_comment(author: &str, body: &str) -> (&'static str, bool) {
+    let b = body.to_ascii_lowercase();
+    const IMPORTANT: &[&str] = &["lovmesh", "plan preview", "plan apply", "warehouse model"];
+    if IMPORTANT.iter().any(|m| b.contains(m)) {
+        return ("bot-status", false);
+    }
+    const BOILERPLATE: &[&str] = &[
+        "codecov",
+        "catalog-freshness",
+        "catalog freshness",
+        "pr classification",
+        "pr-classification",
+        "classified this pr",
+        "review-trigger",
+        "/claude review",
+        "@claude review",
+    ];
+    let noisy_bot = matches!(author, "codecov[bot]" | "codecov-commenter" | "lovable-ci-bot");
+    if noisy_bot || BOILERPLATE.iter().any(|m| b.contains(m)) {
+        return ("boilerplate", true);
+    }
+    ("comment", false)
+}
+
+/// Fetch the PR's top-level conversation comments and render them as an
+/// `<issue-comments>` block, collapsing known bot boilerplate to a stub.
+/// `gh api --paginate` merges the array pages, so it parses as one array.
+async fn fetch_issue_comments(owner: &str, repo: &str, pr_number: &str) -> Option<String> {
+    let r = sh3(&format!(
+        "gh api 'repos/{owner}/{repo}/issues/{pr_number}/comments?per_page=100' --paginate"
+    ))
+    .await;
+    if r.stdout.trim().is_empty() {
+        return None;
+    }
+    let comments: Vec<RestIssueComment> = parse_json(&r.stdout)?;
+    if comments.is_empty() {
+        return None;
+    }
+    let mut out = String::from("<issue-comments>\n");
+    for c in &comments {
+        let author = c.user.as_ref().map(|u| u.login.as_str()).unwrap_or("unknown");
+        let (kind, collapse) = classify_issue_comment(author, &c.body);
+        if collapse {
+            let first = c
+                .body
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim();
+            out.push_str(&format!(
+                "  <comment author=\"{}\" kind=\"{kind}\" created=\"{}\" collapsed=\"true\">{}</comment>\n",
+                xml_escape(author),
+                c.created_at,
+                xml_escape(truncate(first, 100)),
+            ));
+        } else {
+            let body = clean_bot_body(&c.body);
+            out.push_str(&format!(
+                "  <comment author=\"{}\" kind=\"{kind}\" created=\"{}\" url=\"{}\">\n{}\n  </comment>\n",
+                xml_escape(author),
+                c.created_at,
+                xml_escape(&c.html_url),
+                cdata(&body),
+            ));
+        }
+    }
+    out.push_str("</issue-comments>");
+    Some(out)
 }
 
 async fn fetch_pr_comments(owner: &str, repo: &str, pr_number: &str) -> PrCommentsBundle {
@@ -1023,11 +1153,13 @@ async fn fetch_pr_comments(owner: &str, repo: &str, pr_number: &str) -> PrCommen
     let bg_pr_view = sh_bg(&format!(
         "gh pr view {pr_number} --json title,body,reviewDecision,reviews,reviewRequests"
     ));
+    let issue_comments_fut = fetch_issue_comments(owner, repo, pr_number);
 
     let mut bundle = PrCommentsBundle {
         threads_xml: None,
         threads_raw_json: None,
         reviews_xml: None,
+        issue_comments_xml: None,
         meta: None,
         has_unresolved: false,
     };
@@ -1057,6 +1189,8 @@ async fn fetch_pr_comments(owner: &str, repo: &str, pr_number: &str) -> PrCommen
         bundle.meta = format_pr_meta(&pr_view.stdout);
     }
 
+    bundle.issue_comments_xml = issue_comments_fut.await;
+
     bundle
 }
 
@@ -1073,6 +1207,9 @@ async fn collect_reviews(owner: &str, repo: &str, pr_number: &str) -> (Vec<TempF
     }
     if let Some(meta) = &bundle.meta {
         files.push(section("pr-meta", meta));
+    }
+    if let Some(xml) = &bundle.issue_comments_xml {
+        files.push(section("issue-comments", xml));
     }
     (files, bundle.has_unresolved)
 }
@@ -1121,9 +1258,12 @@ async fn pr_comments(pr_arg: Option<String>) {
     } else if let Some(raw) = bundle.threads_raw_json {
         sections.push(("review-threads (raw JSON — XML parse failed)", raw));
     }
+    if let Some(xml) = bundle.issue_comments_xml {
+        sections.push(("issue-comments", xml));
+    }
 
     if sections.is_empty() {
-        eprintln!("No review threads, reviews, or metadata found for PR #{pr_number}.");
+        eprintln!("No review threads, reviews, comments, or metadata found for PR #{pr_number}.");
         return;
     }
 
@@ -1212,7 +1352,7 @@ async fn pr_thread_comment(thread_id: &str, body: &str) {
     }
 }
 
-async fn pr_set_description(body_arg: &str) {
+async fn pr_set_description(pr_arg: Option<String>, body_arg: &str) {
     let body = if body_arg == "-" {
         let mut s = String::new();
         if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut s) {
@@ -1224,12 +1364,9 @@ async fn pr_set_description(body_arg: &str) {
         body_arg.to_string()
     };
 
-    let pr_number = match sh("gh pr view --json number --jq '.number'").await {
-        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
-        _ => {
-            eprintln!("Failed to find a PR for the current branch.");
-            std::process::exit(1);
-        }
+    let Some(pr_number) = resolve_pr_number(pr_arg).await else {
+        eprintln!("No PR for current branch and --pr not supplied.");
+        std::process::exit(2);
     };
 
     // Use --body-file - so we don't have to escape arbitrary markdown for argv.
@@ -1399,6 +1536,19 @@ const WATCH_IGNORED_CHECKS: &[&str] = &[
     QA_TECH_REVIEW,
 ];
 
+// Gate-style checks: they report `fail` until a human/team action (not a CI
+// fix) flips them — currently the core-prompt review gate. No code change
+// turns these green. `ci status` tags them `🔒 needs-approval` and excludes
+// them from the failure tally (so a clean PR doesn't read as failing on a
+// gate alone); `ci failures` reports them separately instead of trying to
+// fetch fixable logs that don't exist. Without this, `ci status` (which shows
+// the gate) and `ci failures` (which drops it via [IGNORED_CHECKS]) contradict.
+const GATE_CHECKS: &[&str] = &[CORE_PROMPT_REVIEW];
+
+fn is_gate_check(name: &str) -> bool {
+    GATE_CHECKS.contains(&name)
+}
+
 /// Drop "skipping" rows from `gh pr checks` output. The agent doesn't need
 /// them in its CI temp file — they're already counted separately.
 fn strip_skipping(out: &str) -> String {
@@ -1438,6 +1588,8 @@ fn parse_checks(out: &str, ignored: &[&str]) -> CheckCounts {
         pending: 0,
         skipping: 0,
         pending_names: Vec::new(),
+        cancelled_names: Vec::new(),
+        stale: 0,
     };
     for (name, &(_, status)) in &checks {
         match status {
@@ -1540,6 +1692,12 @@ fn format_ci_status(counts: &CheckCounts, ci_start: f64, local_running: usize) -
         if !counts.pending_names.is_empty() && counts.pending_names.len() <= 2 {
             status += &format!(" ({})", counts.pending_names.join(", "));
         }
+    }
+    if !counts.cancelled_names.is_empty() {
+        status += &format!("  🔁 {} cancelled", counts.cancelled_names.len());
+    }
+    if counts.stale > 0 {
+        status += &format!("  🔁 {} stale", counts.stale);
     }
     if counts.skipping > 0 {
         status += &format!("  ⏭️ {} skipped", counts.skipping);
@@ -1887,16 +2045,6 @@ async fn distill_failure_logs(
     Some(output)
 }
 
-#[derive(Deserialize)]
-struct RunInfo {
-    #[serde(rename = "databaseId")]
-    database_id: u64,
-    name: Option<String>,
-    #[allow(dead_code)]
-    #[serde(rename = "headSha")]
-    head_sha: Option<String>,
-}
-
 /// One failing check, sourced from `gh pr checks --json`. Covers every provider
 /// surfaced as a commit status / check-run — GitHub Actions, Buildkite, Wiz,
 /// Spacelift, custom statuses — not just GHA workflow runs.
@@ -1986,6 +2134,59 @@ async fn fetch_gha_log(check: &PrCheck) -> String {
     } else {
         log.stderr
     }
+}
+
+#[derive(Deserialize)]
+struct GhJob {
+    steps: Option<Vec<GhJobStep>>,
+}
+#[derive(Deserialize)]
+struct GhJobStep {
+    name: String,
+    #[serde(default)]
+    status: String,
+    conclusion: Option<String>,
+}
+
+/// Compact per-step conclusions for a GHA job, e.g.
+/// `Step conclusions: "Run ./test"=success, "Test Report"=failure`.
+///
+/// This is the signal that distinguishes "the test reran and passed; only the
+/// junit report-publish step is red" (flaky, dorny/test-reporter with
+/// fail-on-error) from a real test failure — a distinction invisible in the
+/// flat log text the distiller otherwise sees. Cheap (a few lines) so it's
+/// safe to prepend to the distiller input alongside the regex-trimmed log.
+/// Empty when the check has no per-job link or the API returns no steps.
+async fn fetch_gha_step_conclusions(check: &PrCheck) -> String {
+    let (_run, job_id) = parse_gha_link(&check.link);
+    let Some(job_id) = job_id else {
+        return String::new();
+    };
+    let r = sh3(&format!(
+        "gh api 'repos/{{owner}}/{{repo}}/actions/jobs/{job_id}'"
+    ))
+    .await;
+    let Some(job) = parse_json::<GhJob>(&r.stdout) else {
+        return String::new();
+    };
+    let steps = job.steps.unwrap_or_default();
+    if steps.is_empty() {
+        return String::new();
+    }
+    let parts: Vec<String> = steps
+        .iter()
+        .map(|s| {
+            let c = s.conclusion.as_deref().filter(|c| !c.is_empty()).unwrap_or(
+                if s.status.is_empty() {
+                    "?"
+                } else {
+                    &s.status
+                },
+            );
+            format!("\"{}\"={}", s.name, c)
+        })
+        .collect();
+    format!("Step conclusions: {}", parts.join(", "))
 }
 
 /// Buildkite logs require `BUILDKITE_API_TOKEN`. Without one, surface the URL +
@@ -2204,10 +2405,14 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
             "      Fetching log for {} ({})...",
             check.name, provider_label
         );
-        let raw = match provider {
-            CheckProvider::GitHubActions => fetch_gha_log(check).await,
-            CheckProvider::Buildkite => fetch_buildkite_log(check, head_sha).await,
-            CheckProvider::External => fetch_external_log(check, head_sha).await,
+        let (raw, steps) = if matches!(provider, CheckProvider::GitHubActions) {
+            tokio::join!(fetch_gha_log(check), fetch_gha_step_conclusions(check))
+        } else {
+            let raw = match provider {
+                CheckProvider::Buildkite => fetch_buildkite_log(check, head_sha).await,
+                _ => fetch_external_log(check, head_sha).await,
+            };
+            (raw, String::new())
         };
         let raw = strip_ansi(&raw);
         names.push(check.name.clone());
@@ -2223,8 +2428,15 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
         } else {
             format!("\nLink: {}", check.link)
         };
+        // Prepend per-step conclusions so flaky-reran-and-passed is
+        // distinguishable from a real failure; see [fetch_gha_step_conclusions].
+        let step_line = if steps.is_empty() {
+            String::new()
+        } else {
+            format!("\n{steps}")
+        };
         summaries.push(format!(
-            "{header}{link_line}\n```\n{}\n```",
+            "{header}{link_line}{step_line}\n```\n{}\n```",
             if summary.trim().is_empty() {
                 "(no extracted error lines)"
             } else {
@@ -2329,6 +2541,7 @@ async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
     let mut pending = 0;
     let mut passed_total = 0;
     let mut skipped_total = 0;
+    let mut gates = 0;
     // Always count totals from full set.
     let all_checks: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
     let mut by_name: HashMap<String, &PrCheck> = HashMap::new();
@@ -2346,6 +2559,12 @@ async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
         }
     }
     for c in by_name.values() {
+        // A failing gate is awaiting human approval, not a fixable CI failure;
+        // count it separately so the exit code and `fail` tally stay clean.
+        if c.bucket == "fail" && is_gate_check(&c.name) {
+            gates += 1;
+            continue;
+        }
         match c.bucket.as_str() {
             "fail" => failed += 1,
             "pending" => pending += 1,
@@ -2354,29 +2573,87 @@ async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
         }
     }
 
+    let gate_suffix = if gates > 0 {
+        format!(", {gates} needs-approval")
+    } else {
+        String::new()
+    };
     println!(
-        "PR #{pr_number} — {} fail, {} pending, {} pass, {} skip",
+        "PR #{pr_number} — {} fail, {} pending, {} pass, {} skip{gate_suffix}",
         failed, pending, passed_total, skipped_total
     );
     if has_conflicts {
         println!("⚠️  Merge conflicts with origin/main — some checks did not run.");
     }
     for c in &checks {
-        let icon = match c.bucket.as_str() {
-            "fail" => "❌",
-            "pending" => "⏳",
-            "pass" => "✅",
-            _ => "⏭",
+        let is_gate = c.bucket == "fail" && is_gate_check(&c.name);
+        let icon = if is_gate {
+            "🔒"
+        } else {
+            match c.bucket.as_str() {
+                "fail" => "❌",
+                "pending" => "⏳",
+                "pass" => "✅",
+                _ => "⏭",
+            }
         };
-        let provider = classify_provider_label(&c.link);
-        let link = if c.link.is_empty() {
+        let provider = if is_gate {
+            "needs-approval"
+        } else {
+            classify_provider_label(&c.link)
+        };
+        // The gate's commit-status description (e.g. "awaiting @lovablelabs/ai
+        // approval") is the actionable bit, not the link.
+        let trailer = if is_gate && !c.description.is_empty() {
+            format!("  — {}", c.description)
+        } else if c.link.is_empty() {
             String::new()
         } else {
             format!("  {}", c.link)
         };
-        println!("{icon} [{provider:>10}] {}{link}", c.name);
+        println!("{icon} [{provider:>14}] {}{trailer}", c.name);
     }
+    // Exit non-zero only on a real (fixable) failure — a pending approval gate
+    // is not something the agent can or should "fix".
     if failed > 0 { 1 } else { 0 }
+}
+
+/// Failing gate-style checks (name + commit-status description), e.g. the
+/// core-prompt review gate "awaiting @lovablelabs/ai approval". Surfaced
+/// separately by `ci failures` so a gate-only red PR doesn't read as
+/// "No failing checks" while `ci status` shows a red gate.
+async fn failing_gate_checks(pr_number: &str) -> Vec<PrCheck> {
+    let r = sh3(&format!(
+        "gh pr checks {pr_number} --json name,bucket,link,workflow,description"
+    ))
+    .await;
+    let all: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
+    all.into_iter()
+        .filter(|c| c.bucket == "fail" && is_gate_check(&c.name))
+        .collect()
+}
+
+/// Print failing gate checks with their commit-status description, so the
+/// agent learns *why* a red check has no fixable log rather than burning
+/// round-trips on `gh run view`. A gate needs a human/team action, not a fix.
+fn print_gate_note(gates: &[PrCheck]) {
+    println!(
+        "\n🔒 {} approval gate(s) red (not fixable by CI — needs a human/team action):",
+        gates.len()
+    );
+    for g in gates {
+        let desc = if g.description.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", g.description)
+        };
+        let link = if g.link.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", g.link)
+        };
+        println!("  - {}{desc}{link}", g.name);
+    }
 }
 
 async fn ci_failures_cmd(
@@ -2391,19 +2668,32 @@ async fn ci_failures_cmd(
         return 2;
     };
     let head_sha = sh("git rev-parse HEAD").await.unwrap_or_default();
-    let failed = list_failed_checks(&pr_number).await;
+    let (failed, gates) = tokio::join!(
+        list_failed_checks(&pr_number),
+        failing_gate_checks(&pr_number)
+    );
     if failed.is_empty() {
-        println!("No failing checks for PR #{pr_number}.");
+        // A gate-only red PR is not a fixable failure — say so explicitly so
+        // this agrees with `ci status` instead of reporting a bare "none"
+        // while `ci status` shows a red gate.
+        if gates.is_empty() {
+            println!("No failing checks for PR #{pr_number}.");
+        } else {
+            println!("No fixable CI failures for PR #{pr_number}.");
+            print_gate_note(&gates);
+        }
         return 0;
     }
 
-    // Build the full per-check dump into a buffer so we can optionally
-    // pipe it through the distiller before printing.
+    // `buf` is the compact distiller input (per-step conclusions + regex-
+    // trimmed errors). `full_buf` keeps the lightly-truncated raw logs for the
+    // on-disk `-full` file the distiller footer points at, so "read the full
+    // log" actually yields the log rather than the trimmed summary.
     let mut buf = String::new();
-    buf.push_str(&format!(
-        "# Failing checks for PR #{pr_number} ({} total)\n\n",
-        failed.len()
-    ));
+    let mut full_buf = String::new();
+    let header = format!("# Failing checks for PR #{pr_number} ({} total)\n\n", failed.len());
+    buf.push_str(&header);
+    full_buf.push_str(&header);
     for check in &failed {
         let provider = classify_provider(&check.link);
         let provider_label = classify_provider_label(&check.link);
@@ -2411,12 +2701,22 @@ async fn ci_failures_cmd(
         if !check.link.is_empty() {
             buf.push_str(&format!("Link: {}\n", check.link));
         }
-        let raw = match provider {
-            CheckProvider::GitHubActions => fetch_gha_log(check).await,
-            CheckProvider::Buildkite => fetch_buildkite_log(check, &head_sha).await,
-            CheckProvider::External => fetch_external_log(check, &head_sha).await,
+        let (raw, steps) = if matches!(provider, CheckProvider::GitHubActions) {
+            tokio::join!(fetch_gha_log(check), fetch_gha_step_conclusions(check))
+        } else {
+            let raw = match provider {
+                CheckProvider::Buildkite => fetch_buildkite_log(check, &head_sha).await,
+                _ => fetch_external_log(check, &head_sha).await,
+            };
+            (raw, String::new())
         };
         let raw = strip_ansi(&raw);
+        // Per-step conclusions go in ahead of the trimmed log so the distiller
+        // can tell a reran-and-passed test (only the publish step red) from a
+        // real failure without the full log.
+        if !steps.is_empty() {
+            buf.push_str(&format!("{steps}\n"));
+        }
         let body = if matches!(provider, CheckProvider::GitHubActions) {
             let s = extract_failure_summary(&raw);
             if s.is_empty() {
@@ -2432,14 +2732,27 @@ async fn ci_failures_cmd(
         } else {
             buf.push_str(&format!("```\n{}\n```\n\n", body.trim()));
         }
+        full_buf.push_str(&format!("## {} ({})\n", check.name, provider_label));
+        if !steps.is_empty() {
+            full_buf.push_str(&format!("{steps}\n"));
+        }
+        let full_body = truncate(&raw, 16000);
+        if full_body.trim().is_empty() {
+            full_buf.push_str("(no log captured)\n\n");
+        } else {
+            full_buf.push_str(&format!("```\n{}\n```\n\n", full_body.trim()));
+        }
     }
 
     if raw_only || buf.len() < 1000 {
         print!("{buf}");
+        if !gates.is_empty() {
+            print_gate_note(&gates);
+        }
         return 1;
     }
 
-    let full_file = section("ci-failures-full", &buf);
+    let full_file = section("ci-failures-full", &full_buf);
     eprintln!(
         "   Distilling failure logs ({} bytes) via {}...",
         buf.len(),
@@ -2460,6 +2773,9 @@ async fn ci_failures_cmd(
             eprintln!("   Distill failed; falling back to raw failure logs.");
             print!("{buf}");
         }
+    }
+    if !gates.is_empty() {
+        print_gate_note(&gates);
     }
     1
 }
@@ -2491,17 +2807,49 @@ async fn resolve_watch_anchor(pr: Option<String>) -> Option<(String, String)> {
     Some((sha, branch))
 }
 
+/// What `ci watch` re-resolves each poll to notice a fresh push. A new push
+/// supersedes (cancel-superseded) the watched commit's runs, so re-anchoring
+/// onto the new head beats fail-fasting on the old head's cancelled jobs.
+enum WatchAnchor {
+    /// Re-resolve the local push destination: `@{push}` (which `git push`
+    /// updates locally), falling back to `origin/<branch>`.
+    Branch(String),
+    /// Re-resolve the PR head via `gh pr view`.
+    Pr(String),
+}
+
+impl WatchAnchor {
+    async fn current_head(&self) -> Option<String> {
+        match self {
+            WatchAnchor::Branch(branch) => match sh("git rev-parse @{push} 2>/dev/null").await {
+                Some(s) if !s.is_empty() => Some(s),
+                _ => sh(&format!("git rev-parse origin/{branch} 2>/dev/null")).await,
+            },
+            WatchAnchor::Pr(pr) => {
+                sh(&format!(
+                    "gh pr view {pr} --json headRefOid --jq '.headRefOid'"
+                ))
+                .await
+            }
+        }
+    }
+}
+
 async fn ci_watch_cmd(pr: Option<String>) -> i32 {
     // The conflict probe's `git fetch origin main` is the slowest startup
     // call and depends on nothing below — start it before anchor resolution
     // so it overlaps the gh round-trips.
     let conflicts = tokio::spawn(check_origin_main_conflicts());
     let explicit_pr = pr.is_some();
-    let Some((sha, branch)) = resolve_watch_anchor(pr).await else {
+    let Some((sha, branch)) = resolve_watch_anchor(pr.clone()).await else {
         eprintln!(
             "Could not resolve a pushed commit to watch — push the branch first (or pass --pr)."
         );
         return 2;
+    };
+    let anchor = match pr {
+        Some(p) => WatchAnchor::Pr(p),
+        None => WatchAnchor::Branch(branch.clone()),
     };
     // The anchor is what was pushed, not HEAD; flag the gap so unpushed local
     // commits aren't silently mistaken for being under test.
@@ -2525,7 +2873,7 @@ async fn ci_watch_cmd(pr: Option<String>) -> i32 {
     if conflicts.unwrap_or(false) {
         println!("⚠️  Merge conflicts with origin/main — some checks did not run.");
     }
-    ci_watch_sha(&sha, ci_start, first_checks).await
+    ci_watch_sha(anchor, sha, ci_start, first_checks).await
 }
 
 // ── SHA-anchored CI watch ────────────────────────────────────────────────────
@@ -2583,7 +2931,14 @@ fn parse_sha_checks(runs_json: &str, statuses_json: &str) -> Vec<PrCheck> {
                 match run.conclusion.as_deref() {
                     Some("success") => "pass",
                     Some("skipped") | Some("neutral") => "skipping",
-                    // failure, timed_out, cancelled, action_required, stale, …
+                    // A queued run the scheduler abandoned because a newer run
+                    // for the same head superseded it — never a code failure.
+                    Some("stale") => "stale",
+                    // Usually cancel-superseded after a re-trigger. Held apart
+                    // from `fail` so `ci watch` can debounce instead of
+                    // fail-fasting on a phantom; see [ci_watch_sha].
+                    Some("cancelled") => "cancelled",
+                    // failure, timed_out, action_required, …
                     _ => "fail",
                 }
             };
@@ -2627,6 +2982,8 @@ fn counts_from_checks(checks: &[PrCheck], ignored: &[&str]) -> CheckCounts {
         pending: 0,
         skipping: 0,
         pending_names: Vec::new(),
+        cancelled_names: Vec::new(),
+        stale: 0,
     };
     for c in checks
         .iter()
@@ -2636,6 +2993,8 @@ fn counts_from_checks(checks: &[PrCheck], ignored: &[&str]) -> CheckCounts {
             "pass" => counts.passed += 1,
             "fail" => counts.failed += 1,
             "skipping" => counts.skipping += 1,
+            "stale" => counts.stale += 1,
+            "cancelled" => counts.cancelled_names.push(c.name.clone()),
             _ => {
                 counts.pending += 1;
                 counts.pending_names.push(c.name.clone());
@@ -2643,6 +3002,7 @@ fn counts_from_checks(checks: &[PrCheck], ignored: &[&str]) -> CheckCounts {
         }
     }
     counts.pending_names.sort();
+    counts.cancelled_names.sort();
     counts
 }
 
@@ -2651,26 +3011,35 @@ fn counts_from_checks(checks: &[PrCheck], ignored: &[&str]) -> CheckCounts {
 /// failed, else 0.
 fn print_checks_summary(label: &str, checks: &[PrCheck], ignored: &[&str]) -> i32 {
     let counts = counts_from_checks(checks, ignored);
-    println!(
+    let mut header = format!(
         "{label} — {} fail, {} pending, {} pass, {} skip",
         counts.failed, counts.pending, counts.passed, counts.skipping
     );
+    if !counts.cancelled_names.is_empty() {
+        header += &format!(", {} cancelled", counts.cancelled_names.len());
+    }
+    if counts.stale > 0 {
+        header += &format!(", {} stale", counts.stale);
+    }
+    println!("{header}");
     let priority = |b: &str| match b {
-        "fail" => 3,
+        "fail" => 4,
+        "cancelled" => 3,
         "pending" => 2,
-        "pass" => 1,
+        "stale" => 1,
         _ => 0,
     };
     let mut shown: Vec<&PrCheck> = checks
         .iter()
         .filter(|c| !ignored.contains(&c.name.as_str()))
-        .filter(|c| c.bucket == "fail" || c.bucket == "pending")
+        .filter(|c| matches!(c.bucket.as_str(), "fail" | "pending" | "cancelled" | "stale"))
         .collect();
     shown.sort_by(|a, b| (priority(&b.bucket), &a.name).cmp(&(priority(&a.bucket), &b.name)));
     for c in shown {
         let icon = match c.bucket.as_str() {
             "fail" => "❌",
             "pending" => "⏳",
+            "cancelled" | "stale" => "🔁",
             _ => "⏭",
         };
         let provider = classify_provider_label(&c.link);
@@ -2684,22 +3053,51 @@ fn print_checks_summary(label: &str, checks: &[PrCheck], ignored: &[&str]) -> i3
     if counts.failed > 0 { 1 } else { 0 }
 }
 
-/// Poll the checks of one specific commit until all settle or one fails
-/// (fail-fast).
+/// Poll one commit's checks until they settle, then print a final summary.
+///
+/// Terminal rules:
+/// - A real failure (conclusion `failure`/`timed_out`/…) fail-fasts instantly.
+/// - `cancelled` is debounced one extra poll: a cancellation is usually
+///   cancel-superseded after a re-trigger, whose replacement runs register a
+///   beat later. It only counts as red if the SAME cancelled set survives a
+///   second poll without a newer run for those names superseding it. This is
+///   the fix for `ci watch` fail-fasting on phantom superseded-run failures.
+/// - `stale`/`skipping`/`pass` are non-blocking; the watch settles when
+///   nothing is `pending` (and any `cancelled` set has settled).
+///
+/// Each poll also re-resolves [WatchAnchor] — a fresh push moves the head and
+/// cancel-supersedes the old runs, so the watch re-anchors onto the new commit
+/// ("Push detected…") instead of fail-fasting on the abandoned one.
 ///
 /// Polls REST by SHA rather than `gh pr checks --watch`: gh's watch blocks
 /// until every check reaches a terminal state, so the perpetually-`pending`
 /// [GRAPHITE_MERGEABILITY] check would hang it forever, and the PR's head
 /// can move under a watch while a fixed SHA cannot.
-async fn ci_watch_sha(sha: &str, ci_start: f64, first_checks: Vec<PrCheck>) -> i32 {
+async fn ci_watch_sha(
+    anchor: WatchAnchor,
+    initial_sha: String,
+    initial_ci_start: f64,
+    first_checks: Vec<PrCheck>,
+) -> i32 {
     const POLL: std::time::Duration = std::time::Duration::from_secs(15);
-    let short = &sha[..7.min(sha.len())];
+    let mut sha = initial_sha;
+    let mut ci_start = initial_ci_start;
     let start = std::time::Instant::now();
     let mut prev_line = String::new();
     let mut checks = first_checks;
+    // The cancelled set observed last poll, once everything else is terminal.
+    // Re-seen unchanged ⇒ genuine cancellation; changed/superseded ⇒ reset.
+    let mut cancel_settle: Option<Vec<String>> = None;
+
     loop {
         let counts = counts_from_checks(&checks, WATCH_IGNORED_CHECKS);
-        let total = counts.passed + counts.failed + counts.pending + counts.skipping;
+        let total = counts.passed
+            + counts.failed
+            + counts.pending
+            + counts.skipping
+            + counts.stale
+            + counts.cancelled_names.len();
+        let short = format!("Commit {}", &sha[..7.min(sha.len())]);
 
         // Checks take a few seconds to register after a push; an empty list
         // means "not started yet", never "all done".
@@ -2717,13 +3115,47 @@ async fn ci_watch_sha(sha: &str, ci_start: f64, first_checks: Vec<PrCheck>) -> i
             prev_line = line;
         }
 
-        if total > 0 && (counts.failed > 0 || counts.pending == 0) {
+        // Real failures fail-fast immediately — no debounce.
+        if counts.failed > 0 {
             println!();
-            return print_checks_summary(&format!("Commit {short}"), &checks, WATCH_IGNORED_CHECKS);
+            return print_checks_summary(&short, &checks, WATCH_IGNORED_CHECKS);
+        }
+
+        // Nothing pending ⇒ candidate terminal state.
+        if total > 0 && counts.pending == 0 {
+            if counts.cancelled_names.is_empty() {
+                println!();
+                return print_checks_summary(&short, &checks, WATCH_IGNORED_CHECKS);
+            }
+            // Only cancelled checks remain. Settle them across one more poll.
+            if cancel_settle.as_ref() == Some(&counts.cancelled_names) {
+                println!();
+                print_checks_summary(&short, &checks, WATCH_IGNORED_CHECKS);
+                return 1;
+            }
+            cancel_settle = Some(counts.cancelled_names.clone());
+        } else {
+            cancel_settle = None;
         }
 
         sleep(POLL).await;
-        checks = checks_for_sha(sha).await;
+
+        // A new push supersedes the watched commit; follow it instead of
+        // fail-fasting on the old head's cancel-superseded jobs.
+        if let Some(new_sha) = anchor.current_head().await {
+            if !new_sha.is_empty() && new_sha != sha {
+                println!(
+                    "\n🔄 Push detected. Restarting watch at #{}",
+                    &new_sha[..7.min(new_sha.len())]
+                );
+                sha = new_sha;
+                ci_start = now_epoch();
+                cancel_settle = None;
+                prev_line.clear();
+            }
+        }
+
+        checks = checks_for_sha(&sha).await;
     }
 }
 
@@ -2897,57 +3329,57 @@ async fn ci_rerun_cmd(name: String, pr: Option<String>) -> i32 {
         eprintln!("No PR for current branch and --pr not supplied.");
         return 2;
     };
-    let head_sha = sh(&format!(
-        "gh pr view {pr_number} --json headRefOid --jq '.headRefOid'"
-    ))
-    .await
-    .unwrap_or_default();
-    let branch = sh(&format!(
-        "gh pr view {pr_number} --json headRefName --jq '.headRefName'"
-    ))
-    .await
-    .unwrap_or_default();
-    // Match by check name → GHA run ID. We need to look up the workflow file
-    // for the failing job, not the job ID, since rerun --failed acts on a run.
-    let runs_json = sh3(&format!(
-        "gh run list --branch {branch} --limit 50 \
-         --json databaseId,name,headSha,conclusion \
-         --jq '[.[] | select(.headSha == \"{head_sha}\" and .conclusion == \"failure\")]'"
-    ))
-    .await;
-    let runs: Vec<RunInfo> = parse_json(&runs_json.stdout).unwrap_or_default();
-    if runs.is_empty() {
-        eprintln!(
-            "No failing GHA runs for {name} on head {head_sha}. \
-                   (Non-GHA checks like Buildkite cannot be rerun via this command.)"
-        );
+    // Resolve the check name to a run via the check's own link — the same
+    // source `ci status`/`ci failures` report from — so the short check name
+    // (`test-go`, `test-realtime`) matches even when its workflow has a
+    // different display name (`Test`, `Test Go realtime`). Name-matching
+    // against `gh run list`'s workflow names misses that mapping.
+    let failed = list_failed_checks(&pr_number).await;
+    if failed.is_empty() {
+        eprintln!("No failing checks for PR #{pr_number} to rerun.");
         return 2;
     }
-    // Try exact match first, then prefix.
-    let target = runs
+    // Accept both the short check name and the workflow display name, in
+    // either direction, so callers can paste whichever `ci status` showed.
+    let matches: Vec<&PrCheck> = failed
         .iter()
-        .find(|r| r.name.as_deref() == Some(name.as_str()))
-        .or_else(|| {
-            runs.iter().find(|r| {
-                r.name
-                    .as_deref()
-                    .map(|n| n.contains(&name))
-                    .unwrap_or(false)
-            })
-        });
-    let Some(run) = target else {
-        eprintln!("No failing run named `{name}`. Failing runs:");
-        for r in &runs {
-            eprintln!("  - {}", r.name.as_deref().unwrap_or("?"));
+        .filter(|c| {
+            c.name == name
+                || c.name.eq_ignore_ascii_case(&name)
+                || c.name.contains(&name)
+                || name.contains(&c.name)
+        })
+        .collect();
+    let target = matches
+        .iter()
+        .copied()
+        .find(|c| c.name == name)
+        .or_else(|| matches.first().copied());
+    let Some(check) = target else {
+        eprintln!("No failing check named `{name}`. Failing checks:");
+        for c in &failed {
+            eprintln!("  - {} [{}]", c.name, classify_provider_label(&c.link));
         }
         return 2;
     };
-    println!(
-        "Re-running failed jobs in {} (run {})...",
-        run.name.as_deref().unwrap_or("?"),
-        run.database_id
-    );
-    let r = sh3(&format!("gh run rerun {} --failed", run.database_id)).await;
+    if classify_provider(&check.link) != CheckProvider::GitHubActions {
+        eprintln!(
+            "`{}` is a {} check — only GitHub Actions runs can be rerun via this command.",
+            check.name,
+            classify_provider_label(&check.link)
+        );
+        return 2;
+    }
+    let (run_id, _job) = parse_gha_link(&check.link);
+    if run_id == 0 {
+        eprintln!(
+            "Could not resolve a GitHub Actions run id from `{}`'s link: {}",
+            check.name, check.link
+        );
+        return 2;
+    }
+    println!("Re-running failed jobs in `{}` (run {run_id})...", check.name);
+    let r = sh3(&format!("gh run rerun {run_id} --failed")).await;
     if !r.stdout.is_empty() {
         println!("{}", r.stdout);
     }
@@ -4822,6 +5254,7 @@ fn build_prompt(
     agent_sessions_str: &str,
     relevant_context_str: &str,
     review_only_note: Option<&str>,
+    push_code: i32,
 ) -> String {
     let notes = if let Some(reason) = skip_ci {
         format!(" CI was skipped due to {reason} — investigate those first.")
@@ -4869,6 +5302,19 @@ fn build_prompt(
         .to_string();
     let review_only_prefix = review_only_note.unwrap_or("");
 
+    // The push already ran; surface a non-zero exit instead of claiming "done",
+    // since a bare push against a misconfigured upstream (origin/main) 128s and
+    // the fix would otherwise be left unpushed. See the Push Result section.
+    let phase1 = if push_code == 0 {
+        "Already done.".to_string()
+    } else {
+        format!(
+            "⚠️ Push exited {push_code} — it likely FAILED (see the Push Result section below). \
+             Re-push the branch (e.g. `git push -u origin HEAD:<branch>`) and confirm it succeeded \
+             before continuing."
+        )
+    };
+
     format!(
         "{review_only_prefix}{skill_text}{graphite_str}\n\n\
          # Instructions\n\n\
@@ -4879,7 +5325,7 @@ fn build_prompt(
          {diff_files_str}{pr_areas_str}\n\
          {relevant_context_str}\n\
          Phase 1 (push):\n\
-         Already done.\n\n\
+         {phase1}\n\n\
          Phase 2/3:\n\
          {notes}\n\n\
          Pre-collected data:\n\
@@ -4952,11 +5398,42 @@ struct ClaudeInvocation {
     path: String,
 }
 
+/// Abort the full dragonfly flow when the working tree state would make the
+/// pre-collected push/diff/CI data describe the wrong commits: a detached HEAD
+/// or an in-progress rebase. Both leave HEAD off the PR branch, so pushing and
+/// diffing against it silently mis-report (e.g. "1 commit" for a 12-commit PR
+/// paused mid-fixup). Exits the process; run before [push].
+async fn assert_head_runnable() {
+    // `--git-path` resolves correctly inside linked worktrees too.
+    for dir in ["rebase-merge", "rebase-apply"] {
+        let Some(p) = sh(&format!("git rev-parse --git-path {dir}")).await else {
+            continue;
+        };
+        if !p.trim().is_empty() && std::path::Path::new(p.trim()).exists() {
+            eprintln!(
+                "❌ A rebase is in progress ({dir}). Finish it (`git rebase --continue`) or \
+                 abort it (`git rebase --abort`) before running dragonfly — data collected \
+                 mid-rebase describes the wrong commits."
+            );
+            std::process::exit(1);
+        }
+    }
+    // Detached HEAD: `git symbolic-ref -q HEAD` exits non-zero off a branch.
+    if sh3("git symbolic-ref -q HEAD").await.code != 0 {
+        eprintln!(
+            "❌ HEAD is detached. Check out the PR branch before running dragonfly — \
+             a detached HEAD isn't the branch that gets pushed or reviewed."
+        );
+        std::process::exit(1);
+    }
+}
+
 async fn build_claude_invocation(
     force: bool,
     non_interactive: bool,
     title_flag: Option<String>,
 ) -> ClaudeInvocation {
+    assert_head_runnable().await;
     // Resolve PR ownership before push() so the rebase prompt inside
     // maybe_rebase_on_main can be suppressed when the PR belongs to
     // someone else (review-only mode).
@@ -5264,6 +5741,7 @@ async fn build_claude_invocation(
         &agent_sessions_str,
         &relevant_context_str,
         review_only_note.as_deref(),
+        push_result.code,
     );
     let prompt = if non_interactive {
         format!("{NON_INTERACTIVE_NOTE}\n{prompt}")
@@ -5315,9 +5793,9 @@ async fn main() {
                 }
             },
             CliCommand::Pr {
-                command: PrCommand::Description { body },
+                command: PrCommand::Description { body, pr },
             } => {
-                pr_set_description(&body).await;
+                pr_set_description(pr, &body).await;
             }
             CliCommand::Pr {
                 command: PrCommand::Comment { pr, body },
@@ -5472,7 +5950,8 @@ mod tests {
             {"id": 3, "name": "lint", "status": "completed", "conclusion": "success"},
             {"id": 4, "name": "docs", "status": "completed", "conclusion": "skipped"},
             {"id": 5, "name": "e2e", "status": "completed", "conclusion": "cancelled"},
-            {"id": 6, "name": "queued-job", "status": "queued", "conclusion": null}
+            {"id": 6, "name": "queued-job", "status": "queued", "conclusion": null},
+            {"id": 7, "name": "superseded", "status": "completed", "conclusion": "stale"}
         ]}"#;
         let statuses = r#"{"state": "pending", "statuses": [
             {"context": "buildkite/app", "state": "pending", "target_url": "https://buildkite.com/o/p/builds/1"},
@@ -5491,12 +5970,15 @@ mod tests {
         assert_eq!(bucket("test-go"), "pending");
         assert_eq!(bucket("lint"), "pass");
         assert_eq!(bucket("docs"), "skipping");
-        assert_eq!(bucket("e2e"), "fail");
+        // cancelled/stale are held apart from `fail` so `ci watch` debounces a
+        // superseded run instead of fail-fasting on a phantom.
+        assert_eq!(bucket("e2e"), "cancelled");
+        assert_eq!(bucket("superseded"), "stale");
         assert_eq!(bucket("queued-job"), "pending");
         assert_eq!(bucket("buildkite/app"), "pending");
         assert_eq!(bucket("wiz"), "pass");
         assert_eq!(bucket("spacelift/stack"), "fail");
-        assert_eq!(checks.len(), 8);
+        assert_eq!(checks.len(), 9);
     }
 
     #[test]
@@ -5588,5 +6070,48 @@ index 111..222 100644
         assert_eq!(counts.failed, 0);
         assert_eq!(counts.pending, 1);
         assert_eq!(counts.pending_names, vec!["test-spanner".to_string()]);
+    }
+
+    #[test]
+    fn counts_from_checks_separates_cancelled_and_stale() {
+        let mk = |name: &str, bucket: &str| PrCheck {
+            name: name.into(),
+            bucket: bucket.into(),
+            link: String::new(),
+            workflow: String::new(),
+            description: String::new(),
+        };
+        let checks = vec![
+            mk("test-go", "pass"),
+            mk("lint-go-result", "cancelled"),
+            mk("test-result", "cancelled"),
+            mk("e2e", "stale"),
+        ];
+        let counts = counts_from_checks(&checks, WATCH_IGNORED_CHECKS);
+        // Cancelled/stale do not inflate `failed` (the phantom-failure bug);
+        // cancelled names are sorted for the cross-poll settle comparison.
+        assert_eq!(counts.failed, 0);
+        assert_eq!(counts.stale, 1);
+        assert_eq!(
+            counts.cancelled_names,
+            vec!["lint-go-result".to_string(), "test-result".to_string()]
+        );
+    }
+
+    #[test]
+    fn classify_issue_comment_tags_boilerplate_and_keeps_signal() {
+        // Lovmesh plan preview is a CI-equivalent signal — never collapsed.
+        assert_eq!(
+            classify_issue_comment("github-actions[bot]", "## Lovmesh Plan Preview\n❌ apply failed"),
+            ("bot-status", false)
+        );
+        // Codecov / pr-classification boilerplate collapses.
+        assert!(classify_issue_comment("codecov[bot]", "coverage 80%").1);
+        assert!(classify_issue_comment("lovable-ci-bot", "PR Classification: trivial").1);
+        // Human comments are kept in full.
+        assert_eq!(
+            classify_issue_comment("aron", "this needs a second look"),
+            ("comment", false)
+        );
     }
 }
