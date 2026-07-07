@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
+mod dedup;
 mod guide_chunks;
 mod pr_score;
 mod sessions;
@@ -66,6 +67,29 @@ enum CliCommand {
     Prompt {
         #[command(subcommand)]
         target: Option<PromptTarget>,
+    },
+    /// Duplicate-function hints for this PR. With no subcommand, lists
+    /// existing functions semantically similar to functions this branch
+    /// added or changed (LLM behavior summaries embedded and compared by
+    /// cosine similarity; summaries/embeddings cached by content hash under
+    /// ~/.dragonfly/dedup so only new code hits the LLM).
+    Dedup {
+        #[command(subcommand)]
+        command: Option<DedupCommand>,
+        /// Cosine similarity threshold for candidates.
+        #[arg(long, default_value_t = dedup::DEFAULT_THRESHOLD)]
+        threshold: f64,
+        /// Max matches listed per changed function.
+        #[arg(long, default_value_t = dedup::DEFAULT_LIMIT)]
+        limit: usize,
+        /// Override the base ref for the changed-function diff. Default:
+        /// auto-detected via `pr_base_ref` (graphite stack parent or
+        /// origin/main).
+        #[arg(long)]
+        base: Option<String>,
+        /// Emit JSON instead of the human listing.
+        #[arg(long)]
+        json: bool,
     },
     /// List CLAUDE.md / AGENTS.md guides relevant to the given file paths.
     /// Walks parent dirs of each path up to the git toplevel, follows
@@ -128,6 +152,28 @@ enum PromptTarget {
         /// blocks instead of writing them to /tmp and referencing the paths.
         #[arg(long)]
         inline_diffs: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DedupCommand {
+    /// Record that a changed function is NOT a duplicate of some or all of
+    /// its currently listed matches. With no MATCH args, dismisses every
+    /// match currently listed for FUNC. Accepts full identities
+    /// (`go/api/pkg/util.(Server).handleFoo`) or a bare function name when
+    /// unambiguous. Dismissed pairs are excluded from all future listings
+    /// (shared across worktrees of this repo).
+    Dismiss {
+        /// The changed function, as printed by `dragonfly dedup`.
+        func: String,
+        /// Specific matches to dismiss (default: all currently listed).
+        matches: Vec<String>,
+    },
+    /// List recorded not-a-duplicate pairs for this repo.
+    Exclusions {
+        /// Emit JSON instead of the human listing.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -4522,10 +4568,13 @@ async fn build_review_agent_context(inline_diffs: bool) -> String {
     let base_for_rag = base_ref.clone();
     let rag_fut = async move { build_relevant_context(&base_for_rag).await };
 
+    let base_for_dedup = base_ref.clone();
+    let dedup_fut = async move { dedup::build_block(&base_for_dedup).await };
+
     let ctx_fut = collect_context_strings(&branch_commits, &base_ref);
 
-    let (diff_files_str, full_diffs_vec, relevant_context, ctx) =
-        tokio::join!(diff_files_fut, full_diffs_fut, rag_fut, ctx_fut);
+    let (diff_files_str, full_diffs_vec, relevant_context, dedup_block, ctx) =
+        tokio::join!(diff_files_fut, full_diffs_fut, rag_fut, dedup_fut, ctx_fut);
 
     // Reuse the SHA-keyed pr-areas cache populated by the main prompt
     // build. When this runs standalone (no preceding dragonfly),
@@ -4598,6 +4647,10 @@ async fn build_review_agent_context(inline_diffs: bool) -> String {
         if !relevant_context.ends_with('\n') {
             out.push('\n');
         }
+    }
+    if let Some(block) = dedup_block {
+        out.push('\n');
+        out.push_str(&block);
     }
     out.push_str("</dragonfly-context>\n");
     out
@@ -5305,6 +5358,7 @@ fn build_prompt(
     graphite_str: &str,
     agent_sessions_str: &str,
     relevant_context_str: &str,
+    potential_duplicates_str: &str,
     review_only_note: Option<&str>,
     push_code: i32,
 ) -> String {
@@ -5375,7 +5429,7 @@ fn build_prompt(
          {}{}{}\n\
          Per-file diffs:\n\
          {diff_files_str}{pr_areas_str}\n\
-         {relevant_context_str}\n\
+         {relevant_context_str}{potential_duplicates_str}\n\
          Phase 1 (push):\n\
          {phase1}\n\n\
          Phase 2/3:\n\
@@ -5523,6 +5577,11 @@ async fn build_claude_invocation(
     let base_ref_for_rag = base_ref.clone();
     let relevant_context_handle =
         tokio::spawn(async move { build_relevant_context(&base_ref_for_rag).await });
+
+    // Dedup hints overlap with CI watch too — a cold summary cache can take
+    // many minutes, but the CI wait dominates and a warm cache is seconds.
+    let base_ref_for_dedup = base_ref.clone();
+    let dedup_handle = tokio::spawn(async move { dedup::build_block(&base_ref_for_dedup).await });
 
     // Run area analysis in parallel with PR/CI checks. The PR-areas LLM
     // call needs the inline diff content (kit has no tool-use, so we
@@ -5776,6 +5835,12 @@ async fn build_claude_invocation(
     let agent_sessions_str = sessions::render_section(&agent_sessions, &push_result.branch);
 
     let relevant_context_str = relevant_context_handle.await.unwrap_or_default();
+    let potential_duplicates_str = dedup_handle
+        .await
+        .ok()
+        .flatten()
+        .map(|b| format!("\n{b}"))
+        .unwrap_or_default();
 
     let prompt = build_prompt(
         pr_status,
@@ -5792,6 +5857,7 @@ async fn build_claude_invocation(
         &graphite_str,
         &agent_sessions_str,
         &relevant_context_str,
+        &potential_duplicates_str,
         review_only_note.as_deref(),
         push_result.code,
     );
@@ -5881,6 +5947,22 @@ async fn main() {
                     CiCommand::Retries { pr } => ci_retries_cmd(pr).await,
                     CiCommand::Rerun { name, pr } => ci_rerun_cmd(name, pr).await,
                     CiCommand::Distill { file, model } => ci_distill_cmd(file, model).await,
+                };
+                std::process::exit(code);
+            }
+            CliCommand::Dedup {
+                command,
+                threshold,
+                limit,
+                base,
+                json,
+            } => {
+                let code = match command {
+                    None => dedup::cmd_list(base, threshold, limit, json).await,
+                    Some(DedupCommand::Dismiss { func, matches }) => {
+                        dedup::cmd_dismiss(func, matches, base, threshold, limit).await
+                    }
+                    Some(DedupCommand::Exclusions { json }) => dedup::cmd_exclusions(json).await,
                 };
                 std::process::exit(code);
             }

@@ -209,6 +209,20 @@ After fixing, present the changes to the user, and allow for them to review manu
 
 After changes have been approved and fixed, re-run `review-agent` to see if it finds more issues.
 
+## Potential duplicates
+
+If the instructions contain a `<potential-duplicates>` block, read each hinted
+pair of functions:
+
+- **Genuine duplication** → report it under "Dedup candidates" in the Phase 8
+  summary. Don't refactor unless the user asks.
+- **False positive** → `dragonfly dedup dismiss '<changed-func>' ['<match>'...]`
+  (identities exactly as printed; no match args = all listed matches).
+  Dismissals persist across worktrees, so only dismiss pairs you verified.
+
+`dragonfly dedup` re-lists candidates; `dragonfly dedup exclusions` shows
+dismissed pairs.
+
 ## Phase 7: PR description
 
 If the PR has no substantial description, write one using:
@@ -286,6 +300,7 @@ It pulls the session token from browser cookies automatically — no setup. Then
 Report a summary:
 - **CI**: Final status of all checks
 - **Fixes applied**: List of commits made to fix CI or bot issues. Remember that CI issues unrelated to this PR should not be fixed, but the user should be informed.
+- **Dedup candidates**: Verified genuine duplicates from the `<potential-duplicates>` block (function, existing counterpart, suggested direction). Omit the section if there were none.
 - **Remaining items**: Any unresolved bot comments or issues needing user input
 - **PR URL**: Link to the PR
 
