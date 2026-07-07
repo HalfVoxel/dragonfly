@@ -1510,6 +1510,12 @@ const CORE_PROMPT_REVIEW: &str = "review";
 // Waiting on it hangs `ci watch`; it's non-blocking like the other review bots.
 const QA_TECH_REVIEW: &str = "QA.tech / PR Review";
 
+// The claude-code-action posts a "Claude Code Review" check that stays `pending`
+// while its AI review runs (often many minutes), and the review is advisory so
+// no code change flips it green. Waiting on it hangs `ci watch`/`pr review`;
+// it's non-blocking like the other review bots.
+const CLAUDE_CODE_REVIEW: &str = "Claude Code Review";
+
 // Checks that are slow, flaky, or non-blocking — exclude from the wait so they
 // don't keep `pending` above zero forever. Failures here are surfaced to the
 // user but not auto-fixed as part of dragonfly.
@@ -1521,6 +1527,7 @@ const IGNORED_CHECKS: &[&str] = &[
     GRAPHITE_MERGEABILITY,
     CORE_PROMPT_REVIEW,
     QA_TECH_REVIEW,
+    CLAUDE_CODE_REVIEW,
     "depthfirst Bot",
 ];
 
@@ -1534,6 +1541,7 @@ const WATCH_IGNORED_CHECKS: &[&str] = &[
     GRAPHITE_MERGEABILITY,
     CORE_PROMPT_REVIEW,
     QA_TECH_REVIEW,
+    CLAUDE_CODE_REVIEW,
 ];
 
 // Gate-style checks: they report `fail` until a human/team action (not a CI
@@ -2129,11 +2137,38 @@ async fn fetch_gha_log(check: &PrCheck) -> String {
         _ => return String::new(),
     };
     let log = sh3(&cmd).await;
-    if !log.stdout.is_empty() {
+    let raw = if !log.stdout.is_empty() {
         log.stdout
     } else {
         log.stderr
-    }
+    };
+    denoise_gha_log(&raw)
+}
+
+/// Drop `git fetch`/checkout noise from a GHA job log.
+///
+/// `actions/checkout` with `fetch-depth: 0` prints one `[new branch] <name> ->
+/// origin/<name>` line per remote ref plus a flood of `Updating files: N%`
+/// progress lines. On a repo with thousands of branches this is the bulk of the
+/// log and breaks failure surfacing two ways: it front-loads the log so a
+/// byte-prefix truncation never reaches the failing step, and hundreds of
+/// branch names contain substrings like "error"/"fail" that seed
+/// [extract_failure_summary]'s keep window, inflating its output past 100 KB.
+fn denoise_gha_log(log: &str) -> String {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(concat!(
+            r"\[(new (branch|tag|ref)|tag update|deleted)\]",
+            r"|-> origin/\S+( \(forced update\))?$",
+            r"|\b(Updating files|Receiving objects|Resolving deltas|Compressing objects",
+            r"|Counting objects|Enumerating objects|Filtering content|Checking out files): +\d",
+        ))
+        .unwrap()
+    });
+    log.lines()
+        .filter(|line| !re.is_match(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Deserialize)]
@@ -2388,6 +2423,23 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
+/// Keep the last `max` bytes of `s` at a UTF-8 boundary, marking the cut.
+///
+/// CI logs put the failure and the trailing `##[error]Process completed` line
+/// at the end, so when a log overflows the cap the tail is the part worth
+/// keeping; the head holds only setup/checkout noise a head-anchored
+/// [truncate] would preserve instead.
+fn truncate_tail(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut start = s.len() - max;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…[earlier log truncated]…\n{}", &s[start..])
+}
+
 /// Collect per-check failure logs across all providers. Replaces the old
 /// GHA-only run-list path. Falls back to a synthetic note for any check we
 /// can't fetch a real log for — never returns empty when there are failures.
@@ -2444,7 +2496,7 @@ async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
             }
         ));
         if matches!(provider, CheckProvider::GitHubActions) && !raw.is_empty() {
-            let body = truncate(&raw, 16000);
+            let body = truncate_tail(&raw, 16000);
             full_logs.push(format!("## {} — full log\n```\n{}\n```", check.name, body));
         }
     }
@@ -2720,7 +2772,7 @@ async fn ci_failures_cmd(
         let body = if matches!(provider, CheckProvider::GitHubActions) {
             let s = extract_failure_summary(&raw);
             if s.is_empty() {
-                truncate(&raw, max_bytes).to_string()
+                truncate_tail(&raw, max_bytes)
             } else {
                 s
             }
@@ -2736,7 +2788,7 @@ async fn ci_failures_cmd(
         if !steps.is_empty() {
             full_buf.push_str(&format!("{steps}\n"));
         }
-        let full_body = truncate(&raw, 16000);
+        let full_body = truncate_tail(&raw, 16000);
         if full_body.trim().is_empty() {
             full_buf.push_str("(no log captured)\n\n");
         } else {
@@ -5816,7 +5868,7 @@ async fn main() {
             CliCommand::Ci { command } => {
                 let code = match command {
                     CiCommand::Status { all, pr } => {
-                        ci_status_cmd(pr, all, &[QA_TECH_REVIEW]).await
+                        ci_status_cmd(pr, all, &[QA_TECH_REVIEW, CLAUDE_CODE_REVIEW]).await
                     }
                     CiCommand::Failures {
                         pr,
@@ -6113,5 +6165,61 @@ index 111..222 100644
             classify_issue_comment("aron", "this needs a second look"),
             ("comment", false)
         );
+    }
+
+    #[test]
+    fn denoise_drops_checkout_noise_and_keeps_the_failure() {
+        // `actions/checkout` ref enumeration + working-tree progress, then the
+        // real failing step. Format mirrors `gh run view --log`: job\tstep\tts.
+        let log = [
+            "job\tCheckout PR head\t2026Z  * [new branch]            fix-error-handling -> origin/fix-error-handling",
+            "job\tCheckout PR head\t2026Z  * [new branch]            saml-delete-orphan-user-on-join-fail -> origin/saml-delete-orphan-user-on-join-fail",
+            "job\tCheckout PR head\t2026Z  + abc1234...def5678 b -> origin/b (forced update)",
+            "job\tCheckout PR head\t2026Z  - [deleted]               (none) -> origin/gone",
+            "job\tCheckout PR head\t2026Z  * [new tag]               v1.2.3 -> v1.2.3",
+            "job\tCheckout PR head\t2026Z Updating files:  53% (1234/2345)",
+            "job\tCheckout PR head\t2026Z Updating files: 100% (2345/2345), done.",
+            "job\tRun codeowners PR check\t2026Z [fail] 1 added file(s) have NO matching CODEOWNERS rule:",
+            "job\tRun codeowners PR check\t2026Z   - go/api/pkg/reviewpublish/strip_test.go",
+            "job\tRun codeowners PR check\t2026Z ##[error]Process completed with exit code 1.",
+        ]
+        .join("\n");
+        let out = denoise_gha_log(&log);
+        // Ref enumeration and checkout progress are stripped...
+        assert!(!out.contains("[new branch]"));
+        assert!(!out.contains("fix-error-handling"));
+        assert!(!out.contains("forced update"));
+        assert!(!out.contains("[deleted]"));
+        assert!(!out.contains("[new tag]"));
+        assert!(!out.contains("Updating files"));
+        // ...but the actual failure survives verbatim.
+        assert!(out.contains("NO matching CODEOWNERS rule"));
+        assert!(out.contains("go/api/pkg/reviewpublish/strip_test.go"));
+        assert!(out.contains("Process completed with exit code 1"));
+
+        // Regression: branch names containing "error"/"fail" no longer seed
+        // extract_failure_summary's keep window, so the summary stays tight and
+        // surfaces the real error instead of a wall of `-> origin/<branch>`.
+        let summary = extract_failure_summary(&out);
+        assert!(summary.contains("strip_test.go"));
+        assert!(!summary.contains("origin/"));
+        assert!(
+            summary.len() < 600,
+            "summary ballooned to {} bytes",
+            summary.len()
+        );
+    }
+
+    #[test]
+    fn truncate_tail_keeps_the_end_where_failures_live() {
+        // Under the cap: returned unchanged, no marker.
+        assert_eq!(truncate_tail("short", 100), "short");
+        // Over the cap: the tail (where `##[error]` lands) is kept; the
+        // setup-noise head is dropped behind a marker.
+        let long = format!("{}##[error]boom", "x".repeat(500));
+        let out = truncate_tail(&long, 20);
+        assert!(out.starts_with("…[earlier log truncated]…\n"));
+        assert!(out.ends_with("##[error]boom"));
+        assert!(!out.contains(&"x".repeat(22)));
     }
 }

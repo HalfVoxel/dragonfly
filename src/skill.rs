@@ -201,9 +201,13 @@ CUSTOM_REVIEW_PLACEHOLDER
 
 Instruct the subagents to write a numbered list of issues they find.
 Ask the user which issues they want you to fix by writing the aggregated list of issues using markdown. Do not use the AskUserQuestion tool, allow the user to answer in free form text.
+
+Nits, in particular comment nits, which are unquestionable improvements, can be implemented immediately without asking the user.
+Present these to the user as well in a numbered "Fixed Immediately" list with one short sentance for each fix.
+
 After fixing, present the changes to the user, and allow for them to review manually before comitting and pushing.
 
-After changes have been approved, re-run `review-agent` to see if it finds more issues.
+After changes have been approved and fixed, re-run `review-agent` to see if it finds more issues.
 
 ## Phase 7: PR description
 
@@ -213,7 +217,7 @@ If the PR has no substantial description, write one using:
 dragonfly pr description "..."
 ```
 
-This phase may be done in parallel with waiting on CI, if CI has passed at least once before.
+This phase may be done in parallel with waiting on CI.
 
 If the PR has a description, validate that it still makes sense and is up to date with the latest changes.
 However, you should not include fixes to the PR itself in its description. It should be about what the PR as a whole aims to do.
