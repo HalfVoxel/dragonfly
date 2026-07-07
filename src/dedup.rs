@@ -21,7 +21,10 @@ use tokio::sync::Semaphore;
 
 use crate::home_dir;
 
-pub const DEFAULT_THRESHOLD: f64 = 0.90;
+// 0.90 finds only near-exact behavior matches; 0.80 also surfaces the
+// "same family, maybe foldable" tier. Erring low is fine: the agent
+// verifies every hint and dismissals persist.
+pub const DEFAULT_THRESHOLD: f64 = 0.80;
 pub const DEFAULT_LIMIT: usize = 5;
 
 // Pipeline knobs, carried over from funcsim's tuned defaults.
