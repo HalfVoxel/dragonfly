@@ -16,6 +16,7 @@ mod guide_chunks;
 mod pr_score;
 mod sessions;
 mod skill;
+mod watch_mcp;
 
 #[derive(Parser)]
 #[command(name = "dragonfly")]
@@ -135,6 +136,23 @@ enum CliCommand {
     ExpandAgent {
         /// Path to an agent markdown file (e.g. agents/comment-reviewer.md).
         file: PathBuf,
+    },
+    /// MCP channel server: pushes CI check results and new PR comments into a
+    /// running Claude Code session as `<channel source="pr-watch">` events.
+    /// Spawned by plugin/dragonfly-watcher over stdio; not for manual use.
+    #[command(hide = true)]
+    WatchMcp {
+        /// Explicit PR number. Default: the current branch's pushed commit
+        /// (and its PR, once one exists).
+        #[arg(long)]
+        pr: Option<String>,
+        /// Poll interval in seconds (min 5).
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
+        /// Skip GitHub polling and emit one synthetic event shortly after the
+        /// handshake. For end-to-end plumbing tests.
+        #[arg(long)]
+        demo: bool,
     },
 }
 
@@ -6117,6 +6135,10 @@ async fn main() {
                     std::process::exit(1);
                 }
             },
+            CliCommand::WatchMcp { pr, interval, demo } => {
+                let code = watch_mcp::watch_mcp_cmd(pr, interval, demo).await;
+                std::process::exit(code);
+            }
         }
         return;
     }

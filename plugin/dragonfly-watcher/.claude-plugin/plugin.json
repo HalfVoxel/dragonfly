@@ -1,0 +1,7 @@
+{
+  "name": "dragonfly-watcher",
+  "description": "Pushes CI check results and new PR review comments into the session as channel events",
+  "version": "0.1.0",
+  "author": { "name": "Aron Granberg" },
+  "repository": "https://github.com/HalfVoxel/dragonfly"
+}

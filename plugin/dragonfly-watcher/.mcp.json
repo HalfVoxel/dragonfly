@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "pr-watch": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/watcher.sh"
+    }
+  }
+}

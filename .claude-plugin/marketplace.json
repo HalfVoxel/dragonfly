@@ -1,0 +1,12 @@
+{
+  "name": "dragonfly",
+  "owner": { "name": "Aron Granberg" },
+  "description": "Dragonfly agent tooling plugins",
+  "plugins": [
+    {
+      "name": "dragonfly-watcher",
+      "source": "./plugin/dragonfly-watcher",
+      "description": "Pushes CI check results and new PR review comments into the session as channel events"
+    }
+  ]
+}
