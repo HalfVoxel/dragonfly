@@ -13,6 +13,10 @@
 // *transitions* observed while the session is live become events. Without
 // the baseline, every session start in a repo with an old red PR would spam
 // stale failures the agent didn't cause and can't contextualize.
+//
+// Stderr is the diagnostic surface: Claude Code records an MCP server's
+// stderr in its debug log, so `eprintln!` here is how field issues get
+// traced without affecting the protocol stream.
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,6 +41,10 @@ user is doing, say so briefly instead of acting.";
 // session context, so an unbounded bot comment (Graphite tables, CI dumps)
 // would waste the whole context budget of a turn.
 const MAX_BODY: usize = 1500;
+
+/// One channel event: content plus `<channel>` tag attributes.
+/// Meta keys must be identifier-shaped; others are dropped by Claude Code.
+type Event = (String, Vec<(&'static str, String)>);
 
 pub async fn watch_mcp_cmd(pr: Option<String>, interval: u64, demo: bool) -> i32 {
     let (tx, mut rx) = unbounded_channel::<Value>();
@@ -138,10 +146,10 @@ pub async fn watch_mcp_cmd(pr: Option<String>, interval: u64, demo: bool) -> i32
     0
 }
 
-fn channel_event(tx: &UnboundedSender<Value>, content: String, meta: &[(&str, String)]) {
+fn send_event(tx: &UnboundedSender<Value>, (content, meta): Event) {
     let meta: serde_json::Map<String, Value> = meta
-        .iter()
-        .map(|(k, v)| (k.to_string(), Value::String(v.clone())))
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), Value::String(v)))
         .collect();
     let _ = tx.send(json!({
         "jsonrpc": "2.0",
@@ -152,12 +160,14 @@ fn channel_event(tx: &UnboundedSender<Value>, content: String, meta: &[(&str, St
 
 async fn demo_loop(tx: UnboundedSender<Value>) {
     tokio::time::sleep(Duration::from_secs(3)).await;
-    channel_event(
+    send_event(
         &tx,
-        "Demo event from `dragonfly watch-mcp --demo`: channel plumbing works. \
-         Acknowledge this event to the user, then continue."
-            .to_string(),
-        &[("kind", "demo".to_string())],
+        (
+            "Demo event from `dragonfly watch-mcp --demo`: channel plumbing works. \
+             Acknowledge this event to the user, then continue."
+                .to_string(),
+            vec![("kind", "demo".to_string())],
+        ),
     );
     // Stay alive: exiting here would surface as a failed MCP server in /mcp.
     std::future::pending::<()>().await;
@@ -201,7 +211,7 @@ struct CiState {
     /// cancel-supersedes the old head's runs, so a cancelled set only counts
     /// as terminal when the identical set survives a second poll.
     cancel_settle: Option<Vec<String>>,
-    /// First fetch after (re)anchoring absorbs state silently.
+    /// First non-empty fetch after session start absorbs state silently.
     baseline: bool,
 }
 
@@ -228,6 +238,7 @@ async fn poll_loop(tx: UnboundedSender<Value>, pr_arg: Option<String>, interval:
         match &mut ci {
             None => {
                 if let Some((sha, branch)) = crate::resolve_watch_anchor(pr_arg.clone()).await {
+                    eprintln!("pr-watch: anchored on {} (branch {branch})", short(&sha));
                     let anchor = match &pr_arg {
                         Some(p) => WatchAnchor::Pr(p.clone()),
                         None => WatchAnchor::Branch(branch),
@@ -246,6 +257,7 @@ async fn poll_loop(tx: UnboundedSender<Value>, pr_arg: Option<String>, interval:
                 if let Some(head) = state.anchor.current_head().await
                     && head != state.sha
                 {
+                    eprintln!("pr-watch: new push {}, re-anchoring", short(&head));
                     state.sha = head;
                     state.buckets.clear();
                     state.settled_announced = false;
@@ -258,31 +270,52 @@ async fn poll_loop(tx: UnboundedSender<Value>, pr_arg: Option<String>, interval:
         }
 
         if let Some(state) = &mut ci {
-            poll_ci(&tx, state, pr_number.as_deref()).await;
+            let checks: Vec<PrCheck> = checks_for_sha(&state.sha)
+                .await
+                .into_iter()
+                .filter(|c| !crate::WATCH_IGNORED_CHECKS.contains(&c.name.as_str()))
+                .collect();
+            for ev in ci_events(state, &checks, pr_number.as_deref()) {
+                send_event(&tx, ev);
+            }
         }
 
         if pr_number.is_none() {
             pr_number = crate::resolve_pr_number(pr_arg.clone()).await;
+            if let Some(pr) = &pr_number {
+                eprintln!("pr-watch: watching PR #{pr}");
+            }
         }
         if let Some(pr) = &pr_number {
             if owner_repo.is_none() {
                 owner_repo = resolve_owner_repo(pr).await;
             }
             if let Some((owner, repo)) = &owner_repo {
-                let fetched = poll_comments(
-                    &tx,
-                    owner,
-                    repo,
-                    pr,
-                    &self_login,
-                    &mut seen_comments,
-                    comments_baselined,
-                )
-                .await;
-                // Only a successful fetch establishes the baseline; treating
-                // a transient gh failure as one would replay the entire
-                // comment history as "new" on the next success.
-                comments_baselined = comments_baselined || fetched;
+                if let Some((threads_json, issues_json)) =
+                    fetch_comments_json(owner, repo, pr).await
+                {
+                    let events = comment_events(
+                        &threads_json,
+                        &issues_json,
+                        pr,
+                        &self_login,
+                        &mut seen_comments,
+                        comments_baselined,
+                    );
+                    if !comments_baselined {
+                        eprintln!(
+                            "pr-watch: comment baseline for #{pr}: {} comments",
+                            seen_comments.len()
+                        );
+                    }
+                    // Only a successful fetch establishes the baseline;
+                    // treating a transient gh failure as one would replay the
+                    // entire comment history as "new" on the next success.
+                    comments_baselined = true;
+                    for ev in events {
+                        send_event(&tx, ev);
+                    }
+                }
             }
         }
 
@@ -300,18 +333,35 @@ async fn resolve_owner_repo(pr: &str) -> Option<(String, String)> {
     Some((parts[3].to_string(), parts[4].to_string()))
 }
 
-async fn poll_ci(tx: &UnboundedSender<Value>, state: &mut CiState, pr: Option<&str>) {
-    let checks: Vec<PrCheck> = checks_for_sha(&state.sha)
-        .await
-        .into_iter()
-        .filter(|c| !crate::WATCH_IGNORED_CHECKS.contains(&c.name.as_str()))
-        .collect();
-    if checks.is_empty() {
-        return; // no runs registered yet, or a transient gh failure
+async fn fetch_comments_json(owner: &str, repo: &str, pr: &str) -> Option<(String, String)> {
+    let threads_cmd = format!(
+        "gh api graphql -f query='{}' -f owner='{owner}' -f repo='{repo}' -F pr={pr}",
+        crate::REVIEW_THREADS_QUERY
+    );
+    let issues_cmd = format!("gh api repos/{owner}/{repo}/issues/{pr}/comments --paginate");
+    let (threads, issues) = tokio::join!(sh(&threads_cmd), sh(&issues_cmd));
+    match (threads, issues) {
+        (Some(t), Some(i)) => Some((t, i)),
+        _ => {
+            eprintln!("pr-watch: comment fetch failed for #{pr} (transient?)");
+            None
+        }
     }
+}
+
+/// Diff freshly fetched checks against the last poll's state.
+///
+/// Emits ci_check_failed for every check newly entering `fail`, and one
+/// ci_settled tally when no check is pending anymore. The baseline poll
+/// absorbs pre-session state silently, including an already-settled run.
+fn ci_events(state: &mut CiState, checks: &[PrCheck], pr: Option<&str>) -> Vec<Event> {
+    if checks.is_empty() {
+        return Vec::new(); // no runs registered yet, or a transient gh failure
+    }
+    let mut events = Vec::new();
     let pr_label = pr.map(|p| format!("PR #{p}, ")).unwrap_or_default();
 
-    for c in &checks {
+    for c in checks {
         let prev = state.buckets.get(&c.name).map(String::as_str);
         if !state.baseline && c.bucket == "fail" && prev != Some("fail") {
             let mut content = format!(
@@ -326,15 +376,14 @@ async fn poll_ci(tx: &UnboundedSender<Value>, state: &mut CiState, pr: Option<&s
                 content += &format!("\n{}", c.link);
             }
             content += "\nRun `dragonfly ci failures` for the error log.";
-            channel_event(
-                tx,
+            events.push((
                 content,
-                &[
+                vec![
                     ("kind", "ci_check_failed".to_string()),
                     ("check", c.name.clone()),
                     ("sha", short(&state.sha).to_string()),
                 ],
-            );
+            ));
         }
         state.buckets.insert(c.name.clone(), c.bucket.clone());
     }
@@ -385,43 +434,36 @@ async fn poll_ci(tx: &UnboundedSender<Value>, state: &mut CiState, pr: Option<&s
             } else {
                 "."
             };
-            channel_event(
-                tx,
+            events.push((
                 content,
-                &[
+                vec![
                     ("kind", "ci_settled".to_string()),
                     ("sha", short(&state.sha).to_string()),
                     ("failed", failed.len().to_string()),
                 ],
-            );
+            ));
         }
         state.settled_announced = true;
     }
     state.baseline = false;
+    events
 }
 
-/// Returns true when both fetches succeeded (baseline may be established).
-async fn poll_comments(
-    tx: &UnboundedSender<Value>,
-    owner: &str,
-    repo: &str,
+/// Diff fetched review-thread + issue comments against the seen set.
+///
+/// Every comment id is recorded in `seen`; ids first observed after the
+/// baseline (and not authored by `self_login`) become events.
+fn comment_events(
+    threads_json: &str,
+    issues_json: &str,
     pr: &str,
     self_login: &str,
     seen: &mut HashSet<String>,
     baselined: bool,
-) -> bool {
-    let threads_cmd = format!(
-        "gh api graphql -f query='{}' -f owner='{owner}' -f repo='{repo}' -F pr={pr}",
-        crate::REVIEW_THREADS_QUERY
-    );
-    let issues_cmd =
-        format!("gh api repos/{owner}/{repo}/issues/{pr}/comments --paginate");
-    let (threads_out, issues_out) = tokio::join!(sh(&threads_cmd), sh(&issues_cmd));
-    let (Some(threads_out), Some(issues_out)) = (threads_out, issues_out) else {
-        return false;
-    };
+) -> Vec<Event> {
+    let mut events = Vec::new();
 
-    let threads = serde_json::from_str::<GqlThreadsResponse>(&threads_out)
+    let threads = serde_json::from_str::<GqlThreadsResponse>(threads_json)
         .ok()
         .and_then(|r| r.data)
         .and_then(|d| d.repository)
@@ -445,23 +487,22 @@ async fn poll_comments(
                 _ => String::new(),
             };
             let status = if t.is_resolved { "resolved" } else { "unresolved" };
-            channel_event(
-                tx,
+            events.push((
                 format!(
                     "New review comment by {author}{loc} (thread {}, {status}):\n{}",
                     t.id,
                     truncate_body(&c.body)
                 ),
-                &[
+                vec![
                     ("kind", "review_comment".to_string()),
                     ("author", author.to_string()),
                     ("thread_id", t.id.clone()),
                 ],
-            );
+            ));
         }
     }
 
-    if let Some(issue_comments) = crate::parse_json::<Vec<IssueComment>>(&issues_out) {
+    if let Some(issue_comments) = crate::parse_json::<Vec<IssueComment>>(issues_json) {
         for c in issue_comments {
             let key = format!("issue-{}", c.id);
             if !seen.insert(key) {
@@ -475,18 +516,172 @@ async fn poll_comments(
             if body.trim().is_empty() {
                 continue;
             }
-            channel_event(
-                tx,
+            events.push((
                 format!(
                     "New PR comment by {author} on #{pr}:\n{}",
                     truncate_body(&body)
                 ),
-                &[
+                vec![
                     ("kind", "pr_comment".to_string()),
                     ("author", author.to_string()),
                 ],
-            );
+            ));
         }
     }
-    true
+    events
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(name: &str, bucket: &str) -> PrCheck {
+        serde_json::from_str(&format!(
+            r#"{{"name":"{name}","bucket":"{bucket}","link":"","workflow":"","description":""}}"#
+        ))
+        .unwrap()
+    }
+
+    fn fresh_state(baseline: bool) -> CiState {
+        CiState {
+            anchor: WatchAnchor::Branch("b".into()),
+            sha: "abcdef1234".into(),
+            buckets: HashMap::new(),
+            settled_announced: false,
+            cancel_settle: None,
+            baseline,
+        }
+    }
+
+    fn kinds(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .map(|(_, m)| {
+                m.iter()
+                    .find(|(k, _)| *k == "kind")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ci_baseline_absorbs_even_failures_then_transitions_fire() {
+        let mut state = fresh_state(true);
+        // Baseline: an already-red already-settled run stays silent.
+        let evs = ci_events(&mut state, &[check("a", "fail"), check("b", "pass")], None);
+        assert!(evs.is_empty());
+        assert!(state.settled_announced);
+
+        // A check flipping to fail later is news.
+        let evs = ci_events(&mut state, &[check("a", "fail"), check("b", "fail")], None);
+        assert_eq!(kinds(&evs), ["ci_check_failed"]);
+        assert!(evs[0].0.contains(": b"));
+    }
+
+    #[test]
+    fn ci_pending_to_settled_emits_tally() {
+        let mut state = fresh_state(true);
+        assert!(ci_events(&mut state, &[check("a", "pending")], Some("42")).is_empty());
+        let evs = ci_events(&mut state, &[check("a", "pass")], Some("42"));
+        assert_eq!(kinds(&evs), ["ci_settled"]);
+        assert!(evs[0].0.contains("PR #42"));
+        assert!(evs[0].0.contains("All green"));
+        // Settle announced once.
+        assert!(ci_events(&mut state, &[check("a", "pass")], Some("42")).is_empty());
+    }
+
+    #[test]
+    fn ci_fail_then_settle_in_one_poll() {
+        let mut state = fresh_state(true);
+        assert!(
+            ci_events(&mut state, &[check("a", "pending"), check("b", "pending")], None)
+                .is_empty()
+        );
+        let evs = ci_events(&mut state, &[check("a", "fail"), check("b", "pass")], None);
+        assert_eq!(kinds(&evs), ["ci_check_failed", "ci_settled"]);
+        assert!(evs[1].0.contains("1 failed (a)"));
+    }
+
+    #[test]
+    fn ci_cancelled_set_needs_two_polls_to_settle() {
+        let mut state = fresh_state(true);
+        assert!(ci_events(&mut state, &[check("a", "pending")], None).is_empty());
+        // First poll with the cancelled set: debounced, no settle.
+        assert!(ci_events(&mut state, &[check("a", "cancelled")], None).is_empty());
+        // Identical set again: settles.
+        let evs = ci_events(&mut state, &[check("a", "cancelled")], None);
+        assert_eq!(kinds(&evs), ["ci_settled"]);
+        assert!(evs[0].0.contains("cancelled (a)"));
+    }
+
+    #[test]
+    fn ci_empty_fetch_keeps_baseline_pending() {
+        let mut state = fresh_state(true);
+        assert!(ci_events(&mut state, &[], None).is_empty());
+        // Baseline unconsumed: the first real fetch is still silent.
+        assert!(state.baseline);
+        assert!(ci_events(&mut state, &[check("a", "fail")], None).is_empty());
+        assert!(!state.baseline);
+    }
+
+    const THREADS: &str = r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[
+        {"id":"PRRT_1","isResolved":false,"isOutdated":false,"path":"src/a.rs","line":7,
+         "comments":{"nodes":[
+            {"id":"C_1","author":{"login":"reviewer"},"body":"needs a guard","createdAt":null},
+            {"id":"C_2","author":{"login":"me"},"body":"fixed","createdAt":null}
+         ]}}
+    ]}}}}}"#;
+
+    const ISSUES: &str = r#"[
+        {"id":11,"user":{"login":"botty"},"body":"deploy preview ready"},
+        {"id":12,"user":{"login":"me"},"body":"thanks"}
+    ]"#;
+
+    #[test]
+    fn comments_baseline_is_silent_then_new_ids_fire() {
+        let mut seen = HashSet::new();
+        // Pre-baseline pass records everything, emits nothing.
+        let evs = comment_events(THREADS, ISSUES, "42", "me", &mut seen, false);
+        assert!(evs.is_empty());
+        assert_eq!(seen.len(), 4);
+        // Same payload again: all seen, nothing new.
+        assert!(comment_events(THREADS, ISSUES, "42", "me", &mut seen, true).is_empty());
+
+        // A new non-self review comment and a new self issue comment arrive.
+        let threads2 = THREADS.replace(
+            r#"{"id":"C_1","#,
+            r#"{"id":"C_3","author":{"login":"reviewer"},"body":"still broken","createdAt":null},{"id":"C_1","#,
+        );
+        let issues2 = ISSUES.replace(
+            r#"{"id":11,"#,
+            r#"{"id":13,"user":{"login":"me"},"body":"self reply"},{"id":11,"#,
+        );
+        let evs = comment_events(&threads2, &issues2, "42", "me", &mut seen, true);
+        assert_eq!(kinds(&evs), ["review_comment"]);
+        assert!(evs[0].0.contains("still broken"));
+        assert!(evs[0].0.contains("src/a.rs:7"));
+        assert!(evs[0].0.contains("PRRT_1"));
+    }
+
+    #[test]
+    fn comments_self_filter_off_when_login_empty() {
+        let mut seen = HashSet::new();
+        comment_events(THREADS, ISSUES, "42", "", &mut seen, false);
+        let issues2 = ISSUES.replace(
+            r#"{"id":11,"#,
+            r#"{"id":13,"user":{"login":"me"},"body":"self reply"},{"id":11,"#,
+        );
+        let evs = comment_events(THREADS, &issues2, "42", "", &mut seen, true);
+        assert_eq!(kinds(&evs), ["pr_comment"]);
+        assert!(evs[0].0.contains("self reply"));
+    }
+
+    #[test]
+    fn truncate_body_caps_long_comments() {
+        let long = "x".repeat(MAX_BODY + 100);
+        let out = truncate_body(&long);
+        assert!(out.ends_with("[... truncated]"));
+        assert!(out.len() < long.len());
+    }
 }

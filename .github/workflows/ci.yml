@@ -2,7 +2,9 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    # watch-mcp-channel: temporary, lets the dragonfly-watcher E2E test see
+    # real check runs on this branch without a PR. Remove before merge.
+    branches: [main, watch-mcp-channel]
 jobs:
   test:
     runs-on: ubuntu-latest
