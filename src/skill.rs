@@ -174,6 +174,13 @@ For each bot comment:
     dragonfly pr comment --body "..."   # or --body - to read from stdin
     ```
 
+### Comment wording
+
+When responding to PR comments by humans, only ever respond with concise wording like "Fixed in <commit>" (for simple things) or something like "Fixed in <commit>, X now does Y" (for more complex things).
+Never include rationale, the comment should read as an informational statement, not a conversation.
+
+When responding to bots, rationale can be included if the issue was a false-positive, so that they do not report the same thing again later.
+
 ## Phase 6: Custom review
 
 If CI is passing and the PR is not marked as ready for review yet, run a
@@ -190,6 +197,13 @@ hunt for, and any context the hook can't provide.
 Also spawn a single `comment-reviewer` subagent for comment and
 documentation quality. Like the review-agent, its context arrives via the
 hook; it typically needs no additional instructions.
+
+Also spawn a single `dedup-reviewer` subagent for code duplication. The hook
+injects a dedup-tailored context with the full hint list inlined, so it
+needs no extra instructions. It validates each hinted pair (dismissing false
+positives itself via `dragonfly dedup dismiss`) and also hunts for
+duplication the hint pipeline cannot see: repeats within the PR itself,
+non-Go code, sub-function copies.
 
 If you think there's some risk of deployment edge cases, start a `review-agent` to evaluate this.
 The system is deployed gradually, with new backends spinning up over a period of ~10 minutes,
@@ -211,14 +225,16 @@ After changes have been approved and fixed, re-run `review-agent` to see if it f
 
 ## Potential duplicates
 
-If the instructions contain a `<potential-duplicates>` block, read each hinted
-pair of functions:
+The pre-collected `dedup` file (when present) lists changed functions whose
+behavior looks similar to existing ones — embedding hints, not verdicts. The
+`dedup-reviewer` subagent spawned in Phase 6 owns them: it receives the full
+hint list inline via its hook context, reads each hinted pair, dismisses
+false positives itself, and reports genuine duplicates and any other
+duplication it finds. Don't have other subagents re-check the hints; you
+don't need to read the file yourself.
 
-- **Genuine duplication** → report it under "Dedup candidates" in the Phase 8
-  summary. Don't refactor unless the user asks.
-- **False positive** → `dragonfly dedup dismiss '<changed-func>' ['<match>'...]`
-  (identities exactly as printed; no match args = all listed matches).
-  Dismissals persist across worktrees, so only dismiss pairs you verified.
+Report verified genuine duplicates under "Dedup candidates" in the Phase 8
+summary; don't refactor them unless the user asks.
 
 `dragonfly dedup` re-lists candidates; `dragonfly dedup exclusions` shows
 dismissed pairs.
@@ -300,7 +316,7 @@ It pulls the session token from browser cookies automatically — no setup. Then
 Report a summary:
 - **CI**: Final status of all checks
 - **Fixes applied**: List of commits made to fix CI or bot issues. Remember that CI issues unrelated to this PR should not be fixed, but the user should be informed.
-- **Dedup candidates**: Verified genuine duplicates from the `<potential-duplicates>` block (function, existing counterpart, suggested direction). Omit the section if there were none.
+- **Dedup candidates**: Verified genuine duplicates from the pre-collected `dedup` hints file (function, existing counterpart, suggested direction). Omit the section if there were none.
 - **Remaining items**: Any unresolved bot comments or issues needing user input
 - **PR URL**: Link to the PR
 

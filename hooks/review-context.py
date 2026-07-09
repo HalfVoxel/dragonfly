@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """SubagentStart hook for Claude Code.
 
-When a `review-agent` or `comment-reviewer` subagent (see agents/) is
-spawned by the parent dragonfly flow, this hook shells out to
-    dragonfly prompt review-agent [--inline-diffs]
+When a `review-agent`, `comment-reviewer`, or `dedup-reviewer` subagent
+(see agents/) is spawned by the parent dragonfly flow, this hook shells out to
+    dragonfly prompt review-agent [--inline-diffs]   # review/comment agents
+    dragonfly prompt dedup-reviewer                  # dedup agent
 and pipes stdout through to the subagent. Claude Code delivers a
 SubagentStart hook's stdout to the subagent as a system reminder before
 its first turn (documented for SessionStart / Setup / SubagentStart in
 [hooks docs](https://code.claude.com/docs/en/hooks)).
 
 `comment-reviewer` gets `--inline-diffs` (full diffs inlined in the
-context); `review-agent` gets the default /tmp diff-file references.
+context); `review-agent` gets the default /tmp diff-file references;
+`dedup-reviewer` gets its own context with the full duplicate-function
+hint list inlined.
 
 The orchestration heavy-lifting — assembling commit list, changed files,
 per-file diff files, and the scored <relevant-context> block — lives in
@@ -24,8 +27,8 @@ that context (manual `claude` invocation against this settings file)
 the subprocess will simply fail and we exit 0 — failing open is
 preferable to breaking the parent's review flow.
 
-Two matchers in settings/dragonfly-settings.json gate this hook on
-agent_type "review-agent" and "comment-reviewer"; the hook keys the
+Matchers in settings/dragonfly-settings.json gate this hook on agent_type
+"review-agent", "comment-reviewer", and "dedup-reviewer"; the hook keys the
 --inline-diffs flag off that same agent_type.
 """
 
@@ -73,12 +76,16 @@ def main() -> int:
         )
         return 0
 
-    # comment-reviewer is tuned to read full diffs inlined in its prompt;
-    # review-agent reads the /tmp diff-file references. Pick the mode by
-    # agent_type so only the comment reviewer pays the larger inlined context.
-    cmd = [bin_path, "prompt", "review-agent"]
-    if payload.get("agent_type") == "comment-reviewer":
-        cmd.append("--inline-diffs")
+    # dedup-reviewer has its own tailored context (full hint list inlined);
+    # the other reviewers share the review-agent context, with only the
+    # comment reviewer paying for inlined diffs.
+    agent_type = payload.get("agent_type")
+    if agent_type == "dedup-reviewer":
+        cmd = [bin_path, "prompt", "dedup-reviewer"]
+    else:
+        cmd = [bin_path, "prompt", "review-agent"]
+        if agent_type == "comment-reviewer":
+            cmd.append("--inline-diffs")
 
     try:
         # cwd defaults to the subagent's cwd (same as parent's main cwd),

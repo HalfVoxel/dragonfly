@@ -35,6 +35,11 @@ struct Cli {
     #[arg(long)]
     title: Option<String>,
 
+    /// Additional guidance for the agent, appended to the end of the main
+    /// agent prompt as a <user-guidance> block.
+    #[arg(short = 'm', long = "message", value_name = "MESSAGE")]
+    message: Option<String>,
+
     /// Only run PR area analysis and print the result
     #[arg(long)]
     areas: bool,
@@ -153,18 +158,25 @@ enum PromptTarget {
         #[arg(long)]
         inline_diffs: bool,
     },
+    /// Print the dragonfly-context block injected into dedup-reviewer
+    /// subagents by the SubagentStart hook. Tailored for duplication review:
+    /// commit list, changed files, per-file diff paths, and the full
+    /// duplicate-function hint list inlined.
+    DedupReviewer,
 }
 
 #[derive(Subcommand)]
 enum DedupCommand {
     /// Record that a changed function is NOT a duplicate of some or all of
     /// its currently listed matches. With no MATCH args, dismisses every
-    /// match currently listed for FUNC. Accepts full identities
-    /// (`go/api/pkg/util.(Server).handleFoo`) or a bare function name when
-    /// unambiguous. Dismissed pairs are excluded from all future listings
-    /// (shared across worktrees of this repo).
+    /// match currently listed for FUNC. Pass `-` as FUNC to batch-dismiss
+    /// from stdin: one `<changed-func> [match...]` line per verdict.
+    /// Accepts full identities (`go/api/pkg/util.(Server).handleFoo`) or a
+    /// bare function name when unambiguous. Dismissed pairs are excluded
+    /// from all future listings (shared across worktrees of this repo).
     Dismiss {
-        /// The changed function, as printed by `dragonfly dedup`.
+        /// The changed function, as printed by `dragonfly dedup`, or `-`
+        /// to read batch lines from stdin.
         func: String,
         /// Specific matches to dismiss (default: all currently listed).
         matches: Vec<String>,
@@ -3868,7 +3880,12 @@ async fn collect_context_strings(
 
 // ── Build files index ────────────────────────────────────────────────────────
 
-fn build_files_index(files: &[TempFile], has_conflicts: bool, failed_names: &[String]) -> String {
+fn build_files_index(
+    files: &[TempFile],
+    has_conflicts: bool,
+    failed_names: &[String],
+    dedup_funcs: Option<usize>,
+) -> String {
     let failures_label = if failed_names.is_empty() {
         "CI failure logs (distilled summary; references full log below)".into()
     } else {
@@ -3902,6 +3919,14 @@ fn build_files_index(files: &[TempFile], has_conflicts: bool, failed_names: &[St
             "CI failure logs (full, untruncated raw)".into(),
         ),
         ("lint", "local lint failures".into()),
+        (
+            "dedup",
+            format!(
+                "{} potential duplicated function{} (hints, not verdicts)",
+                dedup_funcs.unwrap_or(0),
+                if dedup_funcs == Some(1) { "" } else { "s" },
+            ),
+        ),
     ]);
 
     let mut index = String::new();
@@ -4568,13 +4593,10 @@ async fn build_review_agent_context(inline_diffs: bool) -> String {
     let base_for_rag = base_ref.clone();
     let rag_fut = async move { build_relevant_context(&base_for_rag).await };
 
-    let base_for_dedup = base_ref.clone();
-    let dedup_fut = async move { dedup::build_block(&base_for_dedup).await };
-
     let ctx_fut = collect_context_strings(&branch_commits, &base_ref);
 
-    let (diff_files_str, full_diffs_vec, relevant_context, dedup_block, ctx) =
-        tokio::join!(diff_files_fut, full_diffs_fut, rag_fut, dedup_fut, ctx_fut);
+    let (diff_files_str, full_diffs_vec, relevant_context, ctx) =
+        tokio::join!(diff_files_fut, full_diffs_fut, rag_fut, ctx_fut);
 
     // Reuse the SHA-keyed pr-areas cache populated by the main prompt
     // build. When this runs standalone (no preceding dragonfly),
@@ -4648,12 +4670,71 @@ async fn build_review_agent_context(inline_diffs: bool) -> String {
             out.push('\n');
         }
     }
-    if let Some(block) = dedup_block {
-        out.push('\n');
-        out.push_str(&block);
-    }
     out.push_str("</dragonfly-context>\n");
     out
+}
+
+/// Builds the `<dragonfly-context>` block for dedup-reviewer subagents and
+/// prints it (implementation of `prompt dedup-reviewer`). Tailored for
+/// duplication review: commit list, files-changed summary, per-file diff
+/// paths, and the full duplicate-function hint list inlined — the subagent's
+/// primary input, so no file indirection. Skips the RAG-scored
+/// `<relevant-context>` (convention excerpts don't help duplication review
+/// and are the slowest leg of the review-agent build), which also makes this
+/// cheap enough to rebuild per invocation: only one dedup-reviewer spawns
+/// per review round, so the review-agent cache+flock machinery buys nothing.
+async fn dedup_reviewer_prompt_cmd() -> i32 {
+    let base_ref = pr_base_ref().await;
+    let log_cmd = format!("git log {base_ref}..HEAD --oneline");
+    let (branch, branch_commits) = tokio::join!(sh("git branch --show-current"), sh(&log_cmd));
+
+    let changed_files = get_changed_files(&base_ref).await;
+    let relevant: Vec<String> = filter_relevant_files(&changed_files)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    let base_for_diffs = base_ref.clone();
+    let diff_files_fut = async move {
+        let r: Vec<&str> = relevant.iter().map(String::as_str).collect();
+        write_diff_files(&r, &base_for_diffs).await
+    };
+    let hints_fut = dedup::build_inline_block(&base_ref);
+    let ctx_fut = collect_context_strings(&branch_commits, &base_ref);
+
+    let (diff_files_str, hints_block, ctx) = tokio::join!(diff_files_fut, hints_fut, ctx_fut);
+
+    let branch = branch.unwrap_or_default();
+    let mut out = String::from("<dragonfly-context>\n");
+    out.push_str(&format!(
+        "Branch: `{}`  (base: `{}`)\n",
+        if branch.is_empty() {
+            "(detached)".to_string()
+        } else {
+            branch
+        },
+        base_ref,
+    ));
+    out.push_str(&ctx.pr_commits);
+    out.push_str(&ctx.changed_files);
+    if !diff_files_str.is_empty() {
+        out.push_str("\nPer-file diff files:\n");
+        out.push_str(&diff_files_str);
+    } else {
+        out.push_str("\n(no per-file diffs against base — review may be unnecessary)\n");
+    }
+    match hints_block {
+        Some(block) => {
+            out.push('\n');
+            out.push_str(&block);
+        }
+        None => out.push_str(
+            "\n(no duplicate-function hints for this PR — focus on the broader duplication hunt)\n",
+        ),
+    }
+    out.push_str("</dragonfly-context>\n");
+    print!("{out}");
+    0
 }
 
 /// Implementation of `prompt review-agent`. Serializes parallel callers
@@ -5118,6 +5199,7 @@ fn dragonfly_settings_expanded() -> String {
 // user's project. Agent bodies are bundled with the binary.
 const REVIEW_AGENT_MD: &str = include_str!("../agents/review-agent.md");
 const COMMENT_REVIEWER_MD: &str = include_str!("../agents/comment-reviewer.md");
+const DEDUP_REVIEWER_MD: &str = include_str!("../agents/dedup-reviewer.md");
 // Bundled so the `@../code-comments.md` reference in agent bodies can be
 // inlined at registration time. See [expand_bundled_refs].
 const CODE_COMMENTS_MD: &str = include_str!("../code-comments.md");
@@ -5125,7 +5207,7 @@ const CODE_COMMENTS_MD: &str = include_str!("../code-comments.md");
 /// Subagent definitions registered via `claude --agents`. Each is keyed in
 /// the resulting object by its frontmatter `name`, which is the
 /// `subagent_type` the parent agent passes to the Agent tool.
-const BUNDLED_AGENTS: &[&str] = &[REVIEW_AGENT_MD, COMMENT_REVIEWER_MD];
+const BUNDLED_AGENTS: &[&str] = &[REVIEW_AGENT_MD, COMMENT_REVIEWER_MD, DEDUP_REVIEWER_MD];
 
 /// Minimal YAML-frontmatter splitter for agent markdown files. Only handles
 /// the subset our agent files actually use: a leading `---\n...\n---\n`
@@ -5358,7 +5440,6 @@ fn build_prompt(
     graphite_str: &str,
     agent_sessions_str: &str,
     relevant_context_str: &str,
-    potential_duplicates_str: &str,
     review_only_note: Option<&str>,
     push_code: i32,
 ) -> String {
@@ -5429,7 +5510,7 @@ fn build_prompt(
          {}{}{}\n\
          Per-file diffs:\n\
          {diff_files_str}{pr_areas_str}\n\
-         {relevant_context_str}{potential_duplicates_str}\n\
+         {relevant_context_str}\n\
          Phase 1 (push):\n\
          {phase1}\n\n\
          Phase 2/3:\n\
@@ -5538,6 +5619,7 @@ async fn build_claude_invocation(
     force: bool,
     non_interactive: bool,
     title_flag: Option<String>,
+    user_message: Option<String>,
 ) -> ClaudeInvocation {
     assert_head_runnable().await;
     // Resolve PR ownership before push() so the rebase prompt inside
@@ -5581,7 +5663,8 @@ async fn build_claude_invocation(
     // Dedup hints overlap with CI watch too — a cold summary cache can take
     // many minutes, but the CI wait dominates and a warm cache is seconds.
     let base_ref_for_dedup = base_ref.clone();
-    let dedup_handle = tokio::spawn(async move { dedup::build_block(&base_ref_for_dedup).await });
+    let dedup_handle =
+        tokio::spawn(async move { dedup::build_hints_file(&base_ref_for_dedup).await });
 
     // Run area analysis in parallel with PR/CI checks. The PR-areas LLM
     // call needs the inline diff content (kit has no tool-use, so we
@@ -5756,7 +5839,18 @@ async fn build_claude_invocation(
         (None, None) => {}
     }
 
-    let files_index = build_files_index(&files, merge.has_conflicts, &failed_names);
+    // Spawned right after push; by now the CI wait has usually absorbed the
+    // dedup latency, so this await is close to free.
+    let dedup_hints = dedup_handle.await.ok().flatten();
+    let dedup_funcs = dedup_hints.as_ref().map(|h| h.funcs);
+    if let Some(h) = dedup_hints {
+        files.push(TempFile {
+            path: h.path,
+            lines: h.lines,
+        });
+    }
+
+    let files_index = build_files_index(&files, merge.has_conflicts, &failed_names, dedup_funcs);
 
     let (prior_reviews, review_instruction) = get_review_log_context(&pr_info.number);
     // The review prompt instructs the model to output exactly "No issues found."
@@ -5835,12 +5929,6 @@ async fn build_claude_invocation(
     let agent_sessions_str = sessions::render_section(&agent_sessions, &push_result.branch);
 
     let relevant_context_str = relevant_context_handle.await.unwrap_or_default();
-    let potential_duplicates_str = dedup_handle
-        .await
-        .ok()
-        .flatten()
-        .map(|b| format!("\n{b}"))
-        .unwrap_or_default();
 
     let prompt = build_prompt(
         pr_status,
@@ -5857,7 +5945,6 @@ async fn build_claude_invocation(
         &graphite_str,
         &agent_sessions_str,
         &relevant_context_str,
-        &potential_duplicates_str,
         review_only_note.as_deref(),
         push_result.code,
     );
@@ -5865,6 +5952,16 @@ async fn build_claude_invocation(
         format!("{NON_INTERACTIVE_NOTE}\n{prompt}")
     } else {
         prompt
+    };
+    // Last so it wins recency: guidance like "skip Phase 6" must not be
+    // buried under the pre-collected data sections above.
+    let prompt = match &user_message {
+        Some(msg) => format!(
+            "{prompt}\n\
+             The user has provided additional guidance which may be relevant for the review:\n\
+             <user-guidance>\n{msg}\n</user-guidance>\n"
+        ),
+        None => prompt,
     };
 
     // Put our own binary on PATH so the agent can call dragonfly subcommands
@@ -5968,7 +6065,8 @@ async fn main() {
             }
             CliCommand::Prompt { target: None } => {
                 let invocation =
-                    build_claude_invocation(cli.force, cli.non_interactive, cli.title).await;
+                    build_claude_invocation(cli.force, cli.non_interactive, cli.title, cli.message)
+                        .await;
                 println!("{}", invocation.prompt);
             }
             CliCommand::Prompt {
@@ -5980,6 +6078,12 @@ async fn main() {
                 target: Some(PromptTarget::ReviewAgent { inline_diffs }),
             } => {
                 let code = review_agent_prompt_cmd(inline_diffs).await;
+                std::process::exit(code);
+            }
+            CliCommand::Prompt {
+                target: Some(PromptTarget::DedupReviewer),
+            } => {
+                let code = dedup_reviewer_prompt_cmd().await;
                 std::process::exit(code);
             }
             CliCommand::Guides { paths } => {
@@ -6023,7 +6127,8 @@ async fn main() {
     }
 
     let non_interactive = cli.non_interactive;
-    let invocation = build_claude_invocation(cli.force, non_interactive, cli.title).await;
+    let invocation =
+        build_claude_invocation(cli.force, non_interactive, cli.title, cli.message).await;
 
     if non_interactive {
         println!("   Running Claude Code (print mode, non-interactive)...\n");

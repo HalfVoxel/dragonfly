@@ -45,8 +45,6 @@ const EMBED_CONCURRENCY: usize = 6;
 // Neutralizes the "which object" signal so same-receiver methods don't
 // cluster on the receiver type alone.
 const GENERIC_RECV: &str = "(_ R)";
-// Cap on changed functions rendered into <potential-duplicates>.
-const BLOCK_MAX_FUNCS: usize = 20;
 
 const SUMMARY_SYSTEM_PROMPT: &str = "You summarize what each Go function does in one terse line \
     describing its specific operation and effect. Ignore the receiver, the function name, \
@@ -901,9 +899,9 @@ struct Exclusions {
     pairs: Vec<ExclusionPair>,
 }
 
-/// Key exclusions by normalized origin URL so every worktree of the same
-/// repo shares one file. Falls back to the toplevel path for remoteless
-/// repos.
+/// Key per-repo state by normalized origin URL so every worktree of the
+/// same repo shares one directory. Falls back to the toplevel path for
+/// remoteless repos.
 async fn repo_key() -> String {
     let raw = match crate::sh("git remote get-url origin").await {
         Some(url) if !url.is_empty() => url,
@@ -925,20 +923,54 @@ async fn repo_key() -> String {
         .to_string()
 }
 
-async fn exclusions_path() -> PathBuf {
-    dedup_dir().join("repos").join(repo_key().await).join("exclusions.json")
+async fn repo_dir() -> PathBuf {
+    dedup_dir().join("repos").join(repo_key().await)
+}
+
+async fn exclusions_jsonl_path() -> PathBuf {
+    repo_dir().await.join("exclusions.jsonl")
 }
 
 async fn load_exclusions() -> Exclusions {
-    std::fs::read(exclusions_path().await)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    let dir = repo_dir().await;
+    let mut pairs: Vec<ExclusionPair> = Vec::new();
+    // Legacy single-file format; still read so pre-JSONL dismissals keep
+    // applying. New dismissals only ever append to the JSONL.
+    if let Ok(b) = std::fs::read(dir.join("exclusions.json"))
+        && let Ok(e) = serde_json::from_slice::<Exclusions>(&b)
+    {
+        pairs.extend(e.pairs);
+    }
+    if let Ok(s) = std::fs::read_to_string(dir.join("exclusions.jsonl")) {
+        // A torn line from an interrupted append must not poison the rest.
+        pairs.extend(s.lines().filter_map(|l| serde_json::from_str(l).ok()));
+    }
+    let mut seen = HashSet::new();
+    pairs.retain(|p| seen.insert(pair_key(&p.a, &p.b)));
+    Exclusions { pairs }
 }
 
-async fn save_exclusions(e: &Exclusions) -> Result<(), String> {
-    let data = serde_json::to_vec_pretty(e).map_err(|e| e.to_string())?;
-    save_atomic(&exclusions_path().await, &data).map_err(|e| e.to_string())
+/// Record dismissed pairs by appending JSONL lines in a single write.
+/// O_APPEND keeps concurrent dismiss processes from losing each other's
+/// records; the previous read-modify-write of exclusions.json silently
+/// dropped the slower writer's pairs.
+async fn append_exclusions(new: &[ExclusionPair]) -> Result<(), String> {
+    use std::io::Write as _;
+    let path = exclusions_jsonl_path().await;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let mut buf = String::new();
+    for p in new {
+        buf.push_str(&serde_json::to_string(p).map_err(|e| e.to_string())?);
+        buf.push('\n');
+    }
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(buf.as_bytes()))
+        .map_err(|e| e.to_string())
 }
 
 fn pair_key(a: &str, b: &str) -> (String, String) {
@@ -951,7 +983,7 @@ fn pair_key(a: &str, b: &str) -> (String, String) {
 
 // ── Candidate computation ────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DupMatch {
     pub function: String,
     pub path: String,
@@ -960,7 +992,7 @@ pub struct DupMatch {
     pub summary: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct FnCandidates {
     pub function: String,
     pub path: String,
@@ -969,11 +1001,55 @@ pub struct FnCandidates {
     pub matches: Vec<DupMatch>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct DedupReport {
+    /// HEAD sha the report was computed at; snapshot reuse requires a match.
+    pub head: String,
     pub base_ref: String,
     pub threshold: f64,
+    pub limit: usize,
     pub changed_total: usize,
     pub candidates: Vec<FnCandidates>,
+}
+
+async fn snapshot_path() -> PathBuf {
+    repo_dir().await.join("last-report.json")
+}
+
+/// Persist a freshly computed report so later `dedup dismiss` calls and the
+/// dedup-reviewer hook can resolve identities without re-running the
+/// pipeline (a fully warm recompute costs ~10s on a large monorepo, and a
+/// partially cold one can block on LLM calls for minutes). Best-effort.
+async fn save_report_snapshot(report: &DedupReport) {
+    if let Ok(data) = serde_json::to_vec(report)
+        && let Err(e) = save_atomic(&snapshot_path().await, &data)
+    {
+        eprintln!("   Warning: failed to write dedup report snapshot: {e}");
+    }
+}
+
+/// Load the last computed report if it still describes the current state:
+/// same HEAD, same resolved base, same threshold and limit. Any mismatch
+/// (new commits, a different worktree's review overwrote the snapshot)
+/// returns None and the caller recomputes.
+async fn load_report_snapshot(
+    base: Option<&str>,
+    threshold: f64,
+    limit: usize,
+) -> Option<DedupReport> {
+    let data = std::fs::read(snapshot_path().await).ok()?;
+    let report: DedupReport = serde_json::from_slice(&data).ok()?;
+    if report.threshold != threshold || report.limit != limit {
+        return None;
+    }
+    if crate::sh("git rev-parse HEAD").await? != report.head {
+        return None;
+    }
+    let want = match base {
+        Some(b) => b.to_string(),
+        None => crate::pr_base_ref().await,
+    };
+    (report.base_ref == want).then_some(report)
 }
 
 async fn git_show(toplevel: &str, base_ref: &str, path: &str) -> Option<Vec<u8>> {
@@ -987,8 +1063,20 @@ async fn git_show(toplevel: &str, base_ref: &str, path: &str) -> Option<Vec<u8>>
 
 /// Run the full pipeline: extract the repo, diff the changed set against
 /// `base_ref`, summarize + embed (cache misses only), and neighbor-query
-/// each changed function against the whole index.
+/// each changed function against the whole index. Persists the result as
+/// the repo's snapshot for [load_report_snapshot] consumers.
 pub async fn compute_report(
+    base_ref: Option<String>,
+    threshold: f64,
+    limit: usize,
+    quiet: bool,
+) -> Result<DedupReport, String> {
+    let report = compute_report_inner(base_ref, threshold, limit, quiet).await?;
+    save_report_snapshot(&report).await;
+    Ok(report)
+}
+
+async fn compute_report_inner(
     base_ref: Option<String>,
     threshold: f64,
     limit: usize,
@@ -997,6 +1085,7 @@ pub async fn compute_report(
     let toplevel = crate::sh("git rev-parse --show-toplevel")
         .await
         .ok_or("not inside a git repository")?;
+    let head = crate::sh("git rev-parse HEAD").await.unwrap_or_default();
     let base_ref = match base_ref {
         Some(b) => b,
         None => crate::pr_base_ref().await,
@@ -1014,8 +1103,10 @@ pub async fn compute_report(
         .collect();
     if changed_files.is_empty() {
         return Ok(DedupReport {
+            head,
             base_ref,
             threshold,
+            limit,
             changed_total: 0,
             candidates: Vec::new(),
         });
@@ -1027,8 +1118,10 @@ pub async fn compute_report(
         .map_err(|e| e.to_string())?;
     if fns.is_empty() {
         return Ok(DedupReport {
+            head,
             base_ref,
             threshold,
+            limit,
             changed_total: 0,
             candidates: Vec::new(),
         });
@@ -1064,8 +1157,10 @@ pub async fn compute_report(
     let changed_total = changed_idx.len();
     if changed_idx.is_empty() {
         return Ok(DedupReport {
+            head,
             base_ref,
             threshold,
+            limit,
             changed_total,
             candidates: Vec::new(),
         });
@@ -1143,8 +1238,10 @@ pub async fn compute_report(
             .total_cmp(&a.matches[0].cosine)
     });
     Ok(DedupReport {
+        head,
         base_ref,
         threshold,
+        limit,
         changed_total,
         candidates,
     })
@@ -1156,28 +1253,104 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 
 // ── Prompt block ─────────────────────────────────────────────────────────────
 
-/// Render the `<potential-duplicates>` block for agent prompts, or None when
-/// there is nothing to show or the pipeline can't run (no ADC, no kit) —
-/// dedup hints are best-effort and must never block a dragonfly run.
-pub async fn build_block(base_ref: &str) -> Option<String> {
-    match compute_report(Some(base_ref.to_string()), DEFAULT_THRESHOLD, DEFAULT_LIMIT, false).await
+/// The full duplicate-function hint list, persisted under /tmp so agents read
+/// it on demand instead of carrying it inline in the prompt.
+pub struct DedupHints {
+    pub path: PathBuf,
+    pub lines: usize,
+    /// Changed functions with at least one candidate match.
+    pub funcs: usize,
+}
+
+/// Write the untruncated hint list to a temp file, or None when there is
+/// nothing to show or the pipeline can't run (no ADC, no kit) — dedup hints
+/// are best-effort and must never block a dragonfly run.
+pub async fn build_hints_file(base_ref: &str) -> Option<DedupHints> {
+    let report = match compute_report(
+        Some(base_ref.to_string()),
+        DEFAULT_THRESHOLD,
+        DEFAULT_LIMIT,
+        false,
+    )
+    .await
     {
-        Ok(report) if !report.candidates.is_empty() => Some(render_block(&report)),
-        Ok(_) => None,
+        Ok(report) if !report.candidates.is_empty() => report,
+        Ok(_) => return None,
         Err(e) => {
-            eprintln!("   Skipping <potential-duplicates> ({e}).");
+            eprintln!("   Skipping dedup hints ({e}).");
+            return None;
+        }
+    };
+    let body = render_hints(&report);
+    match write_hints_file(&body) {
+        Ok(path) => Some(DedupHints {
+            path,
+            lines: body.lines().count(),
+            funcs: report.candidates.len(),
+        }),
+        Err(e) => {
+            eprintln!("   Skipping dedup hints (temp file write failed: {e}).");
             None
         }
     }
 }
 
-fn render_block(report: &DedupReport) -> String {
-    let mut out = String::from("<potential-duplicates>\n");
-    out.push_str(
-        "Changed functions that may duplicate existing ones (hints, not verdicts \u{2014} \
-         read both first):\n\n",
+/// Render the `<potential-duplicates>` block with the full hint list inlined,
+/// for the dedup-reviewer context, or None when there is nothing to show or
+/// the pipeline can't run (no ADC, no kit) — dedup hints are best-effort and
+/// must never block a dragonfly run.
+///
+/// The review process computes the report (and its snapshot) before agents
+/// spawn, so the SubagentStart hook normally renders from the snapshot
+/// instead of paying a recompute.
+pub async fn build_inline_block(base_ref: &str) -> Option<String> {
+    let report = match load_report_snapshot(Some(base_ref), DEFAULT_THRESHOLD, DEFAULT_LIMIT).await
+    {
+        Some(mut r) => {
+            // Drop pairs dismissed since the snapshot was written.
+            let excluded: HashSet<(String, String)> = load_exclusions()
+                .await
+                .pairs
+                .iter()
+                .map(|p| pair_key(&p.a, &p.b))
+                .collect();
+            for c in &mut r.candidates {
+                c.matches
+                    .retain(|m| !excluded.contains(&pair_key(&c.function, &m.function)));
+            }
+            r.candidates.retain(|c| !c.matches.is_empty());
+            Ok(r)
+        }
+        None => {
+            compute_report(
+                Some(base_ref.to_string()),
+                DEFAULT_THRESHOLD,
+                DEFAULT_LIMIT,
+                false,
+            )
+            .await
+        }
+    };
+    match report {
+        Ok(report) if !report.candidates.is_empty() => Some(format!(
+            "<potential-duplicates>\n{}</potential-duplicates>\n",
+            render_hints(&report)
+        )),
+        Ok(_) => None,
+        Err(e) => {
+            eprintln!("   Skipping dedup hints ({e}).");
+            None
+        }
+    }
+}
+
+fn render_hints(report: &DedupReport) -> String {
+    let mut out = format!(
+        "Changed functions that may duplicate existing ones (cosine \u{2265} {:.2} vs `{}`). \
+         Hints, not verdicts \u{2014} read both functions before concluding.\n\n",
+        report.threshold, report.base_ref,
     );
-    for c in report.candidates.iter().take(BLOCK_MAX_FUNCS) {
+    for c in &report.candidates {
         out.push_str(&format!(
             "- `{}` ({}:{}) \u{2014} {}\n",
             c.function, c.path, c.line, c.summary
@@ -1189,18 +1362,18 @@ fn render_block(report: &DedupReport) -> String {
             ));
         }
     }
-    if report.candidates.len() > BLOCK_MAX_FUNCS {
-        out.push_str(&format!(
-            "\n({} more \u{2014} run `dragonfly dedup` for the full list.)\n",
-            report.candidates.len() - BLOCK_MAX_FUNCS
-        ));
-    }
-    out.push_str(
-        "\nReal duplication \u{2192} mention in the final summary (don't refactor unasked). \
-         False positive \u{2192} `dragonfly dedup dismiss '<changed-func>' ['<match>'...]`.\n\
-         </potential-duplicates>\n",
-    );
     out
+}
+
+fn write_hints_file(body: &str) -> std::io::Result<PathBuf> {
+    use std::io::Write as _;
+    let f = tempfile::Builder::new()
+        .prefix("psc-dedup-")
+        .suffix(".md")
+        .tempfile_in("/tmp")?;
+    let (mut file, path) = f.keep().map_err(|e| e.error)?;
+    file.write_all(body.as_bytes())?;
+    Ok(path)
 }
 
 // ── CLI commands ─────────────────────────────────────────────────────────────
@@ -1297,86 +1470,127 @@ pub async fn cmd_dismiss(
     threshold: f64,
     limit: usize,
 ) -> i32 {
-    // Recompute the current candidate set (warm caches make this cheap) so
-    // "dismiss X" can mean "X is not a dup of anything currently listed".
-    let report = match compute_report(base, threshold, limit, true).await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("dedup dismiss: {e}");
+    // `-` batches from stdin: one `<changed-func> [match...]` per line.
+    // Identities never contain whitespace, so plain splitting is safe.
+    let requests: Vec<(String, Vec<String>)> = if func == "-" {
+        let mut input = String::new();
+        if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input) {
+            eprintln!("dedup dismiss: reading stdin: {e}");
             return 1;
         }
+        let reqs: Vec<(String, Vec<String>)> = input
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let mut it = l.split_whitespace().map(String::from);
+                (it.next().unwrap(), it.collect())
+            })
+            .collect();
+        if reqs.is_empty() {
+            eprintln!(
+                "dedup dismiss: no dismissals on stdin (expected `<changed-func> [match...]` lines)."
+            );
+            return 1;
+        }
+        reqs
+    } else {
+        vec![(func, match_refs)]
+    };
+
+    // Resolve against the snapshot of the review's own pipeline run;
+    // recompute only when it no longer matches (new commits, different
+    // base or params). Dismissals must stay cheap: a recompute costs ~10s
+    // warm and can block on LLM calls when partially cold.
+    let report = match load_report_snapshot(base.as_deref(), threshold, limit).await {
+        Some(r) => r,
+        None => match compute_report(base, threshold, limit, true).await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("dedup dismiss: {e}");
+                return 1;
+            }
+        },
     };
     let identities: Vec<&str> = report.candidates.iter().map(|c| c.function.as_str()).collect();
     if identities.is_empty() {
         eprintln!("dedup dismiss: no changed functions currently have candidates.");
         return 1;
     }
-    let target = match resolve_ref(&func, &identities) {
-        Ok(t) => t.to_string(),
-        Err(e) => {
-            eprintln!("dedup dismiss: {e}");
-            return 1;
-        }
-    };
-    let cand = report
-        .candidates
-        .iter()
-        .find(|c| c.function == target)
-        .unwrap();
-    let match_ids: Vec<&str> = cand.matches.iter().map(|m| m.function.as_str()).collect();
-    let dismissed: Vec<String> = if match_refs.is_empty() {
-        match_ids.iter().map(|s| s.to_string()).collect()
-    } else {
-        let mut out = Vec::new();
-        for r in &match_refs {
-            match resolve_ref(r, &match_ids) {
-                Ok(m) => out.push(m.to_string()),
-                Err(e) => {
-                    eprintln!("dedup dismiss: {e}");
-                    return 1;
-                }
-            }
-        }
-        out
-    };
 
-    let mut exclusions = load_exclusions().await;
-    let existing: HashSet<(String, String)> = exclusions
+    let mut existing: HashSet<(String, String)> = load_exclusions()
+        .await
         .pairs
         .iter()
         .map(|p| pair_key(&p.a, &p.b))
         .collect();
     let now = chrono::Local::now().to_rfc3339();
-    let mut added = 0;
-    for m in &dismissed {
-        let (a, b) = pair_key(&target, m);
-        if existing.contains(&(a.clone(), b.clone())) {
-            continue;
+    let mut new_pairs: Vec<ExclusionPair> = Vec::new();
+    let mut failed = 0usize;
+
+    'requests: for (func, match_refs) in &requests {
+        let target = match resolve_ref(func, &identities) {
+            Ok(t) => t.to_string(),
+            Err(e) => {
+                eprintln!("dedup dismiss: {e}");
+                failed += 1;
+                continue;
+            }
+        };
+        let cand = report
+            .candidates
+            .iter()
+            .find(|c| c.function == target)
+            .unwrap();
+        let match_ids: Vec<&str> = cand.matches.iter().map(|m| m.function.as_str()).collect();
+        let dismissed: Vec<String> = if match_refs.is_empty() {
+            match_ids.iter().map(|s| s.to_string()).collect()
+        } else {
+            let mut out = Vec::new();
+            for r in match_refs {
+                match resolve_ref(r, &match_ids) {
+                    Ok(m) => out.push(m.to_string()),
+                    Err(e) => {
+                        eprintln!("dedup dismiss: {e}");
+                        failed += 1;
+                        continue 'requests;
+                    }
+                }
+            }
+            out
+        };
+        let mut added = 0;
+        for m in &dismissed {
+            let key = pair_key(&target, m);
+            if existing.insert(key.clone()) {
+                new_pairs.push(ExclusionPair {
+                    a: key.0,
+                    b: key.1,
+                    noted_at: now.clone(),
+                });
+                added += 1;
+            }
         }
-        exclusions.pairs.push(ExclusionPair {
-            a,
-            b,
-            noted_at: now.clone(),
-        });
-        added += 1;
+        println!(
+            "Dismissed {added} pair{} for {target}{}:",
+            if added == 1 { "" } else { "s" },
+            if added < dismissed.len() {
+                format!(" ({} already recorded)", dismissed.len() - added)
+            } else {
+                String::new()
+            }
+        );
+        for m in &dismissed {
+            println!("  not a duplicate of {m}");
+        }
     }
-    if let Err(e) = save_exclusions(&exclusions).await {
-        eprintln!("dedup dismiss: failed to save exclusions: {e}");
+
+    if !new_pairs.is_empty()
+        && let Err(e) = append_exclusions(&new_pairs).await
+    {
+        eprintln!("dedup dismiss: failed to record exclusions: {e}");
         return 1;
     }
-    println!(
-        "Dismissed {added} pair{} for {target}{}:",
-        if added == 1 { "" } else { "s" },
-        if added < dismissed.len() {
-            format!(" ({} already recorded)", dismissed.len() - added)
-        } else {
-            String::new()
-        }
-    );
-    for m in &dismissed {
-        println!("  not a duplicate of {m}");
-    }
-    0
+    if failed > 0 { 1 } else { 0 }
 }
 
 pub async fn cmd_exclusions(json: bool) -> i32 {
@@ -1391,13 +1605,13 @@ pub async fn cmd_exclusions(json: bool) -> i32 {
     if exclusions.pairs.is_empty() {
         println!(
             "No dedup exclusions recorded for this repo ({}).",
-            exclusions_path().await.display()
+            exclusions_jsonl_path().await.display()
         );
         return 0;
     }
     println!(
         "Dedup exclusions ({}):",
-        exclusions_path().await.display()
+        exclusions_jsonl_path().await.display()
     );
     for p in &exclusions.pairs {
         println!("  {}  \u{2260}  {}  ({})", p.a, p.b, p.noted_at);
