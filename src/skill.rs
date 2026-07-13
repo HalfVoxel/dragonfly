@@ -326,6 +326,7 @@ If everything is green and clean, say so concisely.
 
 If everything is green and clean, offer to make mark the PR as ready for review, if it isn't already.
 If the user approves, investigate who would be the most reasonable person to review it. Look at who is the code owner of the files, and who has been the primary author as of late. Use git blame around important changes. Make sure to discard mechanical changes like formatting and linting fixes.
+Teams as reviwers are often added automatically based on CODEOWNERS, but we need to have an actual person as a reviewer too (may or may not be a members of the team).
 
 Suggest one recommendation, and possibly 1 or 2 alternatives.
 If the user approves, add the user's choice of reviewer and only then mark the PR as ready.
