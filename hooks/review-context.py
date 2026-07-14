@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """SubagentStart hook for Claude Code.
 
-When a `review-agent`, `comment-reviewer`, or `dedup-reviewer` subagent
-(see agents/) is spawned by the parent dragonfly flow, this hook shells out to
-    dragonfly prompt review-agent [--inline-diffs]   # review/comment agents
+When a `review-agent`, `comment-reviewer`, `dedup-reviewer`, or
+`test-reviewer` subagent (see agents/) is spawned by the parent dragonfly
+flow, this hook shells out to
+    dragonfly prompt review-agent [--inline-diffs]   # review/comment/test agents
     dragonfly prompt dedup-reviewer                  # dedup agent
 and pipes stdout through to the subagent. Claude Code delivers a
 SubagentStart hook's stdout to the subagent as a system reminder before
@@ -11,7 +12,8 @@ its first turn (documented for SessionStart / Setup / SubagentStart in
 [hooks docs](https://code.claude.com/docs/en/hooks)).
 
 `comment-reviewer` gets `--inline-diffs` (full diffs inlined in the
-context); `review-agent` gets the default /tmp diff-file references;
+context); `review-agent` and `test-reviewer` get the default /tmp
+diff-file references (both read full source files anyway);
 `dedup-reviewer` gets its own context with the full duplicate-function
 hint list inlined.
 
@@ -28,8 +30,8 @@ the subprocess will simply fail and we exit 0 — failing open is
 preferable to breaking the parent's review flow.
 
 Matchers in settings/dragonfly-settings.json gate this hook on agent_type
-"review-agent", "comment-reviewer", and "dedup-reviewer"; the hook keys the
---inline-diffs flag off that same agent_type.
+"review-agent", "comment-reviewer", "dedup-reviewer", and "test-reviewer";
+the hook keys the --inline-diffs flag off that same agent_type.
 """
 
 import json

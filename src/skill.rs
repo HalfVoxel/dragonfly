@@ -198,6 +198,12 @@ Also spawn a single `comment-reviewer` subagent for comment and
 documentation quality. Like the review-agent, its context arrives via the
 hook; it typically needs no additional instructions.
 
+If the PR adds or modifies test files, also spawn a single `test-reviewer`
+subagent for test quality and simplification (structure, duplicate or
+low-value tests, assertion style, coverage gaps). Like the comment-reviewer,
+its context arrives via the hook; it typically needs no additional
+instructions.
+
 Also spawn a single `dedup-reviewer` subagent for code duplication. The hook
 injects a dedup-tailored context with the full hint list inlined, so it
 needs no extra instructions. It validates each hinted pair (dismissing false

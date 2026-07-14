@@ -5218,6 +5218,7 @@ fn dragonfly_settings_expanded() -> String {
 const REVIEW_AGENT_MD: &str = include_str!("../agents/review-agent.md");
 const COMMENT_REVIEWER_MD: &str = include_str!("../agents/comment-reviewer.md");
 const DEDUP_REVIEWER_MD: &str = include_str!("../agents/dedup-reviewer.md");
+const TEST_REVIEWER_MD: &str = include_str!("../agents/test-reviewer.md");
 // Bundled so the `@../code-comments.md` reference in agent bodies can be
 // inlined at registration time. See [expand_bundled_refs].
 const CODE_COMMENTS_MD: &str = include_str!("../code-comments.md");
@@ -5225,7 +5226,12 @@ const CODE_COMMENTS_MD: &str = include_str!("../code-comments.md");
 /// Subagent definitions registered via `claude --agents`. Each is keyed in
 /// the resulting object by its frontmatter `name`, which is the
 /// `subagent_type` the parent agent passes to the Agent tool.
-const BUNDLED_AGENTS: &[&str] = &[REVIEW_AGENT_MD, COMMENT_REVIEWER_MD, DEDUP_REVIEWER_MD];
+const BUNDLED_AGENTS: &[&str] = &[
+    REVIEW_AGENT_MD,
+    COMMENT_REVIEWER_MD,
+    DEDUP_REVIEWER_MD,
+    TEST_REVIEWER_MD,
+];
 
 /// Minimal YAML-frontmatter splitter for agent markdown files. Only handles
 /// the subset our agent files actually use: a leading `---\n...\n---\n`
@@ -6278,17 +6284,19 @@ index 111..222 100644
     #[test]
     fn bundled_comment_reviewer_inlines_code_comments() {
         let v: serde_json::Value = serde_json::from_str(&build_agents_json()).unwrap();
-        let prompt = v["comment-reviewer"]["prompt"].as_str().unwrap();
         // Regression: the relative @-import must be inlined, not left dangling
         // (Claude Code would resolve it against the PR repo's cwd and miss).
-        assert!(
-            !prompt.contains("@../code-comments.md"),
-            "dangling @-ref left in comment-reviewer prompt"
-        );
-        assert!(
-            prompt.contains("Explain why, never what"),
-            "code-comments.md not inlined into comment-reviewer prompt"
-        );
+        for agent in ["comment-reviewer", "test-reviewer"] {
+            let prompt = v[agent]["prompt"].as_str().unwrap();
+            assert!(
+                !prompt.contains("@../code-comments.md"),
+                "dangling @-ref left in {agent} prompt"
+            );
+            assert!(
+                prompt.contains("Explain why, never what"),
+                "code-comments.md not inlined into {agent} prompt"
+            );
+        }
         // review-agent carries no such ref and is registered unchanged.
         assert!(
             v["review-agent"]["prompt"]
