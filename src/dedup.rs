@@ -20,6 +20,7 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 use crate::home_dir;
+use crate::status::status_line;
 
 // 0.90 finds only near-exact behavior matches; 0.80 also surfaces the
 // "same family, maybe foldable" tier. Erring low is fine: the agent
@@ -361,7 +362,7 @@ fn save_summaries(cache: &HashMap<String, String>) {
     if let Ok(data) = serde_json::to_vec(cache)
         && let Err(e) = save_atomic(&summaries_cache_path(), &data)
     {
-        eprintln!("   Warning: failed to write summary cache: {e}");
+        status_line!("   Warning: failed to write summary cache: {e}");
     }
 }
 
@@ -414,7 +415,7 @@ fn save_embeddings(cache: &HashMap<String, Vec<f32>>) {
         }
     }
     if let Err(e) = save_atomic(&embeddings_cache_path(), &data) {
-        eprintln!("   Warning: failed to write embedding cache: {e}");
+        status_line!("   Warning: failed to write embedding cache: {e}");
     }
 }
 
@@ -462,11 +463,14 @@ async fn summarize_all(fns: &mut [GoFn], kit: &Kit, quiet: bool) -> Result<(), S
     let cache = Arc::new(Mutex::new(load_summaries()));
     let mut missing: Vec<String> = {
         let c = cache.lock().unwrap();
-        code.keys().filter(|h| !c.contains_key(*h)).cloned().collect()
+        code.keys()
+            .filter(|h| !c.contains_key(*h))
+            .cloned()
+            .collect()
     };
     missing.sort();
     if !quiet {
-        eprintln!(
+        status_line!(
             "   Dedup summaries: {} distinct, {} cached, {} to generate.",
             code.len(),
             code.len() - missing.len(),
@@ -499,7 +503,7 @@ async fn summarize_all(fns: &mut [GoFn], kit: &Kit, quiet: bool) -> Result<(), S
                 if *d % 500 < SUMMARY_BATCH {
                     save_summaries(&c);
                     if !quiet {
-                        eprintln!("   ...{}/{} summarized", *d, total);
+                        status_line!("   ...{}/{} summarized", *d, total);
                     }
                 }
                 Ok::<(), String>(())
@@ -810,10 +814,14 @@ async fn embed_all(fns: &[GoFn], quiet: bool) -> Result<HashMap<String, Vec<f32>
             .or_insert_with(|| f.summary.clone());
     }
     let mut cache = load_embeddings();
-    let mut missing: Vec<String> = texts.keys().filter(|h| !cache.contains_key(*h)).cloned().collect();
+    let mut missing: Vec<String> = texts
+        .keys()
+        .filter(|h| !cache.contains_key(*h))
+        .cloned()
+        .collect();
     missing.sort();
     if !quiet {
-        eprintln!(
+        status_line!(
             "   Dedup embeddings: {} distinct, {} cached, {} to fetch.",
             texts.len(),
             texts.len() - missing.len(),
@@ -1024,7 +1032,7 @@ async fn save_report_snapshot(report: &DedupReport) {
     if let Ok(data) = serde_json::to_vec(report)
         && let Err(e) = save_atomic(&snapshot_path().await, &data)
     {
-        eprintln!("   Warning: failed to write dedup report snapshot: {e}");
+        status_line!("   Warning: failed to write dedup report snapshot: {e}");
     }
 }
 
@@ -1166,7 +1174,7 @@ async fn compute_report_inner(
         });
     }
     if !quiet {
-        eprintln!(
+        status_line!(
             "   Dedup: {} functions in repo, {} changed vs {base_ref}.",
             fns.len(),
             changed_total
@@ -1277,7 +1285,7 @@ pub async fn build_hints_file(base_ref: &str) -> Option<DedupHints> {
         Ok(report) if !report.candidates.is_empty() => report,
         Ok(_) => return None,
         Err(e) => {
-            eprintln!("   Skipping dedup hints ({e}).");
+            status_line!("   Skipping dedup hints ({e}).");
             return None;
         }
     };
@@ -1289,7 +1297,7 @@ pub async fn build_hints_file(base_ref: &str) -> Option<DedupHints> {
             funcs: report.candidates.len(),
         }),
         Err(e) => {
-            eprintln!("   Skipping dedup hints (temp file write failed: {e}).");
+            status_line!("   Skipping dedup hints (temp file write failed: {e}).");
             None
         }
     }
@@ -1338,7 +1346,7 @@ pub async fn build_inline_block(base_ref: &str) -> Option<String> {
         )),
         Ok(_) => None,
         Err(e) => {
-            eprintln!("   Skipping dedup hints ({e}).");
+            status_line!("   Skipping dedup hints ({e}).");
             None
         }
     }

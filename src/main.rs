@@ -16,6 +16,7 @@ mod guide_chunks;
 mod pr_score;
 mod sessions;
 mod skill;
+mod status;
 mod watch_mcp;
 
 #[derive(Parser)]
@@ -693,6 +694,7 @@ async fn maybe_rebase_on_main(
     } else {
         let prompt =
             format!("Branch is {behind} behind origin/main and rebase is clean. Rebase now?");
+        let _hold = status::hold();
         match dialoguer::Confirm::new()
             .with_prompt(prompt)
             .default(true)
@@ -3682,7 +3684,14 @@ fn prompt_pr_title(branch_commits: &Option<String>) -> Option<String> {
     if commit_subjects.len() == 1 {
         input = input.default(commit_subjects[0].clone());
     }
-    let title = match with_sigchld_blocked(|| input.interact_text()) {
+    // Background tasks (dedup hints, PR areas, relevant-context) keep
+    // printing while we block here; buffer their status lines so they
+    // can't clobber the typed title.
+    let read = {
+        let _hold = status::hold();
+        with_sigchld_blocked(|| input.interact_text())
+    };
+    let title = match read {
         Ok(t) => t.trim().to_string(),
         Err(e) => {
             println!("⚠️  Title prompt cancelled: {e}");
@@ -4477,7 +4486,7 @@ async fn build_relevant_context(base_ref: &str) -> String {
     let scores = match pr_score::score_chunks(&chunks, &query).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("   Skipping <relevant-context> ({e}).");
+            status::status_line!("   Skipping <relevant-context> ({e}).");
             return String::new();
         }
     };
@@ -4492,7 +4501,7 @@ async fn build_relevant_context(base_ref: &str) -> String {
         return String::new();
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    eprintln!(
+    status::status_line!(
         "   Including {} relevant-context chunks (threshold ≥{:.1}, +{} ancestor pulls).",
         kept.len(),
         RELEVANT_CONTEXT_THRESHOLD,
@@ -4929,7 +4938,7 @@ async fn analyze_pr_areas(
     if let Some(path) = &cache_path {
         if let Ok(content) = std::fs::read_to_string(path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
-                println!(
+                status::status_line!(
                     "   PR areas: cache hit ({}).",
                     &head_sha[..head_sha.len().min(7)]
                 );
