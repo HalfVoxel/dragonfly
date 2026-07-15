@@ -119,7 +119,10 @@ fn format_session(path: &Path, branch: &str) -> Option<SessionFile> {
             Err(_) => continue,
         };
 
-        if v.get("isSidechain").and_then(|s| s.as_bool()).unwrap_or(false) {
+        if v.get("isSidechain")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false)
+        {
             continue;
         }
         if v.get("isMeta").and_then(|s| s.as_bool()).unwrap_or(false) {
@@ -196,7 +199,9 @@ fn format_session(path: &Path, branch: &str) -> Option<SessionFile> {
                                     .pointer("/input/file_path")
                                     .and_then(|p| p.as_str())
                                     .or_else(|| {
-                                        block.pointer("/input/notebook_path").and_then(|p| p.as_str())
+                                        block
+                                            .pointer("/input/notebook_path")
+                                            .and_then(|p| p.as_str())
                                     })
                                     .unwrap_or("(unknown)");
                                 let event_cwd = v.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
@@ -257,10 +262,7 @@ mod tests {
 
     #[test]
     fn strip_cwd_basic() {
-        assert_eq!(
-            strip_cwd("/x/y/go/api/foo.go", "/x/y"),
-            "go/api/foo.go"
-        );
+        assert_eq!(strip_cwd("/x/y/go/api/foo.go", "/x/y"), "go/api/foo.go");
         assert_eq!(strip_cwd("/x/y", "/x/y"), "");
         assert_eq!(strip_cwd("/other/path", "/x/y"), "/other/path");
         assert_eq!(strip_cwd("/x/y/foo.go", ""), "/x/y/foo.go");

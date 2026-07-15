@@ -1169,7 +1169,10 @@ fn classify_issue_comment(author: &str, body: &str) -> (&'static str, bool) {
         "/claude review",
         "@claude review",
     ];
-    let noisy_bot = matches!(author, "codecov[bot]" | "codecov-commenter" | "lovable-ci-bot");
+    let noisy_bot = matches!(
+        author,
+        "codecov[bot]" | "codecov-commenter" | "lovable-ci-bot"
+    );
     if noisy_bot || BOILERPLATE.iter().any(|m| b.contains(m)) {
         return ("boilerplate", true);
     }
@@ -1193,7 +1196,11 @@ async fn fetch_issue_comments(owner: &str, repo: &str, pr_number: &str) -> Optio
     }
     let mut out = String::from("<issue-comments>\n");
     for c in &comments {
-        let author = c.user.as_ref().map(|u| u.login.as_str()).unwrap_or("unknown");
+        let author = c
+            .user
+            .as_ref()
+            .map(|u| u.login.as_str())
+            .unwrap_or("unknown");
         let (kind, collapse) = classify_issue_comment(author, &c.body);
         if collapse {
             let first = c
@@ -2289,13 +2296,11 @@ async fn fetch_gha_step_conclusions(check: &PrCheck) -> String {
     let parts: Vec<String> = steps
         .iter()
         .map(|s| {
-            let c = s.conclusion.as_deref().filter(|c| !c.is_empty()).unwrap_or(
-                if s.status.is_empty() {
-                    "?"
-                } else {
-                    &s.status
-                },
-            );
+            let c = s
+                .conclusion
+                .as_deref()
+                .filter(|c| !c.is_empty())
+                .unwrap_or(if s.status.is_empty() { "?" } else { &s.status });
             format!("\"{}\"={}", s.name, c)
         })
         .collect();
@@ -2821,7 +2826,10 @@ async fn ci_failures_cmd(
     // log" actually yields the log rather than the trimmed summary.
     let mut buf = String::new();
     let mut full_buf = String::new();
-    let header = format!("# Failing checks for PR #{pr_number} ({} total)\n\n", failed.len());
+    let header = format!(
+        "# Failing checks for PR #{pr_number} ({} total)\n\n",
+        failed.len()
+    );
     buf.push_str(&header);
     full_buf.push_str(&header);
     for check in &failed {
@@ -3162,7 +3170,12 @@ fn print_checks_summary(label: &str, checks: &[PrCheck], ignored: &[&str]) -> i3
     let mut shown: Vec<&PrCheck> = checks
         .iter()
         .filter(|c| !ignored.contains(&c.name.as_str()))
-        .filter(|c| matches!(c.bucket.as_str(), "fail" | "pending" | "cancelled" | "stale"))
+        .filter(|c| {
+            matches!(
+                c.bucket.as_str(),
+                "fail" | "pending" | "cancelled" | "stale"
+            )
+        })
         .collect();
     shown.sort_by(|a, b| (priority(&b.bucket), &a.name).cmp(&(priority(&a.bucket), &b.name)));
     for c in shown {
@@ -3508,7 +3521,10 @@ async fn ci_rerun_cmd(name: String, pr: Option<String>) -> i32 {
         );
         return 2;
     }
-    println!("Re-running failed jobs in `{}` (run {run_id})...", check.name);
+    println!(
+        "Re-running failed jobs in `{}` (run {run_id})...",
+        check.name
+    );
     let r = sh3(&format!("gh run rerun {run_id} --failed")).await;
     if !r.stdout.is_empty() {
         println!("{}", r.stdout);
@@ -5201,7 +5217,27 @@ fn graphite_section(info: &GraphiteInfo) -> String {
 const DRAGONFLY_SETTINGS_TEMPLATE: &str = include_str!("../settings/dragonfly-settings.json");
 const DRAGONFLY_HOOKS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/hooks");
 
-const GRAFANA_DASHBOARDS_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/grafana_dashboards.md");
+// Bundled like the settings template above: the guide references sibling
+// files (pr-descriptions/, grafana_dashboards.md) via `__DRAGONFLY_ROOT__`,
+// which we expand to the checkout dir at runtime so the file the agent reads
+// contains resolvable absolute paths on any machine.
+const PR_DESCRIPTION_GUIDE_TEMPLATE: &str = include_str!("../pr-description-guide.md");
+
+fn pr_description_guide_expanded() -> String {
+    let body =
+        PR_DESCRIPTION_GUIDE_TEMPLATE.replace("__DRAGONFLY_ROOT__", env!("CARGO_MANIFEST_DIR"));
+    let f = tempfile::Builder::new()
+        .prefix("dragonfly-pr-description-guide-")
+        .suffix(".md")
+        .tempfile_in("/tmp")
+        .expect("failed to create pr description guide tempfile");
+    let (mut file, path) = f
+        .keep()
+        .expect("failed to persist pr description guide tempfile");
+    file.write_all(body.as_bytes())
+        .expect("failed to write pr description guide tempfile");
+    path.to_string_lossy().into_owned()
+}
 const DOTENV_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/.env");
 
 fn dragonfly_settings_expanded() -> String {
@@ -5514,7 +5550,10 @@ fn build_prompt(
     };
     let skill_text = skill::DRAGONFLY_SKILL
         .replace("CUSTOM_REVIEW_PLACEHOLDER", review_instructions)
-        .replace("GRAFANA_DASHBOARDS_PATH", GRAFANA_DASHBOARDS_PATH)
+        .replace(
+            "PR_DESCRIPTION_GUIDE_PATH",
+            &pr_description_guide_expanded(),
+        )
         .replace("CODE_COMMENTS_PLACEHOLDER", skill::CODE_COMMENTS_GUIDE);
 
     let now = chrono::Local::now()
@@ -6380,7 +6419,10 @@ index 111..222 100644
     fn classify_issue_comment_tags_boilerplate_and_keeps_signal() {
         // Lovmesh plan preview is a CI-equivalent signal — never collapsed.
         assert_eq!(
-            classify_issue_comment("github-actions[bot]", "## Lovmesh Plan Preview\n❌ apply failed"),
+            classify_issue_comment(
+                "github-actions[bot]",
+                "## Lovmesh Plan Preview\n❌ apply failed"
+            ),
             ("bot-status", false)
         );
         // Codecov / pr-classification boilerplate collapses.

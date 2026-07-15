@@ -587,8 +587,7 @@ async fn summarize_batch(
             if out.contains_key(h) {
                 continue;
             }
-            if let Ok(single) =
-                Box::pin(summarize_batch(std::slice::from_ref(h), code, kit)).await
+            if let Ok(single) = Box::pin(summarize_batch(std::slice::from_ref(h), code, kit)).await
             {
                 out.extend(single);
             }
@@ -618,7 +617,13 @@ async fn call_kit_llm(
         prompt.push_str(&format!("### {i}\n{src}\n"));
     }
     let mut cmd = Command::new(&kit.bin);
-    cmd.args(["llm", "-m", SUMMARY_MODEL, "--system", SUMMARY_SYSTEM_PROMPT]);
+    cmd.args([
+        "llm",
+        "-m",
+        SUMMARY_MODEL,
+        "--system",
+        SUMMARY_SYSTEM_PROMPT,
+    ]);
     if let Some(cwd) = &kit.cwd {
         cmd.current_dir(cwd);
     }
@@ -784,7 +789,9 @@ impl VertexClient {
                 .map(|p| normalize(p.embeddings.values))
                 .collect());
         }
-        Err(format!("vertex request failed after 6 attempts: {last_err}"))
+        Err(format!(
+            "vertex request failed after 6 attempts: {last_err}"
+        ))
     }
 }
 
@@ -838,7 +845,8 @@ async fn embed_all(fns: &[GoFn], quiet: bool) -> Result<HashMap<String, Vec<f32>
         let mut cur_tok = 0usize;
         for h in missing {
             let t = est_tokens(&texts[&h]);
-            if !cur.is_empty() && (cur.len() >= EMBED_BATCH_INSTANCES || cur_tok + t > EMBED_BATCH_TOKENS)
+            if !cur.is_empty()
+                && (cur.len() >= EMBED_BATCH_INSTANCES || cur_tok + t > EMBED_BATCH_TOKENS)
             {
                 batches.push(std::mem::take(&mut cur));
                 cur_tok = 0;
@@ -925,7 +933,13 @@ async fn repo_key() -> String {
     }
     let s = s.strip_suffix(".git").unwrap_or(&s);
     s.chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -1066,7 +1080,11 @@ async fn git_show(toplevel: &str, base_ref: &str, path: &str) -> Option<Vec<u8>>
         .output()
         .await
         .ok()?;
-    if out.status.success() { Some(out.stdout) } else { None }
+    if out.status.success() {
+        Some(out.stdout)
+    } else {
+        None
+    }
 }
 
 /// Run the full pipeline: extract the repo, diff the changed set against
@@ -1240,11 +1258,7 @@ async fn compute_report_inner(
             });
         }
     }
-    candidates.sort_by(|a, b| {
-        b.matches[0]
-            .cosine
-            .total_cmp(&a.matches[0].cosine)
-    });
+    candidates.sort_by(|a, b| b.matches[0].cosine.total_cmp(&a.matches[0].cosine));
     Ok(DedupReport {
         head,
         base_ref,
@@ -1386,12 +1400,7 @@ fn write_hints_file(body: &str) -> std::io::Result<PathBuf> {
 
 // ── CLI commands ─────────────────────────────────────────────────────────────
 
-pub async fn cmd_list(
-    base: Option<String>,
-    threshold: f64,
-    limit: usize,
-    json: bool,
-) -> i32 {
+pub async fn cmd_list(base: Option<String>, threshold: f64, limit: usize, json: bool) -> i32 {
     let report = match compute_report(base, threshold, limit, json).await {
         Ok(r) => r,
         Err(e) => {
@@ -1439,9 +1448,7 @@ pub async fn cmd_list(
         }
         println!();
     }
-    println!(
-        "Dismiss false positives: dragonfly dedup dismiss '<changed-func>' ['<match>'...]"
-    );
+    println!("Dismiss false positives: dragonfly dedup dismiss '<changed-func>' ['<match>'...]");
     0
 }
 
@@ -1519,7 +1526,11 @@ pub async fn cmd_dismiss(
             }
         },
     };
-    let identities: Vec<&str> = report.candidates.iter().map(|c| c.function.as_str()).collect();
+    let identities: Vec<&str> = report
+        .candidates
+        .iter()
+        .map(|c| c.function.as_str())
+        .collect();
     if identities.is_empty() {
         eprintln!("dedup dismiss: no changed functions currently have candidates.");
         return 1;

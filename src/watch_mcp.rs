@@ -125,8 +125,7 @@ pub async fn watch_mcp_cmd(pr: Option<String>, interval: u64, demo: bool) -> i32
                 let _ = tx.send(json!({"jsonrpc": "2.0", "id": id, "result": {"prompts": []}}));
             }
             ("resources/list", Some(id)) => {
-                let _ =
-                    tx.send(json!({"jsonrpc": "2.0", "id": id, "result": {"resources": []}}));
+                let _ = tx.send(json!({"jsonrpc": "2.0", "id": id, "result": {"resources": []}}));
             }
             (m, Some(id)) => {
                 let _ = tx.send(json!({
@@ -472,12 +471,20 @@ fn comment_events(
         .map(|t| t.nodes)
         .unwrap_or_default();
     for t in &threads {
-        let comments = t.comments.as_ref().map(|c| c.nodes.as_slice()).unwrap_or(&[]);
+        let comments = t
+            .comments
+            .as_ref()
+            .map(|c| c.nodes.as_slice())
+            .unwrap_or(&[]);
         for c in comments {
             if !seen.insert(c.id.clone()) {
                 continue;
             }
-            let author = c.author.as_ref().map(|a| a.login.as_str()).unwrap_or("unknown");
+            let author = c
+                .author
+                .as_ref()
+                .map(|a| a.login.as_str())
+                .unwrap_or("unknown");
             if !baselined || author == self_login {
                 continue;
             }
@@ -486,7 +493,11 @@ fn comment_events(
                 (Some(p), None) => format!(" on {p}"),
                 _ => String::new(),
             };
-            let status = if t.is_resolved { "resolved" } else { "unresolved" };
+            let status = if t.is_resolved {
+                "resolved"
+            } else {
+                "unresolved"
+            };
             events.push((
                 format!(
                     "New review comment by {author}{loc} (thread {}, {status}):\n{}",
@@ -508,7 +519,11 @@ fn comment_events(
             if !seen.insert(key) {
                 continue;
             }
-            let author = c.user.as_ref().map(|u| u.login.as_str()).unwrap_or("unknown");
+            let author = c
+                .user
+                .as_ref()
+                .map(|u| u.login.as_str())
+                .unwrap_or("unknown");
             if !baselined || author == self_login {
                 continue;
             }
@@ -595,8 +610,12 @@ mod tests {
     fn ci_fail_then_settle_in_one_poll() {
         let mut state = fresh_state(true);
         assert!(
-            ci_events(&mut state, &[check("a", "pending"), check("b", "pending")], None)
-                .is_empty()
+            ci_events(
+                &mut state,
+                &[check("a", "pending"), check("b", "pending")],
+                None
+            )
+            .is_empty()
         );
         let evs = ci_events(&mut state, &[check("a", "fail"), check("b", "pass")], None);
         assert_eq!(kinds(&evs), ["ci_check_failed", "ci_settled"]);

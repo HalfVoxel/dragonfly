@@ -34,7 +34,10 @@ pub struct GuideChunk {
 /// Unreadable paths are skipped silently — callers that care should pre-check.
 #[allow(dead_code)]
 pub fn chunk_guides<P: AsRef<Path>>(paths: &[P]) -> Vec<GuideChunk> {
-    paths.iter().flat_map(|p| chunk_guide_file(p.as_ref())).collect()
+    paths
+        .iter()
+        .flat_map(|p| chunk_guide_file(p.as_ref()))
+        .collect()
 }
 
 /// See [chunk_guides]. Returns an empty Vec for pure-pointer files (every
@@ -44,7 +47,9 @@ pub fn chunk_guides<P: AsRef<Path>>(paths: &[P]) -> Vec<GuideChunk> {
 /// zero-information rows that just waste scorer tokens.
 #[allow(dead_code)]
 pub fn chunk_guide_file(path: &Path) -> Vec<GuideChunk> {
-    let Ok(text) = std::fs::read_to_string(path) else { return vec![] };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return vec![];
+    };
     if is_pointer_only(&text) {
         return vec![];
     }
@@ -156,7 +161,13 @@ pub fn chunk_guide_text(path: &Path, text: &str) -> Vec<GuideChunk> {
         }
 
         if let Some((level, title)) = parse_atx_heading(line) {
-            flush_chunk(&mut chunks, path, &mut cur_body, cur_level, &cur_breadcrumbs);
+            flush_chunk(
+                &mut chunks,
+                path,
+                &mut cur_body,
+                cur_level,
+                &cur_breadcrumbs,
+            );
             stack.retain(|c| c.level < level);
             stack.push(HeadingCrumb { level, title });
             cur_breadcrumbs = stack.clone();
@@ -168,9 +179,18 @@ pub fn chunk_guide_text(path: &Path, text: &str) -> Vec<GuideChunk> {
 
         if i + 1 < lines.len() {
             if let Some(level) = parse_setext_underline(lines[i + 1], line) {
-                flush_chunk(&mut chunks, path, &mut cur_body, cur_level, &cur_breadcrumbs);
+                flush_chunk(
+                    &mut chunks,
+                    path,
+                    &mut cur_body,
+                    cur_level,
+                    &cur_breadcrumbs,
+                );
                 stack.retain(|c| c.level < level);
-                stack.push(HeadingCrumb { level, title: line.trim().to_string() });
+                stack.push(HeadingCrumb {
+                    level,
+                    title: line.trim().to_string(),
+                });
                 cur_breadcrumbs = stack.clone();
                 cur_level = level;
                 push_line(&mut cur_body, line);
@@ -184,7 +204,13 @@ pub fn chunk_guide_text(path: &Path, text: &str) -> Vec<GuideChunk> {
         i += 1;
     }
 
-    flush_chunk(&mut chunks, path, &mut cur_body, cur_level, &cur_breadcrumbs);
+    flush_chunk(
+        &mut chunks,
+        path,
+        &mut cur_body,
+        cur_level,
+        &cur_breadcrumbs,
+    );
     chunks
 }
 
@@ -300,7 +326,6 @@ fn is_fence_close(line: &str, open_char: char) -> bool {
     t.len() >= 3 && t.chars().all(|c| c == open_char)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,10 +333,12 @@ mod tests {
     fn titles(chunks: &[GuideChunk]) -> Vec<(u8, &str)> {
         chunks
             .iter()
-            .map(|c| (
-                c.level,
-                c.breadcrumbs.last().map(|h| h.title.as_str()).unwrap_or(""),
-            ))
+            .map(|c| {
+                (
+                    c.level,
+                    c.breadcrumbs.last().map(|h| h.title.as_str()).unwrap_or(""),
+                )
+            })
             .collect()
     }
 
@@ -334,12 +361,19 @@ content under D
         );
         let c = &chunks[2];
         assert_eq!(
-            c.breadcrumbs.iter().map(|h| (h.level, h.title.as_str())).collect::<Vec<_>>(),
+            c.breadcrumbs
+                .iter()
+                .map(|h| (h.level, h.title.as_str()))
+                .collect::<Vec<_>>(),
             vec![(1, "A"), (2, "B"), (3, "C")],
         );
         // D pops back to level 2 — A still there, B and C gone.
         assert_eq!(
-            chunks[3].breadcrumbs.iter().map(|h| (h.level, h.title.as_str())).collect::<Vec<_>>(),
+            chunks[3]
+                .breadcrumbs
+                .iter()
+                .map(|h| (h.level, h.title.as_str()))
+                .collect::<Vec<_>>(),
             vec![(1, "A"), (2, "D")],
         );
         assert!(chunks[1].body.starts_with("## B\n"));
@@ -419,7 +453,10 @@ under first
             path: PathBuf::from(path),
             breadcrumbs: levels_titles
                 .iter()
-                .map(|(l, t)| HeadingCrumb { level: *l, title: (*t).into() })
+                .map(|(l, t)| HeadingCrumb {
+                    level: *l,
+                    title: (*t).into(),
+                })
                 .collect(),
             level: levels_titles.last().map(|(l, _)| *l).unwrap_or(0),
             body: String::new(),
@@ -429,10 +466,10 @@ under first
     #[test]
     fn with_ancestors_pulls_in_parents_in_same_file() {
         let chunks = vec![
-            chunk_at("F.md", &[(1, "A")]),                       // 0
-            chunk_at("F.md", &[(1, "A"), (2, "B")]),             // 1
-            chunk_at("F.md", &[(1, "A"), (2, "B"), (3, "C")]),   // 2
-            chunk_at("F.md", &[(1, "A"), (2, "D")]),             // 3 — sibling of B, not ancestor
+            chunk_at("F.md", &[(1, "A")]),                     // 0
+            chunk_at("F.md", &[(1, "A"), (2, "B")]),           // 1
+            chunk_at("F.md", &[(1, "A"), (2, "B"), (3, "C")]), // 2
+            chunk_at("F.md", &[(1, "A"), (2, "D")]),           // 3 — sibling of B, not ancestor
         ];
         let kept = with_ancestors(&chunks, &[2]);
         assert_eq!(kept, vec![0, 1, 2]);
@@ -441,11 +478,15 @@ under first
     #[test]
     fn with_ancestors_does_not_cross_files() {
         let chunks = vec![
-            chunk_at("F.md", &[(1, "A")]),                       // 0 — different file
-            chunk_at("G.md", &[(1, "A"), (2, "B")]),             // 1 — selected
+            chunk_at("F.md", &[(1, "A")]),           // 0 — different file
+            chunk_at("G.md", &[(1, "A"), (2, "B")]), // 1 — selected
         ];
         let kept = with_ancestors(&chunks, &[1]);
-        assert_eq!(kept, vec![1], "ancestor in F.md must not be pulled into G.md's chain");
+        assert_eq!(
+            kept,
+            vec![1],
+            "ancestor in F.md must not be pulled into G.md's chain"
+        );
     }
 
     #[test]
@@ -453,8 +494,8 @@ under first
         // Preamble (level 0, empty breadcrumbs) is a sibling, not an
         // ancestor of the first heading; it must not be auto-pulled.
         let chunks = vec![
-            chunk_at("F.md", &[]),                               // 0 — preamble
-            chunk_at("F.md", &[(1, "A")]),                       // 1
+            chunk_at("F.md", &[]),         // 0 — preamble
+            chunk_at("F.md", &[(1, "A")]), // 1
         ];
         let kept = with_ancestors(&chunks, &[1]);
         assert_eq!(kept, vec![1]);
@@ -463,10 +504,10 @@ under first
     #[test]
     fn with_ancestors_dedupes_and_handles_multi_select() {
         let chunks = vec![
-            chunk_at("F.md", &[(1, "A")]),                       // 0
-            chunk_at("F.md", &[(1, "A"), (2, "B")]),             // 1
-            chunk_at("F.md", &[(1, "A"), (2, "B"), (3, "C")]),   // 2
-            chunk_at("F.md", &[(1, "A"), (2, "D")]),             // 3
+            chunk_at("F.md", &[(1, "A")]),                     // 0
+            chunk_at("F.md", &[(1, "A"), (2, "B")]),           // 1
+            chunk_at("F.md", &[(1, "A"), (2, "B"), (3, "C")]), // 2
+            chunk_at("F.md", &[(1, "A"), (2, "D")]),           // 3
         ];
         // Select two leaves whose chains overlap at "A".
         let kept = with_ancestors(&chunks, &[2, 3]);
@@ -534,7 +575,10 @@ content
         let chunks = chunk_guide_text(Path::new("x.md"), text);
         let c = chunks.last().unwrap();
         assert_eq!(
-            c.breadcrumbs.iter().map(|h| (h.level, h.title.as_str())).collect::<Vec<_>>(),
+            c.breadcrumbs
+                .iter()
+                .map(|h| (h.level, h.title.as_str()))
+                .collect::<Vec<_>>(),
             vec![(1, "A"), (2, "B"), (3, "C")],
         );
     }
