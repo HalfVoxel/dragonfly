@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CI guard hook for Claude Code PreToolUse.
+"""CI guard hook for Claude Code PreToolUse and PermissionRequest.
 
 Intercepts manual `gh pr checks` / `gh run view --log-failed` /
 `gh run list --status failure` patterns and redirects the agent to the
@@ -7,21 +7,18 @@ Intercepts manual `gh pr checks` / `gh run view --log-failed` /
 
 Reads tool input from stdin (JSON with .tool_input.command), outputs a
 permission decision when a rule matches.
+
+Registered on both events because PreToolUse fires after the permission
+dialog: a deny there makes the user approve the command only to watch the
+hook reject it. PermissionRequest fires while the dialog is still pending,
+so a deny cancels the prompt before the user sees it. PreToolUse stays
+registered to catch commands that are allowlisted (e.g. Bash(gh:*)) and
+therefore never raise a dialog.
 """
 
 import json
 import re
 import sys
-
-
-def deny(message: str) -> dict:
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": message,
-        }
-    }
 
 
 # Each rule: (regex over the raw command, deny message).
@@ -141,26 +138,44 @@ RULES = [
 ]
 
 
-def check_command(cmd: str) -> dict | None:
+ASK_RERUN_REASON = (
+    "Prefer `dragonfly ci rerun <check-name>` — it resolves the\n"
+    "check name to the run ID for you and refuses to act on non-GHA\n"
+    "providers (Buildkite/Wiz cannot be rerun from the GH API).\n"
+    "If you already have the run ID and know what you're doing,\n"
+    "approve to proceed."
+)
+
+
+def check_command(cmd: str) -> tuple[str, str] | None:
     for pattern, msg in RULES:
         if not re.search(pattern, cmd):
             continue
         if msg == "ASK_RERUN":
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "ask",
-                    "permissionDecisionReason": (
-                        "Prefer `dragonfly ci rerun <check-name>` — it resolves the\n"
-                        "check name to the run ID for you and refuses to act on non-GHA\n"
-                        "providers (Buildkite/Wiz cannot be rerun from the GH API).\n"
-                        "If you already have the run ID and know what you're doing,\n"
-                        "approve to proceed."
-                    ),
-                }
-            }
-        return deny(msg)
+            return "ask", ASK_RERUN_REASON
+        return "deny", msg
     return None
+
+
+def build_output(event: str, decision: str, reason: str) -> dict | None:
+    if event == "PermissionRequest":
+        # "ask" has no PermissionRequest form: staying silent lets the pending
+        # dialog show, which is the same outcome.
+        if decision != "deny":
+            return None
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "deny", "message": reason},
+            }
+        }
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        }
+    }
 
 
 def main():
@@ -173,7 +188,9 @@ def main():
         return
     result = check_command(cmd)
     if result:
-        json.dump(result, sys.stdout)
+        output = build_output(data.get("hook_event_name", "PreToolUse"), *result)
+        if output:
+            json.dump(output, sys.stdout)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Git guard hook for Claude Code PreToolUse.
+"""Git guard hook for Claude Code PreToolUse and PermissionRequest.
 
 Reads tool input from stdin (JSON with .tool_input.command),
 checks the command against git rules, and outputs a permission decision.
+
+Registered on both events because PreToolUse fires after the permission
+dialog: a deny there makes the user approve the command only to watch the
+hook reject it. PermissionRequest fires while the dialog is still pending,
+so a deny cancels the prompt before the user sees it. PreToolUse stays
+registered to catch commands that are allowlisted (e.g. Bash(git:*)) and
+therefore never raise a dialog.
 """
 
 import json
@@ -19,19 +26,34 @@ RULES = [
 ]
 
 
-def check_command(cmd: str) -> dict | None:
+def check_command(cmd: str) -> tuple[str, str] | None:
     for pattern, exclude, decision, reason in RULES:
         if re.search(pattern, cmd):
             if exclude and re.search(exclude, cmd):
                 continue
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": decision,
-                    "permissionDecisionReason": reason,
-                }
-            }
+            return decision, reason
     return None
+
+
+def build_output(event: str, decision: str, reason: str) -> dict | None:
+    if event == "PermissionRequest":
+        # "ask" has no PermissionRequest form: staying silent lets the pending
+        # dialog show, which is the same outcome.
+        if decision != "deny":
+            return None
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PermissionRequest",
+                "decision": {"behavior": "deny", "message": reason},
+            }
+        }
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        }
+    }
 
 
 def main():
@@ -39,7 +61,9 @@ def main():
     cmd = data.get("tool_input", {}).get("command", "")
     result = check_command(cmd)
     if result:
-        json.dump(result, sys.stdout)
+        output = build_output(data.get("hook_event_name", "PreToolUse"), *result)
+        if output:
+            json.dump(output, sys.stdout)
 
 
 if __name__ == "__main__":
