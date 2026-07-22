@@ -1615,6 +1615,21 @@ const QA_TECH_REVIEW: &str = "QA.tech / PR Review";
 // it's non-blocking like the other review bots.
 const CLAUDE_CODE_REVIEW: &str = "Claude Code Review";
 
+// The high-risk merge gate posts the commit status "high-risk-needs-approval":
+// `pending` until a human approves a pr/risk/high PR, `success` after. No code
+// change flips it, so waiting on it blocks forever on an unapproved PR.
+const HIGH_RISK_APPROVAL: &str = "high-risk-needs-approval";
+
+// The "Relevant Evals" workflow runs evals for 15+ minutes and its result is
+// advisory. Its matrix job names embed the eval name and path ("Run relevant
+// eval (<name>, <path>) / ..."), so they match by prefix (see
+// [is_ignored_check]). The aggregate `Relevant eval status` job has
+// `if: always()` and `needs: run-selected`, so it stays `pending` until every
+// eval finishes — ignoring only the per-eval jobs would still block the wait.
+const EVAL_RUN_PREFIX: &str = "Run relevant eval (*";
+const EVAL_SELECT: &str = "Select relevant evals";
+const EVAL_STATUS: &str = "Relevant eval status";
+
 // Checks that are slow, flaky, or non-blocking — exclude from the wait so they
 // don't keep `pending` above zero forever. Failures here are surfaced to the
 // user but not auto-fixed as part of dragonfly.
@@ -1627,12 +1642,16 @@ const IGNORED_CHECKS: &[&str] = &[
     CORE_PROMPT_REVIEW,
     QA_TECH_REVIEW,
     CLAUDE_CODE_REVIEW,
+    HIGH_RISK_APPROVAL,
+    EVAL_RUN_PREFIX,
+    EVAL_SELECT,
+    EVAL_STATUS,
     "depthfirst Bot",
 ];
 
 // `ci watch` waits for slow checks like test-e2e, but skips the never-terminating
-// Graphite check plus deploy, doc-review, the human-approval review gate, and the
-// QA.tech review bot (non-blocking, not worth blocking the watch on).
+// Graphite check plus deploy, doc-review, the human-approval gates, the eval
+// suite, and the review bots (non-blocking, not worth blocking the watch on).
 // See [GRAPHITE_MERGEABILITY].
 const WATCH_IGNORED_CHECKS: &[&str] = &[
     "doc-review",
@@ -1641,6 +1660,10 @@ const WATCH_IGNORED_CHECKS: &[&str] = &[
     CORE_PROMPT_REVIEW,
     QA_TECH_REVIEW,
     CLAUDE_CODE_REVIEW,
+    HIGH_RISK_APPROVAL,
+    EVAL_RUN_PREFIX,
+    EVAL_SELECT,
+    EVAL_STATUS,
 ];
 
 // Gate-style checks: they report `fail` until a human/team action (not a CI
@@ -1650,10 +1673,20 @@ const WATCH_IGNORED_CHECKS: &[&str] = &[
 // gate alone); `ci failures` reports them separately instead of trying to
 // fetch fixable logs that don't exist. Without this, `ci status` (which shows
 // the gate) and `ci failures` (which drops it via [IGNORED_CHECKS]) contradict.
-const GATE_CHECKS: &[&str] = &[CORE_PROMPT_REVIEW];
+const GATE_CHECKS: &[&str] = &[CORE_PROMPT_REVIEW, HIGH_RISK_APPROVAL];
 
 fn is_gate_check(name: &str) -> bool {
     GATE_CHECKS.contains(&name)
+}
+
+// Ignore-list entries ending in `*` match by prefix; everything else matches
+// exactly. Matrix-generated names like "Run relevant eval (<name>, <path>) /
+// ..." vary per PR, so exact lists can never cover them.
+fn is_ignored_check(name: &str, ignored: &[&str]) -> bool {
+    ignored.iter().any(|entry| match entry.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => *entry == name,
+    })
 }
 
 /// Drop "skipping" rows from `gh pr checks` output. The agent doesn't need
@@ -1674,7 +1707,7 @@ fn parse_checks(out: &str, ignored: &[&str]) -> CheckCounts {
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() >= 2 {
             let name = parts[0].trim();
-            if ignored.contains(&name) {
+            if is_ignored_check(name, ignored) {
                 continue;
             }
             let status = parts[1].trim();
@@ -2221,7 +2254,7 @@ async fn list_failed_checks(pr_number: &str) -> Vec<PrCheck> {
     ))
     .await;
     let mut all: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
-    all.retain(|c| c.bucket == "fail" && !IGNORED_CHECKS.contains(&c.name.as_str()));
+    all.retain(|c| c.bucket == "fail" && !is_ignored_check(&c.name, IGNORED_CHECKS));
     all
 }
 
@@ -2670,7 +2703,7 @@ async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
         format!("gh pr checks {pr_number} --json name,bucket,link,workflow,description");
     let (r, has_conflicts) = tokio::join!(sh3(&checks_cmd), check_origin_main_conflicts(),);
     let mut checks: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
-    checks.retain(|c| !ignored.contains(&c.name.as_str()));
+    checks.retain(|c| !is_ignored_check(&c.name, ignored));
     // Dedup by name, keeping the highest-priority bucket: fail > pending > pass > skipping.
     let priority = |b: &str| match b {
         "fail" => 3,
@@ -2696,7 +2729,7 @@ async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
     let mut by_name: HashMap<String, &PrCheck> = HashMap::new();
     for c in all_checks
         .iter()
-        .filter(|c| !ignored.contains(&c.name.as_str()))
+        .filter(|c| !is_ignored_check(&c.name, ignored))
     {
         // Keep the highest-priority row per name.
         let keep = by_name
@@ -3139,7 +3172,7 @@ fn counts_from_checks(checks: &[PrCheck], ignored: &[&str]) -> CheckCounts {
     };
     for c in checks
         .iter()
-        .filter(|c| !ignored.contains(&c.name.as_str()))
+        .filter(|c| !is_ignored_check(&c.name, ignored))
     {
         match c.bucket.as_str() {
             "pass" => counts.passed += 1,
@@ -3183,7 +3216,7 @@ fn print_checks_summary(label: &str, checks: &[PrCheck], ignored: &[&str]) -> i3
     };
     let mut shown: Vec<&PrCheck> = checks
         .iter()
-        .filter(|c| !ignored.contains(&c.name.as_str()))
+        .filter(|c| !is_ignored_check(&c.name, ignored))
         .filter(|c| {
             matches!(
                 c.bucket.as_str(),
@@ -6402,6 +6435,42 @@ index 111..222 100644
         assert_eq!(counts.failed, 0);
         assert_eq!(counts.pending, 1);
         assert_eq!(counts.pending_names, vec!["test-spanner".to_string()]);
+    }
+
+    #[test]
+    fn eval_and_approval_checks_do_not_block_the_watch() {
+        let mk = |name: &str, bucket: &str| PrCheck {
+            name: name.into(),
+            bucket: bucket.into(),
+            link: String::new(),
+            workflow: String::new(),
+            description: String::new(),
+        };
+        let checks = vec![
+            mk("test-go", "pass"),
+            // Matrix-generated eval names vary per PR; only the prefix is stable.
+            mk(
+                "Run relevant eval (kimi-reasoning-budget, go/api/pkg/providers/evals/kimi-reasoning-budget.yaml) / Run kimi-reasoning-budget eval",
+                "pending",
+            ),
+            mk(EVAL_SELECT, "pending"),
+            mk(EVAL_STATUS, "pending"),
+            mk(HIGH_RISK_APPROVAL, "pending"),
+        ];
+        let counts = counts_from_checks(&checks, WATCH_IGNORED_CHECKS);
+        assert_eq!(counts.passed, 1);
+        assert_eq!(counts.pending, 0);
+        assert!(counts.pending_names.is_empty());
+    }
+
+    #[test]
+    fn is_ignored_check_matches_prefix_entries() {
+        assert!(is_ignored_check(
+            "Run relevant eval (foo, bar.yaml) / Run foo eval",
+            &[EVAL_RUN_PREFIX]
+        ));
+        assert!(is_ignored_check("deploy", &["deploy"]));
+        assert!(!is_ignored_check("deploy-extra", &["deploy"]));
     }
 
     #[test]

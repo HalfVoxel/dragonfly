@@ -272,7 +272,7 @@ async fn poll_loop(tx: UnboundedSender<Value>, pr_arg: Option<String>, interval:
             let checks: Vec<PrCheck> = checks_for_sha(&state.sha)
                 .await
                 .into_iter()
-                .filter(|c| !crate::WATCH_IGNORED_CHECKS.contains(&c.name.as_str()))
+                .filter(|c| !crate::is_ignored_check(&c.name, crate::WATCH_IGNORED_CHECKS))
                 .collect();
             for ev in ci_events(state, &checks, pr_number.as_deref()) {
                 send_event(&tx, ev);
