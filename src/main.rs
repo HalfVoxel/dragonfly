@@ -79,7 +79,8 @@ enum CliCommand {
     /// existing functions semantically similar to functions this branch
     /// added or changed (LLM behavior summaries embedded and compared by
     /// cosine similarity; summaries/embeddings cached by content hash under
-    /// ~/.dragonfly/dedup so only new code hits the LLM).
+    /// ~/.dragonfly/dedup and shared with the team via GCS, so each function
+    /// hits the LLM once org-wide).
     Dedup {
         #[command(subcommand)]
         command: Option<DedupCommand>,
@@ -192,7 +193,8 @@ enum DedupCommand {
     /// from stdin: one `<changed-func> [match...]` line per verdict.
     /// Accepts full identities (`go/api/pkg/util.(Server).handleFoo`) or a
     /// bare function name when unambiguous. Dismissed pairs are excluded
-    /// from all future listings (shared across worktrees of this repo).
+    /// from all future listings, on every machine: they sync through the
+    /// same GCS cache as the summaries and embeddings.
     Dismiss {
         /// The changed function, as printed by `dragonfly dedup`, or `-`
         /// to read batch lines from stdin.
@@ -205,6 +207,18 @@ enum DedupCommand {
         /// Emit JSON instead of the human listing.
         #[arg(long)]
         json: bool,
+    },
+    /// Sync the shared dedup index with GCS (also runs automatically inside
+    /// `dragonfly dedup`): pull packs other machines uploaded, and seed the
+    /// remote when it is empty. Packs carry behavior summaries and embedding
+    /// vectors keyed by content hash, plus dismissed not-a-duplicate pairs —
+    /// never source code. Configure the location with DRAGONFLY_DEDUP_GCS
+    /// (gs://bucket/prefix, or `off`).
+    Sync {
+        /// Push the entire local index as one pack, not just seed-if-empty.
+        /// Recovers entries whose original run died before its upload.
+        #[arg(long)]
+        full: bool,
     },
 }
 
@@ -6132,6 +6146,7 @@ async fn main() {
                         dedup::cmd_dismiss(func, matches, base, threshold, limit).await
                     }
                     Some(DedupCommand::Exclusions { json }) => dedup::cmd_exclusions(json).await,
+                    Some(DedupCommand::Sync { full }) => dedup::cmd_sync(full).await,
                 };
                 std::process::exit(code);
             }
