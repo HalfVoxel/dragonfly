@@ -13,11 +13,11 @@ The `dragonfly` CLI is required (install: `cargo install --git https://github.co
 
 1. If the invocation names a specific area or file list, focus the fan-out there; otherwise review the whole branch diff.
 2. `git fetch origin` so remote refs are current.
-3. Warm the shared review context (background it; takes ~10–60s cold — it runs PR-area scoring, CLAUDE.md/AGENTS.md chunk ranking, and duplicate-function detection):
+3. Warm the shared review context (background it; takes ~10–60s cold — it runs PR-area scoring and CLAUDE.md/AGENTS.md chunk ranking):
    ```bash
    dragonfly prompt review-agent > /dev/null
    ```
-   This populates a 4-minute per-cwd cache that the SubagentStart hook serves to every subagent, so the fan-out pays the build cost once. Stderr reports cache hit/build timing.
+   This populates a 4-minute per-cwd cache that the SubagentStart hook serves to the `review-agent` and `test-reviewer` spawns; the comment-reviewer's inline-diff context and the dedup-reviewer's hint context build separately. Stderr reports cache hit/build timing.
 4. While that runs, do Phase 1. Then get the area breakdown (cached by HEAD SHA after the warm):
    ```bash
    dragonfly --areas
@@ -62,7 +62,7 @@ Ask which issues to fix as free-form text (not AskUserQuestion). After fixing ap
 
 ## Phase 4 — Stamp the review
 
-After reporting (the stamp means "reviewed", not "approved"), record the reviewed HEAD (kept as a review log; also consumed by the optional push-gate hook if it's ever re-enabled):
+After reporting (the stamp means "reviewed", not "approved"), record the reviewed HEAD as a review log:
 
 ```bash
 mkdir -p ~/.dragonfly/reviewed

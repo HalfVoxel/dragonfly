@@ -11,10 +11,9 @@ When a `review-agent`, `comment-reviewer`, `dedup-reviewer`, or
 out to
     dragonfly prompt review-agent [--inline-diffs]   # review/comment/test agents
     dragonfly prompt dedup-reviewer                  # dedup agent
-and pipes stdout through to the subagent. Claude Code delivers a
-SubagentStart hook's stdout to the subagent as a system reminder before
-its first turn (documented for SessionStart / Setup / SubagentStart in
-[hooks docs](https://code.claude.com/docs/en/hooks)).
+and returns the output as the subagent's initial context via
+`hookSpecificOutput.additionalContext` JSON (plain hook stdout does not
+reach SubagentStart subagents; see the comment at the emit site below).
 
 `comment-reviewer` gets `--inline-diffs` (full diffs inlined in the
 context); `review-agent` and `test-reviewer` get the default /tmp
@@ -28,11 +27,9 @@ the Rust binary. That command serializes parallel callers behind a
 filesystem flock so a multi-agent fan-out only pays the build cost once
 within a four-minute TTL.
 
-`dragonfly` is expected to be on PATH (the orchestrator adds the
-binary's own dir before exec'ing `claude`). When the hook is run outside
-that context (manual `claude` invocation against this settings file)
-the subprocess will simply fail and we exit 0 — failing open is
-preferable to breaking the parent's review flow.
+`dragonfly` is expected to be on PATH. When it is missing the hook
+exits 0 without output — failing open is preferable to breaking the
+review flow, and the agents carry their own fallback instructions.
 
 Matchers in hooks.json gate this hook on agent_type "review-agent",
 "comment-reviewer", "dedup-reviewer", and "test-reviewer"; the hook keys
@@ -106,7 +103,7 @@ def main() -> int:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=False,
-            timeout=600,
+            timeout=550,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         print(f"review-context: {BIN_NAME} invocation failed: {e}", file=sys.stderr)

@@ -6,10 +6,9 @@ When a `review-agent`, `comment-reviewer`, `dedup-reviewer`, or
 flow, this hook shells out to
     dragonfly prompt review-agent [--inline-diffs]   # review/comment/test agents
     dragonfly prompt dedup-reviewer                  # dedup agent
-and pipes stdout through to the subagent. Claude Code delivers a
-SubagentStart hook's stdout to the subagent as a system reminder before
-its first turn (documented for SessionStart / Setup / SubagentStart in
-[hooks docs](https://code.claude.com/docs/en/hooks)).
+and returns the output as the subagent's initial context via
+`hookSpecificOutput.additionalContext` JSON (plain hook stdout does not
+reach SubagentStart subagents; see the comment at the emit site below).
 
 `comment-reviewer` gets `--inline-diffs` (full diffs inlined in the
 context); `review-agent` and `test-reviewer` get the default /tmp
@@ -31,7 +30,9 @@ preferable to breaking the parent's review flow.
 
 Matchers in settings/dragonfly-settings.json gate this hook on agent_type
 "review-agent", "comment-reviewer", "dedup-reviewer", and "test-reviewer";
-the hook keys the --inline-diffs flag off that same agent_type.
+the hook keys the --inline-diffs flag off that same agent_type. Agents
+registered by the dragonfly-review plugin carry a "<plugin-name>:" prefix
+in agent_type, so the prefix is stripped before comparing.
 """
 
 import json
@@ -81,7 +82,7 @@ def main() -> int:
     # dedup-reviewer has its own tailored context (full hint list inlined);
     # the other reviewers share the review-agent context, with only the
     # comment reviewer paying for inlined diffs.
-    agent_type = payload.get("agent_type")
+    agent_type = (payload.get("agent_type") or "").split(":")[-1]
     if agent_type == "dedup-reviewer":
         cmd = [bin_path, "prompt", "dedup-reviewer"]
     else:

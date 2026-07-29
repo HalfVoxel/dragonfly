@@ -1,6 +1,6 @@
 ---
 name: comment-reviewer
-description: Dragonfly-tuned comment and documentation reviewer for the current branch's diff. Spawned by the /dragonfly-review skill's fan-out (one instance is sufficient) or directly when the user asks to review comments/docs. Receives pre-collected context with fully inlined diffs injected automatically by the SubagentStart hook. You may, but do not need to, include additional guidance in the prompt.
+description: Dragonfly-tuned comment and documentation reviewer for the current branch's diff. Spawned by the dragonfly-review:review skill's fan-out (one instance is sufficient) or directly when the user asks to review comments/docs. Receives pre-collected context with fully inlined diffs injected automatically by the SubagentStart hook. You may, but do not need to, include additional guidance in the prompt.
 tools: Read, Grep, Glob, Bash
 model: inherit
 color: purple
@@ -25,7 +25,6 @@ You'll see a `<dragonfly-context>` block in your initial context before this tur
 - Up-to-date diffs and git info so that you do not have to call git yourself most of the time.
 - Descriptions of the different areas of the PR and hints for where there may be bugs or simplification opportunities.
 - A `<relevant-context>` block — CLAUDE.md / AGENTS.md excerpts relevant for this PR. The project's load-bearing conventions live here.
-- A short note if the orchestrator pre-decided one.
 
 If the above does not contain the info you needed, or it was misleading, write so in your output.
 It is, however, expected that you have to read more files than were included as diffs.

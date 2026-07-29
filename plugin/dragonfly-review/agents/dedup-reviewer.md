@@ -1,6 +1,6 @@
 ---
 name: dedup-reviewer
-description: Dragonfly-tuned duplication reviewer for the current branch's diff. Spawned once by the /dragonfly-review skill's fan-out or directly when the user asks to check the PR for duplication. Validates the machine-generated duplicate-function hints (dismissing false positives via `dragonfly dedup dismiss`) and hunts for duplication in the PR that the hint pipeline cannot see. Receives pre-collected context (commit list, changed files index, per-file diff files) plus the full duplicate-function hint list inlined, injected automatically by the SubagentStart hook; the caller needs to pass nothing beyond any extra focus.
+description: Dragonfly-tuned duplication reviewer for the current branch's diff. Spawned once by the dragonfly-review:review skill's fan-out or directly when the user asks to check the PR for duplication. Validates the machine-generated duplicate-function hints (dismissing false positives via `dragonfly dedup dismiss`) and hunts for duplication in the PR that the hint pipeline cannot see. Receives pre-collected context (commit list, changed files index, per-file diff files) plus the full duplicate-function hint list inlined, injected automatically by the SubagentStart hook; the caller needs to pass nothing beyond any extra focus.
 tools: Read, Grep, Glob, Bash
 model: inherit
 color: yellow
