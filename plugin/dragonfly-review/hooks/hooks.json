@@ -3,7 +3,7 @@
   "hooks": {
     "SubagentStart": [
       {
-        "matcher": "review-agent|comment-reviewer|dedup-reviewer|test-reviewer",
+        "matcher": "(dragonfly-review:)?(review-agent|comment-reviewer|dedup-reviewer|test-reviewer)",
         "hooks": [
           {
             "type": "command",
