@@ -1,0 +1,7 @@
+{
+  "name": "dragonfly-review",
+  "description": "Fan-out PR review: a skill that spawns dragonfly-tuned reviewer subagents (correctness, comments, tests, duplication), each fed pre-collected diff context by the dragonfly CLI",
+  "version": "0.1.0",
+  "author": { "name": "Vic Klein" },
+  "repository": "https://github.com/HalfVoxel/dragonfly"
+}
