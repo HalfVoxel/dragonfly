@@ -644,9 +644,10 @@ fn submit_feedback(message: &str) {
 
 /// If the branch is behind origin/main and would rebase cleanly, rebase it.
 /// New branches (no upstream) rebase automatically; branches with a remote
-/// counterpart prompt first. Reuses the merge-tree probe that will later
-/// drive the "Merge Conflict Check" prompt section. Returns true if a rebase
-/// actually happened, so the caller can promote a normal push to a force-push.
+/// counterpart prompt first, defaulting to yes if unanswered within 30s.
+/// Reuses the merge-tree probe that will later drive the "Merge Conflict
+/// Check" prompt section. Returns true if a rebase actually happened, so the
+/// caller can promote a normal push to a force-push.
 ///
 /// Graphite branches are skipped entirely: `git rebase origin/main` rewrites
 /// only the current branch and leaves Graphite's parent metadata and any
@@ -709,15 +710,24 @@ async fn maybe_rebase_on_main(
         let prompt =
             format!("Branch is {behind} behind origin/main and rebase is clean. Rebase now?");
         let _hold = status::hold();
-        match dialoguer::Confirm::new()
-            .with_prompt(prompt)
-            .default(true)
-            .interact()
-        {
-            Ok(yes) => yes,
-            Err(e) => {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = dialoguer::Confirm::new()
+                .with_prompt(prompt)
+                .default(true)
+                .interact();
+            let _ = tx.send(result);
+        });
+        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(Ok(Ok(yes))) => yes,
+            Ok(Ok(Err(e))) => {
                 println!("   Rebase prompt cancelled: {e}");
                 false
+            }
+            Ok(Err(_)) => false,
+            Err(_) => {
+                println!("   No response in 30s — proceeding with rebase.");
+                true
             }
         }
     };
