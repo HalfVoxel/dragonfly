@@ -6120,11 +6120,38 @@ async fn build_claude_invocation(
     let settings = dragonfly_settings_expanded();
     let agents = build_agents_json();
     ClaudeInvocation {
-        prompt,
+        prompt: spill_oversized_prompt(prompt),
         settings,
         agents,
         path,
     }
+}
+
+/// Argv bytes the prompt may occupy before it is moved into a file.
+///
+/// Darwin's `ARG_MAX` is 1 MiB shared by argv *and* the environment, and the
+/// exec is the point of no return: overflow surfaces as `E2BIG` after the full
+/// push/CI/review collection has already run.
+const MAX_PROMPT_ARGV_BYTES: usize = 256 * 1024;
+
+/// Pass the prompt through argv, or write it to a file and return a pointer to
+/// it when it is too large to exec with.
+fn spill_oversized_prompt(prompt: String) -> String {
+    if prompt.len() <= MAX_PROMPT_ARGV_BYTES {
+        return prompt;
+    }
+    let f = section("prompt", &prompt);
+    println!(
+        "   Prompt is {} KiB — passing it as a file ({}).",
+        prompt.len() / 1024,
+        f.path.display(),
+    );
+    format!(
+        "Your instructions for this session are too large to pass on the command line.\n\
+         Read {} in full, right now, before doing anything else, and follow it as if it \
+         had been sent as this message.\n",
+        f.path.display(),
+    )
 }
 
 #[tokio::main]
@@ -6636,5 +6663,20 @@ index 111..222 100644
         assert!(out.starts_with("…[earlier log truncated]…\n"));
         assert!(out.ends_with("##[error]boom"));
         assert!(!out.contains(&"x".repeat(22)));
+    }
+
+    #[test]
+    fn oversized_prompt_becomes_a_file_pointer() {
+        let small = "read the diff".to_string();
+        assert_eq!(spill_oversized_prompt(small.clone()), small);
+
+        let huge = "x".repeat(MAX_PROMPT_ARGV_BYTES + 1);
+        let out = spill_oversized_prompt(huge.clone());
+        assert!(out.len() < 1024);
+        let path = out
+            .split_whitespace()
+            .find(|w| w.contains("/psc-prompt-"))
+            .expect("pointer names the spill file");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), huge);
     }
 }

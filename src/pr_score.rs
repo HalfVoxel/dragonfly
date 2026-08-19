@@ -23,6 +23,25 @@ struct LovScore {
 /// `LOV_PATH` overrides the binary; otherwise `lov` on PATH is used. The
 /// rag-score subcommand lives on an unmerged worktree branch as of this
 /// writing, so PATH may need to point at that build.
+/// Diff bytes kept as the scoring query.
+///
+/// `lov eval rag score` takes the query through `--query` only, so an
+/// unbounded diff makes the spawn fail with `E2BIG` (Darwin `ARG_MAX` is 1 MiB
+/// for argv plus environment) and drops `<relevant-context>` from the prompt
+/// entirely. The head of a diff is enough signal to rank guide chunks.
+const MAX_QUERY_BYTES: usize = 128 * 1024;
+
+fn cap_query(query: &str) -> &str {
+    if query.len() <= MAX_QUERY_BYTES {
+        return query;
+    }
+    let mut end = MAX_QUERY_BYTES;
+    while end > 0 && !query.is_char_boundary(end) {
+        end -= 1;
+    }
+    &query[..end]
+}
+
 pub async fn score_chunks(chunks: &[GuideChunk], query: &str) -> Result<Vec<f64>, String> {
     if chunks.is_empty() {
         return Ok(vec![]);
@@ -56,7 +75,7 @@ pub async fn score_chunks(chunks: &[GuideChunk], query: &str) -> Result<Vec<f64>
         .arg("rag")
         .arg("score")
         .arg("--query")
-        .arg(query);
+        .arg(cap_query(query));
     for p in &chunk_paths {
         cmd.arg(p);
     }
