@@ -10,9 +10,14 @@ hook reject it. PermissionRequest fires while the dialog is still pending,
 so a deny cancels the prompt before the user sees it. PreToolUse stays
 registered to catch commands that are allowlisted (e.g. Bash(git:*)) and
 therefore never raise a dialog.
+
+Set GIT_GUARD=off to disable. Required for headless runs (`claude -p`): with no
+human to answer, an "ask" decision is a hard block, so goalie-triage agents
+could not commit at all.
 """
 
 import json
+import os
 import re
 import sys
 
@@ -20,9 +25,12 @@ RULES = [
     # (pattern, exclude_pattern, decision, reason)
     (r"\bgit\s+add\b[^|&;]*?(\s--all\b|\s-[a-z]*A[a-z]*\b)", None, "deny",
      "git add -A / --all is not allowed. Stage files explicitly by path (e.g. `git add path/to/file`) so unintended changes are never committed."),
-    (r"\bgit\s+merge\s+", None, "deny", "git merge is not allowed. Rebase instead."),
-    (r"\bgit\s+commit\b", None, "ask", "git commit requires confirmation"),
-    (r"\bgit\s+(rebase|reset)\b", r"\bgit\s+rebase\s+--continue\b", "ask", "git rebase/reset requires confirmation"),
+    # `--abort/--continue/--quit` clean up an in-progress merge rather than create
+    # one; `git merge-base`/`merge-file` don't match (no space after `merge`).
+    (r"\bgit\s+merge\s+", r"\bgit\s+merge\s+--(abort|continue|quit)\b", "deny",
+     "git merge is not allowed. Rebase instead: `git fetch origin && git rebase origin/main`."),
+    # (r"\bgit\s+commit\b", None, "ask", "git commit requires confirmation"),
+    # (r"\bgit\s+(rebase|reset)\b", r"\bgit\s+rebase\s+--continue\b", "ask", "git rebase/reset requires confirmation"),
 ]
 
 
@@ -57,6 +65,8 @@ def build_output(event: str, decision: str, reason: str) -> dict | None:
 
 
 def main():
+    if os.environ.get("GIT_GUARD") == "off":
+        return
     data = json.load(sys.stdin)
     cmd = data.get("tool_input", {}).get("command", "")
     result = check_command(cmd)
