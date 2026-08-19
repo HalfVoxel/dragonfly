@@ -1769,10 +1769,23 @@ async fn get_changed_files(base_ref: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// True when the `rgo` wrapper is installed, meaning Go builds belong on the
+/// dev-aron build server instead of this machine. Every rgo-vs-local choice reads
+/// this, so a machine without rgo keeps the original behavior throughout.
+fn rgo_available() -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg("command -v rgo >/dev/null 2>&1")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn start_local_lints(changed_dirs: &std::collections::HashSet<&str>) -> Vec<(String, Child)> {
     let mut linters = Vec::new();
     if changed_dirs.contains("go") {
-        linters.push(("lint-go".into(), sh_bg("lint-go")));
+        let cmd = if rgo_available() { "rgo lint" } else { "lint-go" };
+        linters.push(("lint-go".into(), sh_bg(cmd)));
     }
     if changed_dirs.contains("app") {
         linters.push((
@@ -5595,7 +5608,16 @@ fn build_prompt(
     } else {
         ""
     };
+    // Naming the guarded commands only helps where the guard exists; without rgo the
+    // agent must be told to run them locally, as it always did.
+    let go_verify = if rgo_available() {
+        "   - For Go files: `rgo lint` and/or `rgo test <pkgs>` \
+         (both run on the build server; a hook denies local `lint-go` / `test-api`)"
+    } else {
+        "   - For Go files: `lint-go` and/or `test-api`"
+    };
     let skill_text = skill::DRAGONFLY_SKILL
+        .replace("GO_VERIFY_PLACEHOLDER", go_verify)
         .replace("CUSTOM_REVIEW_PLACEHOLDER", review_instructions)
         .replace(
             "PR_DESCRIPTION_GUIDE_PATH",

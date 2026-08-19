@@ -122,7 +122,7 @@ Pre-existing issues on main should not be fixed before asking the user.
 5. **Fix it**: If relevant to this PR and NOT pre-existing, fix the issue. Ask the user for clarifications if any are needed.
 
 5.1 **Run local verification** before pushing again:
-   - For Go files: `lint-go` and/or `test-api`
+GO_VERIFY_PLACEHOLDER
    - For frontend files: `lint-web` and/or `test-web`
    - Format edited files: `format <files>`
 
