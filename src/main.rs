@@ -5237,28 +5237,28 @@ async fn pr_base_ref() -> String {
     let Some(parent) = branches.get(idx + 1) else {
         return default;
     };
-    // Sanity: parent must be an ancestor of HEAD.
-    if sh3(&format!("git merge-base --is-ancestor {parent} HEAD"))
+    // Sanity: the ref we hand to `git diff` must itself be an ancestor of HEAD,
+    // not just the local branch it is named after. `origin/<parent>` goes stale
+    // whenever the stack is restacked without being resubmitted; diffing
+    // against a diverged ref yields the whole merge-base..HEAD range (thousands
+    // of files, hundreds of KB of `--stat`) instead of this PR's changes.
+    for candidate in [format!("origin/{parent}"), parent.clone()] {
+        if is_ancestor_of_head(&candidate).await {
+            return candidate;
+        }
+    }
+    default
+}
+
+/// True when `git_ref` exists and is an ancestor of HEAD.
+///
+/// `merge-base --is-ancestor` exits non-zero for an unknown ref too, so this
+/// doubles as an existence check.
+async fn is_ancestor_of_head(git_ref: &str) -> bool {
+    sh3(&format!("git merge-base --is-ancestor {git_ref} HEAD"))
         .await
         .code
-        != 0
-    {
-        return default;
-    }
-    let remote = format!("origin/{parent}");
-    if sh(&format!("git rev-parse --verify {remote}"))
-        .await
-        .is_some()
-    {
-        remote
-    } else if sh(&format!("git rev-parse --verify {parent}"))
-        .await
-        .is_some()
-    {
-        parent.clone()
-    } else {
-        default
-    }
+        == 0
 }
 
 fn graphite_section(info: &GraphiteInfo) -> String {
