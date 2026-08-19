@@ -50,6 +50,10 @@ Pre-existing tests in a touched file are in scope when they interact with your f
 
 **Hard to test implementations**: Could the implementation be simplified or refactored to make the code easier to test?
 
+**Test optimizations**: Can tests use go's `testing/synctest` package to speed them up? If they are blocking on sleep at any point. Can they be optimized in other ways? Note that test clarity is preferred over a super-optimized test. We just want to avoid unnecessarily slow tests.
+
+**Test determinism/flakiness**: Is there a risk a test can be flaky in a heavily loaded CI runner, or due to some other reason? `synctest` can be a great help here too.
+
 ## Comment guidelines
 
 Read: @../code-comments.md

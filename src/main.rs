@@ -5562,6 +5562,7 @@ const REVIEW_SIMPLIFICATION: &str = "\
 This PR has areas with high simplification potential.
 Spawn a dedicated `review-agent` subagent (subagent_type: review-agent) to review the code for simplification opportunities — duplicate code, large functions that should be broken down, or repetitive patterns that could be restructured.
 Guide it using the potential_for_simplification score in the PR areas breakdown — focus it on the areas with the highest simplification potential. The <dragonfly-context> hook delivers the diff files automatically; you only need to specify the focus.
+While simplifications in tests are still worthwhile to report, the dedicated test reviewer will take care of digging deep into them, use this reviewer to focus on non-test code.
 ";
 
 fn build_prompt(
@@ -5896,6 +5897,7 @@ async fn build_claude_invocation(
              - Focus on Phase 5 (review bot comments) and Phase 6 (custom review).\n\
              - Surface findings as a numbered list; let the user pick which to post as a PR comment.\n\
              - After user approves, post a single top-level PR comment with the review findings via `dragonfly pr comment --body -` (pipe the markdown on stdin to avoid shell-quoting the multi-line body). Group findings in red/orange/green sections (use colored dots).\n\
+               Title should be 'Dragonfly Review (agent generated + human review)'. Skip 'Checked and found clean' and similar sections. Only incude the findings. Keep each finding concise.
              - Skip Phase 7 (PR description) and Phase 9 (ready for review).\n\
              - When CI fails, report it; do not start fixing it.\n\n",
             pr_info.author_login, viewer_login,

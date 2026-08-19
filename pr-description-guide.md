@@ -7,12 +7,30 @@ This guide complements the existing repo rule in `AGENTS.md`, but overrides it w
 
 Pick the ones that fit the change; skip ones that don't. Order them as listed below.
 
+# Background (High level)
+
+Assume the reader knows nothing of the codebase, but is familiar on a high level with how the product works.
+Explain what issue's related subsystems do on a very high level. Avoid mentioning specific code.
+Use terms in ./GLOSSARY.md if relevant.
+Then explain how the issue ties into the systems.
+
+# Background (Low level)
+
+Assume the reader is somewhat familiar with the codebase, but not with this area of the code. Explain on a high level what they need to know to evaluate this issue.
+
 - **`# Summary`** — 1-3 bullets. What changed and the headline why.
+- **`# Background (High level)`**: Assume the reader knows nothing of the codebase, but is familiar on a high level with how the product works.
+Explain what issue's related subsystems do on a very high level. Avoid mentioning specific code.
+Use terms in ./GLOSSARY.md if relevant.
+Then explain how the issue ties into the systems.
+2-4 sentences.
+- **`# Background (Low level)`**
+Assume the reader is somewhat familiar with the codebase, but not with this area of the code. Explain on a high level what they need to know to evaluate this issue. Builds upon the high level background, but word it so that this section makes sense even if a user skipped the high level background.
+1-4 sentences.
 - **`# Important behavioral changes`** — 0-3 bullets. If this PR is a refactor and it introduces some important behavioral change that reviewers may object to. Mention it here.
-- **`# Problem`** — 2-4 bullets. Motivation, prior behavior, what hurt without this.
 - **`# Example`** (or `# Examples`) — only when appropriate (CLI updates, new APIs, config changes that benefit from showing usage). Contains a fenced code block.
-- **`# What changed`** — 3-6 bullets. Concrete changes. One sentence per bullet.
-- **`# Who`** — If the features are behind a feature flag, list it here. E.g. "* All functionality gated behind the new-trajectory/constructPrompt feature flag (rolled out to 5%)". Make the feature flag name a link to confidence.
+- **`# What changed`** — 3-6 bullets. Concrete changes. One sentence per bullet. Keep them high-level and scannable.
+- **`# Feature flags`** — If the features are behind a feature flag, list it here. E.g. "* All functionality gated behind the new-trajectory/constructPrompt feature flag (rolled out to 5%)". Make the feature flag name a link to confidence.
 - **`# Links`** — For bugfixes, it's useful to include grafana urls / braintrust trace links or similar that show the bug happening.
 
 ## PR examples

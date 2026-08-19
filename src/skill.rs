@@ -180,8 +180,10 @@ For each bot comment:
 
 When responding to PR comments by humans, only ever respond with concise wording like "Fixed in <commit>" (for simple things) or something like "Fixed in <commit>, X now does Y" (for more complex things).
 Never include rationale, the comment should read as an informational statement, not a conversation.
+You should *never ever* reply to humans automatically without approval from the user first.
 
 When responding to bots, rationale can be included if the issue was a false-positive, so that they do not report the same thing again later.
+
 
 ## Phase 6: Custom review
 
@@ -249,7 +251,7 @@ dismissed pairs.
 
 ## Phase 7: PR description
 
-If the PR has no substantial description, write one using:
+If the PR has no substantial description, or just has an auto-generated one (contains "Generated with Claude Code" or a "Test plan" header, which manually written ones never do), write one using:
 
 ```
 dragonfly pr description "..."
@@ -263,6 +265,9 @@ However, you should not include fixes to the PR itself in its description. It sh
 Before submitting a PR description, you *must* always check the latest PR description via the `gh` cli, to ensure it hasn't been updated from elsewhere.
 
 Before writing or updating a description, read the PR description guide (sections to use, examples, graphs, hard rules) at:
+
+Treat a previously auto-generated description (contains "🤖 Generated with Claude Code") as low-quality and not authoritive.
+It will need to be rewritten to follow these guidelines.
 
 ```
 PR_DESCRIPTION_GUIDE_PATH
