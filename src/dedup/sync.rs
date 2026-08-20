@@ -461,8 +461,8 @@ impl Gcs {
     }
 
     async fn upload(&self, object: &str, data: &[u8]) -> Result<(), String> {
-        let mut tmp = tempfile::NamedTempFile::new_in(dedup_dir())
-            .map_err(|e| format!("temp file: {e}"))?;
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(dedup_dir()).map_err(|e| format!("temp file: {e}"))?;
         {
             use std::io::Write as _;
             tmp.write_all(data).map_err(|e| format!("temp file: {e}"))?;
@@ -829,7 +829,10 @@ mod tests {
 
     #[test]
     fn enc_escapes_path_separators() {
-        assert_eq!(enc("dedup/v1/packs/ab.pack"), "dedup%2Fv1%2Fpacks%2Fab.pack");
+        assert_eq!(
+            enc("dedup/v1/packs/ab.pack"),
+            "dedup%2Fv1%2Fpacks%2Fab.pack"
+        );
         assert_eq!(enc("a-b._~Z9"), "a-b._~Z9");
     }
 }
