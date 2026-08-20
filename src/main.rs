@@ -16,8 +16,11 @@ mod guide_chunks;
 mod pr_score;
 mod sessions;
 mod skill;
+mod stack;
 mod status;
 mod watch_mcp;
+
+use stack::{StackDetails, pr_base_ref};
 
 #[derive(Parser)]
 #[command(name = "dragonfly")]
@@ -91,7 +94,7 @@ enum CliCommand {
         #[arg(long, default_value_t = dedup::DEFAULT_LIMIT)]
         limit: usize,
         /// Override the base ref for the changed-function diff. Default:
-        /// auto-detected via `pr_base_ref` (graphite stack parent or
+        /// auto-detected via `pr_base_ref` (stack parent or
         /// origin/main).
         #[arg(long)]
         base: Option<String>,
@@ -99,6 +102,10 @@ enum CliCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Print the PR stack the current branch belongs to: kind (native GitHub
+    /// or Graphite), branch order, the base ref diffs are measured against,
+    /// and per-PR CI status.
+    Stack,
     /// List CLAUDE.md / AGENTS.md guides relevant to the given file paths.
     /// Walks parent dirs of each path up to the git toplevel, follows
     /// `@`-references transitively, dedupes, and prints one absolute path per
@@ -119,7 +126,7 @@ enum CliCommand {
         #[arg(long)]
         output: Option<PathBuf>,
         /// Override the base ref for the diff. Default: auto-detected via
-        /// `pr_base_ref` (graphite stack parent or origin/main). Useful
+        /// `pr_base_ref` (stack parent or origin/main). Useful
         /// when HEAD is a detached merge commit and origin/main already
         /// contains it — pass `HEAD^1` (the pre-merge main) instead.
         #[arg(long)]
@@ -649,10 +656,10 @@ fn submit_feedback(message: &str) {
 /// Check" prompt section. Returns true if a rebase actually happened, so the
 /// caller can promote a normal push to a force-push.
 ///
-/// Graphite branches are skipped entirely: `git rebase origin/main` rewrites
-/// only the current branch and leaves Graphite's parent metadata and any
-/// descendant branches pointing at orphaned commits. Restacking is the user's
-/// job (`gt sync`), not this flow's.
+/// Stacked branches are skipped entirely: `git rebase origin/main` rewrites
+/// only the current branch, leaving the branches above it — and Graphite's or
+/// `gh stack`'s parent metadata — pointing at orphaned commits. Restacking is
+/// the user's job (`gh stack sync` / `gt sync`), not this flow's.
 async fn maybe_rebase_on_main(
     has_upstream: bool,
     merge_probe: &ShResult,
@@ -667,7 +674,14 @@ async fn maybe_rebase_on_main(
         return false;
     }
 
-    if is_graphite_branch().await {
+    if let Some(s) = stack::detect_stack().await {
+        let hint = stack::restack_hint(s.kind);
+        println!("   Branch is {behind} behind origin/main; skipping auto-rebase ({hint}).");
+        return false;
+    }
+    // A single Graphite-tracked branch is not a stack, but `gt` still owns its
+    // parent metadata, so a raw rebase would desync it.
+    if stack::is_graphite_branch().await {
         println!(
             "   Branch is {behind} behind origin/main; skipping auto-rebase (Graphite branch — run `gt sync` to restack)."
         );
@@ -1794,7 +1808,11 @@ fn rgo_available() -> bool {
 fn start_local_lints(changed_dirs: &std::collections::HashSet<&str>) -> Vec<(String, Child)> {
     let mut linters = Vec::new();
     if changed_dirs.contains("go") {
-        let cmd = if rgo_available() { "rgo lint" } else { "lint-go" };
+        let cmd = if rgo_available() {
+            "rgo lint"
+        } else {
+            "lint-go"
+        };
         linters.push(("lint-go".into(), sh_bg(cmd)));
     }
     if changed_dirs.contains("app") {
@@ -5073,210 +5091,6 @@ fn extract_json_from_end(output: &str) -> Option<serde_json::Value> {
     None
 }
 
-// ── Graphite detection ───────────────────────────────────────────────────────
-
-struct GraphiteInfo {
-    stack_viz: String,
-    stack_ci_status: String,
-}
-
-async fn get_graphite_trunk() -> String {
-    // Use --git-common-dir so this works inside worktrees (where .git is a file).
-    let Some(git_common_dir) = sh("git rev-parse --git-common-dir").await else {
-        return "main".into();
-    };
-    let config_candidates = [
-        PathBuf::from(&git_common_dir).join(".graphite_repo_config"),
-        PathBuf::from(&git_common_dir).join("graphite_repo_config"),
-    ];
-    config_candidates
-        .iter()
-        .find(|p| p.exists())
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-        .and_then(|v| v.get("trunk").and_then(|s| s.as_str().map(String::from)))
-        .unwrap_or_else(|| "main".to_string())
-}
-
-/// Parse branch names from `gt log short --stack` output. Since `--stack`
-/// already restricts output to ancestors + descendants of the current branch,
-/// we only need to strip the bullet chars and any trailing "(needs restack)" /
-/// "(current, ...)" annotation.
-fn parse_stack_branches(output: &str, trunk: &str) -> Vec<String> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let line_before_paren = line.split('(').next().unwrap_or(line);
-            let start = line_before_paren
-                .char_indices()
-                .find(|(_, c)| c.is_ascii_alphanumeric() || *c == '_')?
-                .0;
-            let name = line_before_paren[start..].trim().to_string();
-            if name.is_empty() || name == trunk {
-                None
-            } else {
-                Some(name)
-            }
-        })
-        .collect()
-}
-
-/// True if the current branch is tracked by Graphite (single branch or stack).
-/// `gt log short --stack` exits non-zero on an untracked branch, so a clean exit
-/// with at least one non-trunk branch means Graphite owns this branch's parent.
-async fn is_graphite_branch() -> bool {
-    let r = sh3("gt log short --stack 2>/dev/null").await;
-    if r.code != 0 || r.stdout.is_empty() {
-        return false;
-    }
-    let trunk = get_graphite_trunk().await;
-    !parse_stack_branches(&r.stdout, &trunk).is_empty()
-}
-
-/// Returns (stack_viz, branches) if the current branch is part of a multi-branch
-/// Graphite stack. Uses `gt log short --stack`, which limits output to the
-/// current linear stack — no sibling-stack filtering needed.
-async fn detect_graphite_stack(trunk: &str) -> Option<(String, Vec<String>)> {
-    let r = sh3("gt log short --stack 2>/dev/null").await;
-    if r.code != 0 || r.stdout.is_empty() {
-        return None;
-    }
-    let branches = parse_stack_branches(&r.stdout, trunk);
-    // A stack needs at least 2 non-trunk branches (current + ancestor/descendant).
-    if branches.len() < 2 {
-        return None;
-    }
-    Some((r.stdout, branches))
-}
-
-async fn branch_ci_status(branch: String, is_current: bool) -> String {
-    let view_cmd = format!("gh pr view {branch} --json number 2>/dev/null");
-    let checks_cmd = format!("gh pr checks {branch} 2>/dev/null");
-    let (view_r, checks_r) = tokio::join!(sh3(&view_cmd), sh3(&checks_cmd));
-
-    let marker = if is_current {
-        " **(current — CI wait blocks here)**"
-    } else {
-        ""
-    };
-
-    let pr_num: Option<u64> = serde_json::from_str::<serde_json::Value>(&view_r.stdout)
-        .ok()
-        .and_then(|v| v.get("number").and_then(|n| n.as_u64()));
-
-    let Some(pr) = pr_num else {
-        return format!("- `{branch}`{marker} — no PR");
-    };
-
-    let counts = parse_checks(&checks_r.stdout, IGNORED_CHECKS);
-    let mut parts = Vec::new();
-    if counts.passed > 0 {
-        parts.push(format!("{} passed", counts.passed));
-    }
-    if counts.failed > 0 {
-        parts.push(format!("{} failing", counts.failed));
-    }
-    if counts.pending > 0 {
-        parts.push(format!("{} pending", counts.pending));
-    }
-    let summary = if parts.is_empty() {
-        "no checks yet".into()
-    } else {
-        parts.join(", ")
-    };
-    format!("- `{branch}`{marker} — PR #{pr} — {summary}")
-}
-
-async fn collect_stack_ci_status(branches: &[String], current: &str) -> String {
-    let handles: Vec<_> = branches
-        .iter()
-        .map(|b| {
-            let is_current = b == current;
-            tokio::spawn(branch_ci_status(b.clone(), is_current))
-        })
-        .collect();
-
-    let mut lines = Vec::new();
-    for h in handles {
-        if let Ok(line) = h.await {
-            lines.push(line);
-        }
-    }
-    lines.join("\n")
-}
-
-async fn build_graphite_info() -> Option<GraphiteInfo> {
-    let trunk = get_graphite_trunk().await;
-    let (stack_viz, branches) = detect_graphite_stack(&trunk).await?;
-    let current = sh("git branch --show-current").await.unwrap_or_default();
-    let stack_ci_status = collect_stack_ci_status(&branches, &current).await;
-    Some(GraphiteInfo {
-        stack_viz,
-        stack_ci_status,
-    })
-}
-
-/// Returns the git ref to compare HEAD against for "what's in this PR" diffs.
-/// In a Graphite stack, returns `origin/<parent_branch>` (or the local branch
-/// if origin/<parent_branch> is missing). Otherwise returns `origin/<trunk>`.
-/// Merge-conflict checks deliberately stay against `origin/main` and use raw
-/// strings rather than this helper.
-async fn pr_base_ref() -> String {
-    let trunk = get_graphite_trunk().await;
-    let default = format!("origin/{trunk}");
-    let Some((_, branches)) = detect_graphite_stack(&trunk).await else {
-        return default;
-    };
-    let current = sh("git branch --show-current").await.unwrap_or_default();
-    if current.is_empty() {
-        return default;
-    }
-    let Some(idx) = branches.iter().position(|b| b == &current) else {
-        return default;
-    };
-    let Some(parent) = branches.get(idx + 1) else {
-        return default;
-    };
-    // Sanity: the ref we hand to `git diff` must itself be an ancestor of HEAD,
-    // not just the local branch it is named after. `origin/<parent>` goes stale
-    // whenever the stack is restacked without being resubmitted; diffing
-    // against a diverged ref yields the whole merge-base..HEAD range (thousands
-    // of files, hundreds of KB of `--stat`) instead of this PR's changes.
-    for candidate in [format!("origin/{parent}"), parent.clone()] {
-        if is_ancestor_of_head(&candidate).await {
-            return candidate;
-        }
-    }
-    default
-}
-
-/// True when `git_ref` exists and is an ancestor of HEAD.
-///
-/// `merge-base --is-ancestor` exits non-zero for an unknown ref too, so this
-/// doubles as an existence check.
-async fn is_ancestor_of_head(git_ref: &str) -> bool {
-    sh3(&format!("git merge-base --is-ancestor {git_ref} HEAD"))
-        .await
-        .code
-        == 0
-}
-
-fn graphite_section(info: &GraphiteInfo) -> String {
-    format!(
-        "\n## Graphite Stack\n\n\
-         This branch is in a Graphite stack. Prefer `gt` over raw git so stack metadata stays in sync:\n\n\
-         - `gt submit --no-edit --stack` — push/update the whole stack. `gt absorb` and `gt restack` rewrite ancestor/descendant commits, so pushing only the current branch would leave those PRs pointing at orphaned commits on GitHub. `gt submit` ignores `--title`/`--body`; use `gh pr edit` for those.\n\
-         - `gt absorb --dry-run` → `gt absorb` — route a staged fix into the ancestor branch whose lines it touches, instead of piling a commit on the current branch.\n\
-         - `gt restack` — rebase dependents after amending an ancestor or when trunk has moved. Don't use `gt get --force` here; it force-updates siblings from remote.\n\n\
-         Current stack:\n\
-         ```\n{}\n```\n\n\
-         ### Stack PR CI status\n\n\
-         **Only the current branch's CI blocks this run.** Ancestor-PR failures are informational — mention them in the final summary, but don't block on or fix them unless the user asks.\n\n\
-         {}\n",
-        info.stack_viz, info.stack_ci_status
-    )
-}
-
 // ── Prompt building ──────────────────────────────────────────────────────────
 
 // Settings JSON + Bash PreToolUse hooks are bundled with the binary. The
@@ -5577,7 +5391,7 @@ fn build_prompt(
     initial_review_str: &str,
     pr_areas_str: &str,
     pr_areas: &Option<serde_json::Value>,
-    graphite_str: &str,
+    stack_str: &str,
     agent_sessions_str: &str,
     relevant_context_str: &str,
     review_only_note: Option<&str>,
@@ -5655,7 +5469,7 @@ fn build_prompt(
     };
 
     format!(
-        "{review_only_prefix}{skill_text}{graphite_str}\n\n\
+        "{review_only_prefix}{skill_text}{stack_str}\n\n\
          # Instructions\n\n\
          Current time: {now}\n\
          PR status: {pr_status}\n\
@@ -5797,7 +5611,7 @@ async fn build_claude_invocation(
         println!("⚠️  Push had issues: {}", push_result.stderr);
     }
 
-    let mut graphite_handle = Some(tokio::spawn(build_graphite_info()));
+    let mut stack_handle = Some(tokio::spawn(stack::build_stack_details()));
 
     let base_ref = pr_base_ref().await;
     if base_ref != "origin/main" {
@@ -5853,7 +5667,7 @@ async fn build_claude_invocation(
     files.push(section("merge", &merge.content));
 
     let mut pre_areas: Option<(Option<serde_json::Value>, String, ContextStrings)> = None;
-    let mut pre_graphite: Option<Option<GraphiteInfo>> = None;
+    let mut pre_stack: Option<Option<StackDetails>> = None;
     let pr_info = if let Some(pr) = early_pr_info {
         pr
     } else {
@@ -5866,14 +5680,14 @@ async fn build_claude_invocation(
         } else {
             prompt_pr_title(&branch_commits)
         };
-        // Drain the subagent and graphite handles after the prompt; the
+        // Drain the subagent and stack handles after the prompt; the
         // results are needed by the rest of build_claude_invocation either
         // way, and waiting now keeps the later `pre_*` paths tidy.
         if let Some(h) = areas_handle.take() {
             pre_areas = h.await.ok();
         }
-        if let Some(h) = graphite_handle.take() {
-            pre_graphite = Some(h.await.ok().flatten());
+        if let Some(h) = stack_handle.take() {
+            pre_stack = Some(h.await.ok().flatten());
         }
         match title {
             Some(t) => create_pr_with_title(&t).await,
@@ -6055,16 +5869,20 @@ async fn build_claude_invocation(
         })
         .unwrap_or_default();
 
-    let graphite_info = match pre_graphite {
+    let stack_details = match pre_stack {
         Some(v) => v,
-        None => graphite_handle.take().unwrap().await.ok().flatten(),
+        None => stack_handle.take().unwrap().await.ok().flatten(),
     };
-    if graphite_info.is_some() {
-        println!("   Graphite stack detected — including stack workflow + per-PR CI status.");
+    if let Some(d) = stack_details.as_ref() {
+        let kind = match d.info.kind {
+            stack::StackKind::GitHub => "GitHub PR stack",
+            stack::StackKind::Graphite => "Graphite stack",
+        };
+        println!("   {kind} detected — including stack workflow + per-PR CI status.");
     }
-    let graphite_str = graphite_info
+    let stack_str = stack_details
         .as_ref()
-        .map(graphite_section)
+        .map(stack::stack_section)
         .unwrap_or_default();
 
     let cwd = std::env::current_dir()
@@ -6095,7 +5913,7 @@ async fn build_claude_invocation(
         &initial_review_str,
         &pr_areas_str,
         &pr_areas,
-        &graphite_str,
+        &stack_str,
         &agent_sessions_str,
         &relevant_context_str,
         review_only_note.as_deref(),
@@ -6266,6 +6084,30 @@ async fn main() {
             } => {
                 let code = dedup_reviewer_prompt_cmd().await;
                 std::process::exit(code);
+            }
+            CliCommand::Stack => {
+                match stack::build_stack_details().await {
+                    Some(d) => {
+                        let kind = match d.info.kind {
+                            stack::StackKind::GitHub => "native GitHub (gh stack)",
+                            stack::StackKind::Graphite => "Graphite (gt)",
+                        };
+                        println!("Stack: {kind}");
+                        println!("{}", d.info.viz.trim_end());
+                        if let Some(parent) = &d.info.parent {
+                            println!("\nParent branch: {parent}");
+                        }
+                        println!("Diff base ref: {}", pr_base_ref().await);
+                        if d.info.untracked_locally {
+                            println!(
+                                "Local `gh stack` tracking: missing (run `gh stack checkout <pr>`)"
+                            );
+                        }
+                        println!("\n{}", d.ci_status);
+                    }
+                    None => println!("Not in a stack (diff base ref: {}).", pr_base_ref().await),
+                }
+                return;
             }
             CliCommand::Guides { paths } => {
                 let paths = if paths.is_empty() {

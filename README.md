@@ -22,7 +22,7 @@ Why use this instead of just letting claude do everything itself?
 * It automatically spawns multiple review subagents which finds a lot more issues than claude does on its own.
 * Reading existing files is faster for claude than invoking git commands itself.
 * Claude often runs the wrong git commands (e.g. diffs against `main` when it should use `origin/main`)
-* Claude often doesn't realize it's in a graphite stacked PR by itself.
+* Claude often doesn't realize it's in a stacked PR by itself (native `gh stack` or Graphite).
 * Claude is automatically prompted to follow a strict sequence of phases, which covers much more than it does by itself, unprompted.
 * Dangerous git commands require approval via a hook, even if claude runs the rest with dangerously-skip-permissions.
 * Responds to review comments in a concise way if asked. Always labels ai comments with a footer.
