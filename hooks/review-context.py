@@ -32,8 +32,9 @@ Matchers in settings/dragonfly-settings.json gate this hook on agent_type
 "review-agent", "comment-reviewer", "dedup-reviewer", and "test-reviewer";
 the hook keys the --inline-diffs flag off that same agent_type. These
 matchers only ever see bare agent types, so the namespace strip below is
-a no-op here; it exists to keep this body identical to the plugin's
-vendored copy, which receives "dragonfly-review:"-prefixed agent types.
+a no-op here; it exists to keep this body in sync with the plugin's
+vendored copy, which receives "dragonfly-review:"-prefixed agent types
+and deliberately runs its subprocess with a shorter (550s) timeout.
 """
 
 import json
