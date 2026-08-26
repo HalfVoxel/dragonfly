@@ -35,7 +35,7 @@ pub const DEFAULT_LIMIT: usize = 5;
 // Pipeline knobs, carried over from funcsim's tuned defaults.
 const MIN_CHARS: usize = 120;
 const MAX_CHARS: usize = 6000;
-const SUMMARY_MODEL: &str = "vertex/gemini-3.1-flash-lite-preview";
+const SUMMARY_MODEL: &str = "vertex/gemini-3.1-flash-lite";
 const SUMMARY_BATCH: usize = 20;
 const SUMMARY_CONCURRENCY: usize = 8;
 const SUMMARY_MAX_FUNC_CHARS: usize = 3000;

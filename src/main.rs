@@ -272,7 +272,7 @@ enum PrCommand {
 /// the underlying `provider/model` string at call time so flags stay short.
 #[derive(Clone, Copy, ValueEnum)]
 enum Model {
-    /// vertex/gemini-3.1-flash-lite-preview — cheap/fast, weak on subtle bugs.
+    /// vertex/gemini-3.1-flash-lite — cheap/fast, weak on subtle bugs.
     Gemini,
     /// anthropic/claude-haiku-4-5
     Haiku,
@@ -285,7 +285,7 @@ enum Model {
 impl Model {
     fn kit_id(self) -> &'static str {
         match self {
-            Self::Gemini => "vertex/gemini-3.1-flash-lite-preview",
+            Self::Gemini => "vertex/gemini-3.1-flash-lite",
             Self::Haiku => "anthropic/claude-haiku-4-5",
             Self::Sonnet => "anthropic/claude-sonnet-4-6",
             Self::Opus => "anthropic/claude-opus-4-7",
