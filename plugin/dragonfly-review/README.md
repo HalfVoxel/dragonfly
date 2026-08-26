@@ -30,8 +30,11 @@ and are silently absent without it.
 
 `hooks/review-context.py` is a vendored copy of the repo's
 `hooks/review-context.py` (plugins cannot reference files outside their
-root), and the four `agents/*.md` are adapted copies of the repo's
-`agents/` files; sync deliberate changes both ways.
+root), the four `agents/*.md` are adapted copies of the repo's `agents/`
+files with the `code-comments.md` guide inlined (the repo agents
+@-reference it instead), and `skills/review/SKILL.md` shares its policy
+blocks with `DRAGONFLY_SKILL` in `src/skill.rs`. Sync deliberate changes
+to any of them both ways.
 
 ## Notes
 

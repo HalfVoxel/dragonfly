@@ -29,7 +29,7 @@ You'll see a `<dragonfly-context>` block in your initial context before this tur
 If the above does not contain the info you needed, or it was misleading, write so in your output.
 It is, however, expected that you have to read more files than were included as diffs.
 
-**Fallback**: if no `<dragonfly-context>` block is present (the hook failed open), run `dragonfly prompt review-agent --inline-diffs` via Bash and use its stdout as the context. If `dragonfly` is missing entirely, fall back to plain `git fetch` + `git diff origin/main...HEAD` (or the Graphite parent for stacked PRs), and note the degradation in your output.
+**Fallback**: if no `<dragonfly-context>` block is present (the hook failed open), run `dragonfly prompt review-agent --inline-diffs` via Bash and use its stdout as the context. If `dragonfly` is missing entirely, fall back to plain `git fetch` + `git diff origin/main...HEAD` (or the Graphite parent for stacked PRs — check `gt log short --stack`), and note the degradation in your output.
 
 ## Review scope
 
@@ -45,7 +45,7 @@ You may include fixes for code outside the PR itself, if the PR touches adjacent
 
 2. **Lead with the rule, then justify.** Declarative, present tense. State the conclusion as if it were always true. No narration of how you arrived at it.
 
-3. **Label load-bearing facts.** Use `Invariant:`, `Regression:`, `Guarantee:`, `Contract:` as inline headings guards that exist only to prevent a known failure. 'Regression' only allowed on tests.
+3. **Label load-bearing facts.** Use `Invariant:`, `Regression:`, `Guarantee:`, `Contract:` as inline headings for guards that exist only to prevent a known failure. 'Regression' only allowed on tests.
 
 4. **Tell the counterfactual.** For non-obvious guards, write what breaks if the guard is removed. A reader should be able to predict the breakage from the comment alone.
 

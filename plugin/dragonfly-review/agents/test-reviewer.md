@@ -60,7 +60,7 @@ Pre-existing tests in a touched file are in scope when they interact with your f
 
 2. **Lead with the rule, then justify.** Declarative, present tense. State the conclusion as if it were always true. No narration of how you arrived at it.
 
-3. **Label load-bearing facts.** Use `Invariant:`, `Regression:`, `Guarantee:`, `Contract:` as inline headings guards that exist only to prevent a known failure. 'Regression' only allowed on tests.
+3. **Label load-bearing facts.** Use `Invariant:`, `Regression:`, `Guarantee:`, `Contract:` as inline headings for guards that exist only to prevent a known failure. 'Regression' only allowed on tests.
 
 4. **Tell the counterfactual.** For non-obvious guards, write what breaks if the guard is removed. A reader should be able to predict the breakage from the comment alone.
 

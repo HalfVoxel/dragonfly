@@ -30,9 +30,10 @@ preferable to breaking the parent's review flow.
 
 Matchers in settings/dragonfly-settings.json gate this hook on agent_type
 "review-agent", "comment-reviewer", "dedup-reviewer", and "test-reviewer";
-the hook keys the --inline-diffs flag off that same agent_type. Agents
-registered by the dragonfly-review plugin carry a "<plugin-name>:" prefix
-in agent_type, so the prefix is stripped before comparing.
+the hook keys the --inline-diffs flag off that same agent_type. These
+matchers only ever see bare agent types, so the namespace strip below is
+a no-op here; it exists to keep this body identical to the plugin's
+vendored copy, which receives "dragonfly-review:"-prefixed agent types.
 """
 
 import json

@@ -3,8 +3,10 @@
 
 Vendored copy of ../../../hooks/review-context.py: installed plugins are
 copied to Claude Code's plugin cache, which cannot reference files outside
-the plugin root. Keep the two files in sync apart from the plugin-specific
-agent-type namespace handling below.
+the plugin root. The bodies are kept identical except one deliberate
+delta: the subprocess timeout is 550 here vs 600 in the repo copy. It
+must stay below the 600s hook timeout in hooks.json, or Claude Code
+kills the hook before the graceful TimeoutExpired fail-open path runs.
 
 When a `review-agent`, `comment-reviewer`, `dedup-reviewer`, or
 `test-reviewer` subagent (see ../agents/) is spawned, this hook shells
@@ -31,11 +33,10 @@ within a four-minute TTL.
 exits 0 without output — failing open is preferable to breaking the
 review flow, and the agents carry their own fallback instructions.
 
-Matchers in hooks.json gate this hook on agent_type "review-agent",
-"comment-reviewer", "dedup-reviewer", and "test-reviewer"; the hook keys
-the --inline-diffs flag off that same agent_type. Plugin-provided agents
-carry a "<plugin-name>:" prefix in agent_type, so the prefix is stripped
-before comparing.
+The hooks.json matcher fires only for the plugin-namespaced agent types
+("dragonfly-review:review-agent", ...) — SubagentStart matchers are
+full-string regexes, so bare names never match. The hook strips the
+prefix before keying the --inline-diffs flag off the agent type.
 """
 
 import json
