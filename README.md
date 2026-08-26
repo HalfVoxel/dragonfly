@@ -62,10 +62,10 @@ dragonfly --feedback "..."  # append a note to ~/.dragonfly/feedback
 This repo is a Claude Code plugin marketplace
 (`claude plugin marketplace add HalfVoxel/dragonfly`):
 
-- [`dragonfly-review`](plugin/dragonfly-review/) — the fan-out PR review flow
+- [`dragonfly-review`](plugin/dragonfly-review/): the fan-out PR review flow
   as an installable skill + reviewer subagents + context-injection hook, for
   use from any Claude Code session (no orchestrator run required).
-- [`dragonfly-watcher`](plugin/dragonfly-watcher/) — a channel that pushes CI
+- [`dragonfly-watcher`](plugin/dragonfly-watcher/): a channel that pushes CI
   results and new PR comments into the running session.
 
 ## Requirements

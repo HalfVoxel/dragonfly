@@ -24,7 +24,7 @@ and are silently absent without it.
 
 | Component | Purpose |
 | --- | --- |
-| `skills/review` | Orchestrator: scope, comment triage, fan-out, report. Review-only — it never pushes, and replies to review threads only after user approval. |
+| `skills/review` | Orchestrator: scope, comment triage, fan-out, report. Review-only: it never pushes, and replies to review threads only after user approval. |
 | `agents/` | The four reviewer subagents (read-only tools; `model: inherit`) |
 | `hooks/` | SubagentStart hook injecting `<dragonfly-context>` via `dragonfly prompt` |
 
@@ -39,10 +39,10 @@ in `src/skill.rs`. Sync deliberate changes to any of them both ways.
 ## Notes
 
 - If you previously wired these agents/hooks manually in `~/.claude`, remove
-  those copies — otherwise both hook registrations fire and the context is
+  those copies; otherwise both hook registrations fire and the context is
   injected twice.
 - The skill and subagents call a handful of `dragonfly` subcommands
-  (`prompt`, `--areas`, `pr comments`, `dedup …`) — all read-only except
+  (`prompt`, `--areas`, `pr comments`, `dedup …`), all read-only except
   `dedup dismiss`, which records persistent not-a-duplicate verdicts.
   Allowlist them in your permissions settings to avoid prompts, e.g.
   `Bash(dragonfly prompt:*)`, `Bash(dragonfly --areas)`,

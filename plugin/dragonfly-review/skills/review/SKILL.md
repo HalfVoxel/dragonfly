@@ -5,7 +5,7 @@ description: Dragonfly PR review — fan out specialist review subagents over th
 
 # Dragonfly review
 
-Review the current branch's changes (the PR) using Dragonfly's fan-out review flow. You orchestrate; the `review-agent` / `comment-reviewer` / `test-reviewer` / `dedup-reviewer` subagents (this plugin's agents — their types may appear namespaced, e.g. `dragonfly-review:review-agent`) do the reading. Review-only: report findings first, fix only what the user picks.
+Review the current branch's changes (the PR) using Dragonfly's fan-out review flow. You orchestrate; the `review-agent` / `comment-reviewer` / `test-reviewer` / `dedup-reviewer` subagents (this plugin's agents; their types may appear namespaced, e.g. `dragonfly-review:review-agent`) do the reading. Review-only: report findings first, fix only what the user picks.
 
 The `dragonfly` CLI is required (install: `cargo install --git https://github.com/HalfVoxel/dragonfly --locked`). If it's missing, fall back to plain `git`/`gh` and a single `review-agent` with the diff scope in the prompt.
 

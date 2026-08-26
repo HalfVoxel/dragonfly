@@ -6405,8 +6405,7 @@ index 111..222 100644
     #[test]
     fn plugin_agents_inline_current_code_comments() {
         // The plugin cache cannot reference files outside the plugin root, so
-        // these two agents vendor the guide; this pins them to the canonical
-        // code-comments.md so guide edits cannot drift apart.
+        // these agents vendor the guide; pin them to the canonical copy.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let guide = crate::skill::CODE_COMMENTS_GUIDE.trim();
         for agent in ["comment-reviewer", "test-reviewer"] {
@@ -6423,9 +6422,8 @@ index 111..222 100644
 
     #[test]
     fn plugin_hook_body_matches_repo_hook() {
-        // The vendored hook's only deliberate body delta is the 550s
-        // subprocess timeout (it must stay below hooks.json's 600s hook
-        // timeout); docstrings legitimately differ.
+        // Invariant: the vendored hook's only body delta is the 550s
+        // subprocess timeout, which must stay below hooks.json's 600s.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let after_docstring = |src: &str| {
             let open = src.find("\"\"\"").expect("docstring open");

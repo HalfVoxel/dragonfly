@@ -30,11 +30,11 @@ filesystem flock so a multi-agent fan-out only pays the build cost once
 within a four-minute TTL.
 
 `dragonfly` is expected to be on PATH. When it is missing the hook
-exits 0 without output — failing open is preferable to breaking the
+exits 0 without output; failing open is preferable to breaking the
 review flow, and the agents carry their own fallback instructions.
 
 The hooks.json matcher fires only for the plugin-namespaced agent types
-("dragonfly-review:review-agent", ...) — SubagentStart matchers are
+("dragonfly-review:review-agent", ...): SubagentStart matchers are
 full-string regexes, so bare names never match. The hook strips the
 prefix before keying the --inline-diffs flag off the agent type.
 """
