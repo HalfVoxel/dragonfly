@@ -6,7 +6,7 @@ copied to Claude Code's plugin cache, which cannot reference files outside
 the plugin root. The bodies are kept identical except one deliberate
 delta: the subprocess timeout is 550 here vs 600 in the repo copy. It
 must stay below the 600s hook timeout in hooks.json, or Claude Code
-kills the hook before the graceful TimeoutExpired fail-open path runs.
+kills the hook before the TimeoutExpired path can report the failure.
 
 When a `review-agent`, `comment-reviewer`, `dedup-reviewer`, or
 `test-reviewer` subagent (see ../agents/) is spawned, this hook shells
@@ -29,9 +29,10 @@ the Rust binary. That command serializes parallel callers behind a
 filesystem flock so a multi-agent fan-out only pays the build cost once
 within a four-minute TTL.
 
-`dragonfly` is expected to be on PATH. When it is missing the hook
-exits 0 without output; failing open is preferable to breaking the
-review flow, and the agents carry their own fallback instructions.
+Contract: the hook never fails open. Every failure to produce context
+exits 2 (blocking) rather than letting the reviewer start empty; see
+[_fail]. `dragonfly` is expected to be on PATH, so a checkout without
+the binary installed fails the spawn until it is.
 
 The hooks.json matcher fires only for the plugin-namespaced agent types
 ("dragonfly-review:review-agent", ...): SubagentStart matchers are
@@ -57,6 +58,26 @@ def _debug(msg: str) -> None:
             fh.write(msg + "\n")
 
 
+def _fail(reason: str) -> int:
+    """Aborts the spawn with a blocking hook error.
+
+    Contract: this hook never fails open. A reviewer subagent that starts
+    without <dragonfly-context> reviews an empty diff and reports "no
+    issues found", which reads as a clean review rather than a broken
+    one. Exit 2 is Claude Code's blocking-error code: the spawn fails and
+    stderr surfaces, so a stale cache or a missing binary is a visible
+    failure the caller must fix, not a silently degraded review.
+    """
+    _debug(f"[hook] failing loudly: {reason}")
+    print(f"review-context: {reason}", file=sys.stderr)
+    print(
+        "review-context: refusing to start the reviewer without "
+        "<dragonfly-context>. Fix the cause and re-spawn.",
+        file=sys.stderr,
+    )
+    return 2
+
+
 def main() -> int:
     raw_stdin = sys.stdin.read()
     _debug(f"[hook] invoked, stdin_len={len(raw_stdin)}")
@@ -64,8 +85,7 @@ def main() -> int:
         payload = json.loads(raw_stdin)
     except json.JSONDecodeError:
         _debug(f"[hook] bad json: {raw_stdin[:200]!r}")
-        # Unparseable input is a hook-runner bug, not ours. Fail open.
-        return 0
+        return _fail(f"unparseable hook payload: {raw_stdin[:200]!r}")
     _debug(
         f"[hook] event={payload.get('hook_event_name')!r} "
         f"agent_type={payload.get('agent_type')!r} "
@@ -77,11 +97,7 @@ def main() -> int:
 
     bin_path = shutil.which(BIN_NAME)
     if bin_path is None:
-        print(
-            f"review-context: {BIN_NAME!r} not on PATH; skipping context injection.",
-            file=sys.stderr,
-        )
-        return 0
+        return _fail(f"{BIN_NAME!r} not on PATH; cannot build review context")
 
     # dedup-reviewer has its own tailored context (full hint list inlined);
     # the other reviewers share the review-agent context, with only the
@@ -107,21 +123,16 @@ def main() -> int:
             timeout=550,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
-        print(f"review-context: {BIN_NAME} invocation failed: {e}", file=sys.stderr)
-        return 0
+        return _fail(f"{BIN_NAME} invocation failed: {e}")
 
     # Propagate the subprocess's stderr so build/timing logs surface in
     # the parent agent's transcript when something goes wrong.
     if result.stderr:
         sys.stderr.buffer.write(result.stderr)
     if result.returncode != 0:
-        print(
-            f"review-context: {BIN_NAME} exited {result.returncode}; skipping.",
-            file=sys.stderr,
-        )
-        return 0
+        return _fail(f"{BIN_NAME} exited {result.returncode}")
     if not result.stdout:
-        return 0
+        return _fail(f"{BIN_NAME} produced no context on stdout")
 
     # Claude Code routes a SubagentStart hook's
     # `hookSpecificOutput.additionalContext` into the subagent's initial

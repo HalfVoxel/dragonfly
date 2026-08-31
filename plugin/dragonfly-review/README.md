@@ -30,11 +30,16 @@ and are silently absent without it.
 
 `hooks/review-context.py` is a vendored copy of the repo's
 `hooks/review-context.py` (plugins cannot reference files outside their
-root), the four `agents/*.md` are adapted copies of the repo's `agents/`
-files (`comment-reviewer` and `test-reviewer` inline the
-`code-comments.md` guide their repo counterparts @-reference), and
-`skills/review/SKILL.md` shares its policy blocks with `DRAGONFLY_SKILL`
-in `src/skill.rs`. Sync deliberate changes to any of them both ways.
+root), and `skills/review/SKILL.md` shares its policy blocks with
+`DRAGONFLY_SKILL` in `src/skill.rs`. Sync deliberate changes to either
+one both ways.
+
+The four `agents/*.md` bodies are **generated** from the repo's
+`agents/` files — edit those, then run `dragonfly gen-plugin-agents`.
+Frontmatter here is hand-maintained (the plugin pins `tools:` for
+read-only enforcement and `model: inherit`); only the body is derived.
+`src/gen_plugin.rs` declares the body deltas, and
+`plugin_agents_match_generated` fails the build when a copy goes stale.
 
 ## Notes
 

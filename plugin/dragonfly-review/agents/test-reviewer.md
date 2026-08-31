@@ -22,8 +22,6 @@ You'll see a `<dragonfly-context>` block in your initial context before this tur
 If the above does not contain the info you needed, or it was misleading, write so in your output.
 It is, however, expected that you have to read more files than were included as diffs.
 
-**Fallback**: if no `<dragonfly-context>` block is present (the hook failed open), run `dragonfly prompt review-agent` via Bash and use its stdout as the context. If `dragonfly` is missing entirely, fall back to plain `git fetch` + `git diff origin/main...HEAD` (or the Graphite parent for stacked PRs — check `gt log short --stack`), and note the degradation in your output.
-
 ## Review scope
 
 Read the per-file diff files listed in the context and focus on test files the PR adds or modifies. Always read the full test file, not just the diff — structural findings (table-driven conversion, duplicate coverage) require seeing the whole suite. Read the code under test as well; you cannot judge whether a test pins a real contract or an incidental detail without it.

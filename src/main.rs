@@ -12,6 +12,7 @@ use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
 mod dedup;
+mod gen_plugin;
 mod guide_chunks;
 mod pr_score;
 mod sessions;
@@ -141,6 +142,15 @@ enum CliCommand {
     /// `@`-imports inlined (resolved against the file's directory). Lets
     /// scripts/compare-comment-reviewers.sh reuse the binary's @-expansion
     /// instead of reimplementing it.
+    /// Regenerate the dragonfly-review plugin's vendored agent bodies from
+    /// the canonical `agents/*.md`. Frontmatter in the plugin copies is
+    /// preserved; see src/gen_plugin.rs for the declared body deltas.
+    #[command(hide = true)]
+    GenPluginAgents {
+        /// Report stale files and exit 1 instead of rewriting them.
+        #[arg(long)]
+        check: bool,
+    },
     #[command(hide = true)]
     ExpandAgent {
         /// Path to an agent markdown file (e.g. agents/comment-reviewer.md).
@@ -6133,6 +6143,9 @@ async fn main() {
             } => {
                 score_guides_cmd(output, base, threshold).await;
             }
+            CliCommand::GenPluginAgents { check } => {
+                std::process::exit(gen_plugin::gen_plugin_agents(check));
+            }
             CliCommand::ExpandAgent { file } => match expand_agent_file(&file) {
                 Ok(s) => print!("{s}"),
                 Err(e) => {
@@ -6306,24 +6319,6 @@ index 111..222 100644
     }
 
     #[test]
-    fn plugin_agents_inline_current_code_comments() {
-        // The plugin cache cannot reference files outside the plugin root, so
-        // these agents vendor the guide; pin them to the canonical copy.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let guide = crate::skill::CODE_COMMENTS_GUIDE.trim();
-        for agent in ["comment-reviewer", "test-reviewer"] {
-            let body = std::fs::read_to_string(
-                root.join(format!("plugin/dragonfly-review/agents/{agent}.md")),
-            )
-            .unwrap();
-            assert!(
-                body.contains(guide),
-                "plugin {agent}.md no longer inlines code-comments.md verbatim"
-            );
-        }
-    }
-
-    #[test]
     fn plugin_hook_body_matches_repo_hook() {
         // Invariant: the vendored hook's only body delta is the 550s
         // subprocess timeout, which must stay below hooks.json's 600s.
@@ -6333,12 +6328,10 @@ index 111..222 100644
             let close = src[open + 3..].find("\"\"\"").expect("docstring close");
             src[open + 3 + close + 3..].to_string()
         };
-        let repo =
-            std::fs::read_to_string(root.join("hooks/review-context.py")).unwrap();
-        let plugin = std::fs::read_to_string(
-            root.join("plugin/dragonfly-review/hooks/review-context.py"),
-        )
-        .unwrap();
+        let repo = std::fs::read_to_string(root.join("hooks/review-context.py")).unwrap();
+        let plugin =
+            std::fs::read_to_string(root.join("plugin/dragonfly-review/hooks/review-context.py"))
+                .unwrap();
         assert_eq!(
             after_docstring(&repo),
             after_docstring(&plugin).replace("timeout=550,", "timeout=600,"),
