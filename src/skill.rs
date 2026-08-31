@@ -1,5 +1,7 @@
 pub const CODE_COMMENTS_GUIDE: &str = include_str!("../code-comments.md");
 
+// plugin/dragonfly-review/skills/review/SKILL.md shares the review-phase
+// policy blocks below; sync deliberate changes both ways.
 pub const DRAGONFLY_SKILL: &str = r#"# Dragonfly
 
 Push the current branch, monitor CI, and fix relevant issues that arise — including review bot comments.

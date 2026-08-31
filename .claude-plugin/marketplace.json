@@ -7,6 +7,11 @@
       "name": "dragonfly-watcher",
       "source": "./plugin/dragonfly-watcher",
       "description": "Pushes CI check results and new PR review comments into the session as channel events"
+    },
+    {
+      "name": "dragonfly-review",
+      "source": "./plugin/dragonfly-review",
+      "description": "Fan-out PR review skill with dragonfly-tuned reviewer subagents fed pre-collected diff context"
     }
   ]
 }

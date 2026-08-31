@@ -6403,6 +6403,47 @@ index 111..222 100644
     }
 
     #[test]
+    fn plugin_agents_inline_current_code_comments() {
+        // The plugin cache cannot reference files outside the plugin root, so
+        // these agents vendor the guide; pin them to the canonical copy.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let guide = crate::skill::CODE_COMMENTS_GUIDE.trim();
+        for agent in ["comment-reviewer", "test-reviewer"] {
+            let body = std::fs::read_to_string(
+                root.join(format!("plugin/dragonfly-review/agents/{agent}.md")),
+            )
+            .unwrap();
+            assert!(
+                body.contains(guide),
+                "plugin {agent}.md no longer inlines code-comments.md verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn plugin_hook_body_matches_repo_hook() {
+        // Invariant: the vendored hook's only body delta is the 550s
+        // subprocess timeout, which must stay below hooks.json's 600s.
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let after_docstring = |src: &str| {
+            let open = src.find("\"\"\"").expect("docstring open");
+            let close = src[open + 3..].find("\"\"\"").expect("docstring close");
+            src[open + 3 + close + 3..].to_string()
+        };
+        let repo =
+            std::fs::read_to_string(root.join("hooks/review-context.py")).unwrap();
+        let plugin = std::fs::read_to_string(
+            root.join("plugin/dragonfly-review/hooks/review-context.py"),
+        )
+        .unwrap();
+        assert_eq!(
+            after_docstring(&repo),
+            after_docstring(&plugin).replace("timeout=550,", "timeout=600,"),
+            "hook bodies drifted beyond the documented timeout delta"
+        );
+    }
+
+    #[test]
     fn parse_hunk_new_start_reads_plus_side() {
         assert_eq!(parse_hunk_new_start(" -10,3 +50,3 @@ fn g() {"), Some(50));
         assert_eq!(parse_hunk_new_start(" -1 +1 @@"), Some(1));
