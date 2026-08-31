@@ -40,7 +40,7 @@ Spawn all subagents **in a single message** (parallel Agent tool calls). Their `
 Pick the fan-out from the area breakdown:
 
 - **Correctness** — one `review-agent` per area with `potential_for_bugs` ≥ 6. For those, instruct it to be aggressive: trace all code paths the change touches and follow call chains beyond the diff hunks.
-- **Simplification** — one `review-agent` if any area has `potential_for_simplification` ≥ 6, pointed at the highest-scoring areas.
+- **Simplification** — one `review-agent` if any area has `potential_for_simplification` ≥ 6, pointed at the highest-scoring areas. Point it at non-test code: simplifications in tests are worth reporting, but the `test-reviewer` owns digging into those.
 - **Deployment edge cases** — one `review-agent` if the diff touches wire formats, API contracts, schemas, enums, or feature flags. Remind it: deploys are gradual (~10 minutes), so old and new frontends/backends coexist and can call each other in mixed orders (e.g. old frontend → new backend → old backend).
 - **Comments & docs** — always one `comment-reviewer` (a single instance is sufficient; it typically needs no extra instructions).
 - **Test quality** — one `test-reviewer` if the PR adds or modifies test files (structure, duplicate or low-value tests, assertion style, coverage gaps). A single instance is sufficient; it typically needs no extra instructions.

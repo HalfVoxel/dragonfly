@@ -16,6 +16,7 @@ You'll see a `<dragonfly-context>` block in your initial context before this tur
 - Up-to-date diffs and git info so that you do not have to call git yourself most of the time.
 - Descriptions of the different areas of the PR and hints for where there may be bugs or simplification opportunities.
 - A `<relevant-context>` block — CLAUDE.md / AGENTS.md excerpts relevant for this PR. The project's load-bearing conventions live here.
+- A short **scope note** if the orchestrator pre-decided one (`backend only`, `frontend only`, `CLI only`, etc.).
 
 If the above does not contain the info you needed, or it was misleading, write so in your output.
 It is, however, expected that you have to read more files than were included as diffs.
