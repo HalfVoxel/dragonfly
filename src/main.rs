@@ -267,12 +267,15 @@ enum PrCommand {
         body: String,
     },
     /// Print PR review threads, top-level reviews, and metadata in the same
-    /// cleaned format used by the pre-collected data (review-threads,
-    /// review-pr, pr-meta). Defaults to the current branch's PR.
+    /// cleaned format used by the pre-collected data (pr-meta, pr-reviews,
+    /// review-threads, issue-comments). Defaults to the current branch's PR.
     Comments {
         /// Explicit PR number. Defaults to the current branch's PR.
         #[arg(long)]
         pr: Option<String>,
+        /// Include resolved review threads. Hidden by default, with a count.
+        #[arg(long)]
+        show_resolved: bool,
     },
     /// Run an initial code review of the current branch (defaults to Gemini).
     /// Same call that runs automatically inside `dragonfly` when no
@@ -580,10 +583,6 @@ fn write_section(prefix: &str, content: &str, suffix: &str) -> TempFile {
 
 fn section(prefix: &str, content: &str) -> TempFile {
     write_section(prefix, content, ".md")
-}
-
-fn section_json(prefix: &str, content: &str) -> TempFile {
-    write_section(prefix, content, ".json")
 }
 
 fn parse_json<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
@@ -925,6 +924,9 @@ const REVIEW_THREADS_QUERY: &str = r#"query($owner: String!, $repo: String!, $pr
           isOutdated
           path
           line
+          originalLine
+          startLine
+          originalStartLine
           comments(first: 50) {
             nodes {
               id
@@ -970,6 +972,12 @@ struct GqlThread {
     is_outdated: bool,
     path: Option<String>,
     line: Option<u64>,
+    #[serde(rename = "originalLine")]
+    original_line: Option<u64>,
+    #[serde(rename = "startLine")]
+    start_line: Option<u64>,
+    #[serde(rename = "originalStartLine")]
+    original_start_line: Option<u64>,
     comments: Option<GqlComments>,
 }
 #[derive(Deserialize, Default)]
@@ -1124,9 +1132,32 @@ fn clean_bot_body(raw: &str) -> String {
     re.replace_all(out.trim(), "\n\n").to_string()
 }
 
-fn format_threads_xml(threads: &[GqlThread]) -> String {
+/// Bot output with no review signal: Wiz scan tags and the Web Preview link
+/// card. Dropped entirely rather than collapsed to a stub.
+fn is_noise_comment(author: &str, body: &str) -> bool {
+    author.starts_with("wiz-") || body.contains("🌐 Web Preview")
+}
+
+fn format_threads_xml(threads: &[GqlThread], show_resolved: bool) -> String {
     let mut out = String::from("<review-threads>\n");
+    let mut hidden_resolved = 0usize;
     for t in threads {
+        let opener_is_noise = t
+            .comments
+            .as_ref()
+            .and_then(|c| c.nodes.first())
+            .map(|c| {
+                let author = c.author.as_ref().map(|a| a.login.as_str()).unwrap_or("");
+                is_noise_comment(author, &c.body)
+            })
+            .unwrap_or(false);
+        if opener_is_noise {
+            continue;
+        }
+        if t.is_resolved && !show_resolved {
+            hidden_resolved += 1;
+            continue;
+        }
         let status = if t.is_resolved {
             "resolved"
         } else if t.is_outdated {
@@ -1135,9 +1166,23 @@ fn format_threads_xml(threads: &[GqlThread]) -> String {
             "open"
         };
         let path = t.path.as_deref().unwrap_or("unknown");
-        let line = t.line.map(|l| l.to_string()).unwrap_or_default();
+        // Outdated threads carry only originalLine: GitHub nulls `line`
+        // once the commented hunk changes in a later push.
+        let end = t.line.or(t.original_line);
+        let line = end.map(|l| l.to_string()).unwrap_or_default();
+        let start_line = t
+            .start_line
+            .or(t.original_start_line)
+            .filter(|s| Some(*s) != end)
+            .map(|l| format!(" start_line=\"{l}\""))
+            .unwrap_or_default();
+        let outdated = if t.is_outdated && t.is_resolved {
+            " outdated=\"true\""
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "<thread id=\"{}\" status=\"{status}\" path=\"{path}\" line=\"{line}\">\n",
+            "<thread id=\"{}\" status=\"{status}\" path=\"{path}\" line=\"{line}\"{start_line}{outdated}>\n",
             xml_escape(&t.id)
         ));
         if let Some(comments) = &t.comments {
@@ -1157,6 +1202,11 @@ fn format_threads_xml(threads: &[GqlThread]) -> String {
             }
         }
         out.push_str("</thread>\n");
+    }
+    if hidden_resolved > 0 {
+        out.push_str(&format!(
+            "{hidden_resolved} additional resolved thread(s), view with --show-resolved\n"
+        ));
     }
     out.push_str("</review-threads>");
     out
@@ -1249,6 +1299,9 @@ async fn fetch_issue_comments(owner: &str, repo: &str, pr_number: &str) -> Optio
             .as_ref()
             .map(|u| u.login.as_str())
             .unwrap_or("unknown");
+        if is_noise_comment(author, &c.body) {
+            continue;
+        }
         let (kind, collapse) = classify_issue_comment(author, &c.body);
         if collapse {
             let first = c
@@ -1278,7 +1331,12 @@ async fn fetch_issue_comments(owner: &str, repo: &str, pr_number: &str) -> Optio
     Some(out)
 }
 
-async fn fetch_pr_comments(owner: &str, repo: &str, pr_number: &str) -> PrCommentsBundle {
+async fn fetch_pr_comments(
+    owner: &str,
+    repo: &str,
+    pr_number: &str,
+    show_resolved: bool,
+) -> PrCommentsBundle {
     let query_escaped = REVIEW_THREADS_QUERY.replace('\'', "'\\''");
     let bg_threads = sh_bg(&format!(
         "gh api graphql -f query='{query_escaped}' -f owner={owner} -f repo={repo} -F pr={pr_number}"
@@ -1309,7 +1367,7 @@ async fn fetch_pr_comments(owner: &str, repo: &str, pr_number: &str) -> PrCommen
                 .unwrap_or_default();
             bundle.has_unresolved = nodes.iter().any(|t| !t.is_resolved && !t.is_outdated);
             if !nodes.is_empty() {
-                bundle.threads_xml = Some(format_threads_xml(&nodes));
+                bundle.threads_xml = Some(format_threads_xml(&nodes, show_resolved));
             }
         } else {
             bundle.threads_raw_json = Some(threads.stdout);
@@ -1327,27 +1385,44 @@ async fn fetch_pr_comments(owner: &str, repo: &str, pr_number: &str) -> PrCommen
     bundle
 }
 
+impl PrCommentsBundle {
+    /// The bundle as self-describing blocks, each wrapped in an XML element
+    /// named after its section. Invariant: the section name is the element
+    /// name, so stdout output and the pre-collected file names agree.
+    fn sections(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if let Some(meta) = &self.meta {
+            out.push(("pr-meta", meta.clone()));
+        }
+        if let Some(xml) = &self.reviews_xml {
+            out.push(("pr-reviews", xml.clone()));
+        }
+        if let Some(xml) = &self.threads_xml {
+            out.push(("review-threads", xml.clone()));
+        } else if let Some(raw) = &self.threads_raw_json {
+            out.push((
+                "review-threads",
+                format!("<review-threads format=\"json\">\n{}\n</review-threads>", cdata(raw)),
+            ));
+        }
+        if let Some(xml) = &self.issue_comments_xml {
+            out.push(("issue-comments", xml.clone()));
+        }
+        out
+    }
+}
+
 async fn collect_reviews(owner: &str, repo: &str, pr_number: &str) -> (Vec<TempFile>, bool) {
-    let bundle = fetch_pr_comments(owner, repo, pr_number).await;
-    let mut files = Vec::new();
-    if let Some(xml) = &bundle.threads_xml {
-        files.push(section("review-threads", xml));
-    } else if let Some(raw) = &bundle.threads_raw_json {
-        files.push(section_json("review-threads", raw));
-    }
-    if let Some(xml) = &bundle.reviews_xml {
-        files.push(section("review-pr", xml));
-    }
-    if let Some(meta) = &bundle.meta {
-        files.push(section("pr-meta", meta));
-    }
-    if let Some(xml) = &bundle.issue_comments_xml {
-        files.push(section("issue-comments", xml));
-    }
+    let bundle = fetch_pr_comments(owner, repo, pr_number, true).await;
+    let files = bundle
+        .sections()
+        .iter()
+        .map(|(name, body)| section(name, body))
+        .collect();
     (files, bundle.has_unresolved)
 }
 
-async fn pr_comments(pr_arg: Option<String>) {
+async fn pr_comments(pr_arg: Option<String>, show_resolved: bool) {
     let pr_number = match pr_arg {
         Some(n) => n.trim().to_string(),
         None => match sh("gh pr view --json number --jq '.number'").await {
@@ -1377,36 +1452,14 @@ async fn pr_comments(pr_arg: Option<String>) {
     }
     let (owner, repo) = (parts[3], parts[4]);
 
-    let bundle = fetch_pr_comments(owner, repo, &pr_number).await;
-
-    let mut sections: Vec<(&str, String)> = Vec::new();
-    if let Some(meta) = bundle.meta {
-        sections.push(("pr-meta", meta));
-    }
-    if let Some(xml) = bundle.reviews_xml {
-        sections.push(("review-pr", xml));
-    }
-    if let Some(xml) = bundle.threads_xml {
-        sections.push(("review-threads", xml));
-    } else if let Some(raw) = bundle.threads_raw_json {
-        sections.push(("review-threads (raw JSON — XML parse failed)", raw));
-    }
-    if let Some(xml) = bundle.issue_comments_xml {
-        sections.push(("issue-comments", xml));
-    }
-
+    let bundle = fetch_pr_comments(owner, repo, &pr_number, show_resolved).await;
+    let sections = bundle.sections();
     if sections.is_empty() {
         eprintln!("No review threads, reviews, comments, or metadata found for PR #{pr_number}.");
         return;
     }
-
-    for (i, (label, body)) in sections.iter().enumerate() {
-        if i > 0 {
-            println!();
-        }
-        println!("<!-- {label} -->");
-        println!("{}", body.trim_end());
-    }
+    let bodies: Vec<&str> = sections.iter().map(|(_, b)| b.trim_end()).collect();
+    println!("{}", bodies.join("\n\n"));
 }
 
 #[derive(Deserialize, Default)]
@@ -1431,8 +1484,8 @@ struct PrReviewRequest {
 
 fn format_pr_meta(json: &str) -> Option<String> {
     let meta: PrViewMeta = serde_json::from_str(json).ok()?;
-    let mut out = String::new();
-    out.push_str(&format!("# PR\n\nTitle: {}\n", meta.title.trim()));
+    let mut out = String::from("<pr-meta>\n");
+    out.push_str(&format!("Title: {}\n", meta.title.trim()));
     let decision = meta
         .review_decision
         .as_deref()
@@ -1457,6 +1510,7 @@ fn format_pr_meta(json: &str) -> Option<String> {
     } else {
         out.push_str(&format!("\n## Body\n\n{body}\n"));
     }
+    out.push_str("</pr-meta>");
     Some(out)
 }
 
@@ -4048,7 +4102,7 @@ fn build_files_index(
             "review-threads",
             "review threads — inline review + bot comments)".into(),
         ),
-        ("review-pr", "top-level PR reviews".into()),
+        ("pr-reviews", "top-level PR reviews".into()),
         (
             "pr-meta",
             "PR title, body, review decision, requested reviewers".into(),
@@ -6026,9 +6080,9 @@ async fn main() {
                 pr_comment(pr, &body).await;
             }
             CliCommand::Pr {
-                command: PrCommand::Comments { pr },
+                command: PrCommand::Comments { pr, show_resolved },
             } => {
-                pr_comments(pr).await;
+                pr_comments(pr, show_resolved).await;
             }
             CliCommand::Pr {
                 command: PrCommand::Review { model },
@@ -6434,6 +6488,43 @@ index 111..222 100644
             counts.cancelled_names,
             vec!["lint-go-result".to_string(), "test-result".to_string()]
         );
+    }
+
+    #[test]
+    fn threads_xml_hides_resolved_and_drops_noise_openers() {
+        let mk = |id: &str, resolved: bool, author: &str, body: &str| GqlThread {
+            id: id.into(),
+            is_resolved: resolved,
+            is_outdated: false,
+            path: Some("a.rs".into()),
+            line: Some(3),
+            original_line: None,
+            start_line: None,
+            original_start_line: None,
+            comments: Some(GqlComments {
+                nodes: vec![GqlComment {
+                    id: format!("{id}-c"),
+                    author: Some(GqlAuthor { login: author.into() }),
+                    body: body.into(),
+                    created_at: None,
+                }],
+            }),
+        };
+        let threads = vec![
+            mk("open", false, "aron", "fix this"),
+            mk("done", true, "aron", "done"),
+            mk("wiz", false, "wiz-72ff", "PII tag"),
+        ];
+        let hidden = format_threads_xml(&threads, false);
+        assert!(hidden.contains("id=\"open\""));
+        assert!(!hidden.contains("id=\"done\""));
+        assert!(!hidden.contains("id=\"wiz\""));
+        assert!(hidden.contains("1 additional resolved thread(s), view with --show-resolved"));
+        let shown = format_threads_xml(&threads, true);
+        assert!(shown.contains("id=\"done\""));
+        assert!(!shown.contains("additional resolved"));
+        assert!(!shown.contains("id=\"wiz\""));
+        assert!(is_noise_comment("github-actions[bot]", "## 🌐 Web Preview\nlink"));
     }
 
     #[test]

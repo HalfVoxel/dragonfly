@@ -1,7 +1,8 @@
 # dragonfly-review
 
 Dragonfly's fan-out PR review as a Claude Code plugin: the
-`dragonfly-review:review` skill spawns specialist reviewer subagents
+`dragonfly-review:review` and `dragonfly-review:review-and-fix` skills
+spawn specialist reviewer subagents
 (`review-agent` per concern, `comment-reviewer`, `dedup-reviewer`, and
 `test-reviewer` when tests changed), each fed pre-collected diff context by
 a SubagentStart hook that shells out to `dragonfly prompt`.
@@ -15,16 +16,18 @@ claude plugin install dragonfly-review@dragonfly
 ```
 
 The `dragonfly` binary must be on PATH (cargo installs to `~/.cargo/bin`;
-make sure that's on PATH). Without it the hook fails open and the agents
-fall back to plain `git diff` with degraded context. PR-area scoring and
-duplicate-function hints additionally need the `kit` LLM helper on PATH
-and are silently absent without it.
+make sure that's on PATH). Without it the SubagentStart hook fails the
+reviewer spawn rather than starting it contextless, so the missing binary
+surfaces immediately. PR-area scoring and duplicate-function hints
+additionally need the `kit` LLM helper on PATH and are silently absent
+without it.
 
 ## What's included
 
 | Component | Purpose |
 | --- | --- |
 | `skills/review` | Orchestrator: scope, comment triage, fan-out, report. Review-only: it never pushes, and replies to review threads only after user approval. |
+| `skills/review-and-fix` | Fixed four-reviewer fan-out (correctness, simplification, tests, comments), then applies the unambiguous fixes and defers the rest. Never commits or pushes. |
 | `agents/` | The four reviewer subagents (read-only tools; `model: inherit`) |
 | `hooks/` | SubagentStart hook injecting `<dragonfly-context>` via `dragonfly prompt` |
 

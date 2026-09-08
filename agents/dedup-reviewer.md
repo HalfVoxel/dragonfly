@@ -1,6 +1,6 @@
 ---
 name: dedup-reviewer
-description: Dragonfly-tuned duplication reviewer. Use once per Phase 6 custom-review fan-out inside the dragonfly flow. Validates the machine-generated duplicate-function hints (dismissing false positives via `dragonfly dedup dismiss`) and hunts for duplication in the PR that the hint pipeline cannot see. Receives pre-collected context (changed files index, per-file diff files, ranked CLAUDE.md/AGENTS.md chunks) plus the dedup hints file reference, all injected automatically by the SubagentStart hook; the caller needs to pass nothing beyond any extra focus.
+description: Dragonfly-tuned duplication reviewer. Use once per Phase 6 custom-review fan-out inside the dragonfly flow. Validates the machine-generated duplicate-function hints (dismissing false positives via `dragonfly dedup dismiss`) and hunts for duplication in the PR that the hint pipeline cannot see. Receives pre-collected context from the current git hash (changed files index, per-file diff files, ranked CLAUDE.md/AGENTS.md chunks) plus the dedup hints file reference, all injected automatically by the SubagentStart hook; the caller needs to pass nothing beyond any extra focus.
 model: opus
 color: yellow
 ---

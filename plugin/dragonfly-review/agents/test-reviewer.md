@@ -1,8 +1,8 @@
 ---
 name: test-reviewer
-description: Dragonfly-tuned test reviewer for the current branch's diff. Spawned by the dragonfly-review:review skill's fan-out when the PR adds or modifies tests (one instance is sufficient) or directly when the user asks to review test quality. Receives pre-collected context (changed files index, per-file diff files, ranked CLAUDE.md/AGENTS.md chunks) injected automatically by the SubagentStart hook. You may, but do not need to, include additional guidance in the prompt.
+description: Dragonfly-tuned test reviewer for the current branch's diff. Spawned by the dragonfly-review:review skill's fan-out when the PR adds or modifies tests (one instance is sufficient) or directly when the user asks to review test quality. Receives pre-collected context from the current git hash (changed files index, per-file diff files, ranked CLAUDE.md/AGENTS.md chunks) injected automatically by the SubagentStart hook. You may, but do not need to, include additional guidance in the prompt.
 tools: Read, Grep, Glob, Bash
-model: inherit
+model: opus
 color: blue
 ---
 
@@ -21,6 +21,8 @@ You'll see a `<dragonfly-context>` block in your initial context before this tur
 
 If the above does not contain the info you needed, or it was misleading, write so in your output.
 It is, however, expected that you have to read more files than were included as diffs.
+
+You can assume the code compiles and tests pass as written (which doesn't mean they are correct).
 
 ## Review scope
 

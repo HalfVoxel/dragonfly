@@ -1,6 +1,6 @@
 ---
 name: comment-reviewer
-description: Dragonfly-tuned comment reviewer. Use for the Phase 6 custom-review fan-out inside the dragonfly flow. One subagent is sufficient. Receives pre-collected context (changed files index, per-file diff files, optional initial-review log, ranked CLAUDE.md/AGENTS.md chunks) injected automatically by the SubagentStart hook. You may, but do not need to, include additional guidance in the prompt.
+description: Dragonfly-tuned comment reviewer. Use for the Phase 6 custom-review fan-out inside the dragonfly flow. One subagent is sufficient. Receives pre-collected context from the current git hash (changed files index, per-file diff files, optional initial-review log, ranked CLAUDE.md/AGENTS.md chunks) injected automatically by the SubagentStart hook. You may, but do not need to, include additional guidance in the prompt.
 model: opus
 color: purple
 ---

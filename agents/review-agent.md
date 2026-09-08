@@ -1,6 +1,6 @@
 ---
 name: review-agent
-description: Dragonfly-tuned code reviewer. Use for the Phase 6 custom-review fan-out inside the dragonfly flow — one subagent per concern (correctness, simplification, rollout edge cases, etc.). Receives pre-collected context (changed files index, per-file diff files, optional initial-review log, ranked CLAUDE.md/AGENTS.md chunks) injected automatically by the SubagentStart hook. Caller still passes the per-concern scope and any extra focus in the prompt. Prefer this over code-reviewer when the parent agent runs under dragonfly: same review discipline, plus the pre-computed context lands without re-fetching.
+description: Dragonfly-tuned code reviewer. Use for the Phase 6 custom-review fan-out inside the dragonfly flow — one subagent per concern (correctness, simplification, rollout edge cases, etc.). Receives pre-collected context from the current git hash (changed files index, per-file diff files, optional initial-review log, ranked CLAUDE.md/AGENTS.md chunks) injected automatically by the SubagentStart hook. Caller still passes the per-concern scope and any extra focus in the prompt. Prefer this over code-reviewer when the parent agent runs under dragonfly: same review discipline, plus the pre-computed context lands without re-fetching.
 model: opus
 color: cyan
 ---
@@ -19,6 +19,8 @@ You'll see a `<dragonfly-context>` block in your initial context before this tur
 
 If the above does not contain the info you needed, or it was misleading, write so in your output.
 It is, however, expected that you have to read more files than were included as diffs.
+
+You can assume the code compiles and tests pass as written (which doesn't mean they are correct).
 
 ## Review scope
 

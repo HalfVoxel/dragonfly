@@ -135,12 +135,12 @@ Repeat until CI is green or you need user input.
 ## Phase 5: Review Bot Comments
 
 Inline review threads (including bot comments) and top-level PR reviews are
-already in the pre-collected data — see the `review-threads`, `review-pr`, and
+already in the pre-collected data — see the `review-threads`, `pr-reviews`, and
 `pr-meta` files in the index. Read those first.
 
 If you need to re-check after pushing a fix or suspect the snapshot is stale,
 re-fetch live with the dragonfly helper — it returns the same cleaned
-`<review-threads>` / `<pr-reviews>` / `# PR` sections that you already see in
+`<pr-meta>` / `<pr-reviews>` / `<review-threads>` / `<issue-comments>` sections that you already see in
 the pre-collected files (thread IDs included), so you don't need to write
 GraphQL by hand:
 
@@ -251,13 +251,14 @@ dismissed pairs.
 
 ## Phase 7: PR description
 
-If the PR has no substantial description, or just has an auto-generated one (contains "Generated with Claude Code" or a "Test plan" header, which manually written ones never do), write one using:
+If the PR has no substantial description, or just has an auto-generated one, write one using:
 
 ```
 dragonfly pr description "..."
 ```
 
 This phase may be done in parallel with waiting on CI.
+If the existing PR description contains "Generated with Claude Code" or a "Test plan" header, then it's 100% auto-generated and should be completely rewritten.
 
 If the PR has a description, validate that it still makes sense and is up to date with the latest changes.
 However, you should not include fixes to the PR itself in its description. It should be about what the PR as a whole aims to do.
@@ -266,12 +267,12 @@ Before submitting a PR description, you *must* always check the latest PR descri
 
 Before writing or updating a description, read the PR description guide (sections to use, examples, graphs, hard rules) at:
 
-Treat a previously auto-generated description (contains "🤖 Generated with Claude Code") as low-quality and not authoritive.
-It will need to be rewritten to follow these guidelines.
-
 ```
 PR_DESCRIPTION_GUIDE_PATH
 ```
+
+Treat a previously auto-generated description (contains "🤖 Generated with Claude Code" or "Test plan") as low-quality and not authoritive.
+It will need to be rewritten to follow these guidelines.
 
 ## Phase 8: Final Status
 

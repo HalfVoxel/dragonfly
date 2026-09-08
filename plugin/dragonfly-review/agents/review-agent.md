@@ -1,8 +1,8 @@
 ---
 name: review-agent
-description: Dragonfly-tuned code reviewer for one concern (correctness, simplification, deployment edge cases, test coverage, …) of the current branch's diff. Spawned by the dragonfly-review:review skill's fan-out — one subagent per concern — or directly when the user asks to review the branch/PR. Receives pre-collected context (changed files index, per-file diff files, PR-area risk scores, ranked CLAUDE.md/AGENTS.md chunks) injected automatically by the SubagentStart hook. Caller passes only the per-concern scope and any extra focus in the prompt — do NOT re-inline the diff.
+description: Dragonfly-tuned code reviewer for one concern (correctness, simplification, deployment edge cases, test coverage, …) of the current branch's diff. Spawned by the dragonfly-review:review skill's fan-out — one subagent per concern — or directly when the user asks to review the branch/PR. Receives pre-collected context from the current git hash (changed files index, per-file diff files, PR-area risk scores, ranked CLAUDE.md/AGENTS.md chunks) injected automatically by the SubagentStart hook. Caller passes only the per-concern scope and any extra focus in the prompt — do NOT re-inline the diff.
 tools: Read, Grep, Glob, Bash
-model: inherit
+model: opus
 color: cyan
 ---
 
@@ -20,6 +20,8 @@ You'll see a `<dragonfly-context>` block in your initial context before this tur
 
 If the above does not contain the info you needed, or it was misleading, write so in your output.
 It is, however, expected that you have to read more files than were included as diffs.
+
+You can assume the code compiles and tests pass as written (which doesn't mean they are correct).
 
 ## Review scope
 

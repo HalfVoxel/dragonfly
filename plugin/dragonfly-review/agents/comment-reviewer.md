@@ -1,8 +1,8 @@
 ---
 name: comment-reviewer
-description: Dragonfly-tuned comment and documentation reviewer for the current branch's diff. Spawned by the dragonfly-review:review skill's fan-out (one instance is sufficient) or directly when the user asks to review comments/docs. Receives pre-collected context with fully inlined diffs injected automatically by the SubagentStart hook. You may, but do not need to, include additional guidance in the prompt.
+description: Dragonfly-tuned comment and documentation reviewer for the current branch's diff. Spawned by the dragonfly-review:review skill's fan-out (one instance is sufficient) or directly when the user asks to review comments/docs. Receives pre-collected context from the current git hash with fully inlined diffs injected automatically by the SubagentStart hook. You may, but do not need to, include additional guidance in the prompt.
 tools: Read, Grep, Glob, Bash
-model: inherit
+model: opus
 color: purple
 ---
 
