@@ -1708,6 +1708,11 @@ const CLAUDE_CODE_REVIEW: &str = "Claude Code Review";
 // change flips it, so waiting on it blocks forever on an unapproved PR.
 const HIGH_RISK_APPROVAL: &str = "high-risk-needs-approval";
 
+// The stale-merge gate posts the commit status "stale-merge-gate": `pending`
+// (never `failure`) while the head is too far behind `main` or lacks its
+// required base. Only a rebase flips it, so waiting on it blocks forever.
+const STALE_MERGE_GATE: &str = "stale-merge-gate";
+
 // The "Relevant Evals" workflow runs evals for 15+ minutes and its result is
 // advisory. Its matrix job names embed the eval name and path ("Run relevant
 // eval (<name>, <path>) / ..."), so they match by prefix (see
@@ -1731,6 +1736,7 @@ const IGNORED_CHECKS: &[&str] = &[
     QA_TECH_REVIEW,
     CLAUDE_CODE_REVIEW,
     HIGH_RISK_APPROVAL,
+    STALE_MERGE_GATE,
     EVAL_RUN_PREFIX,
     EVAL_SELECT,
     EVAL_STATUS,
@@ -1738,8 +1744,8 @@ const IGNORED_CHECKS: &[&str] = &[
 ];
 
 // `ci watch` waits for slow checks like test-e2e, but skips the never-terminating
-// Graphite check plus deploy, doc-review, the human-approval gates, the eval
-// suite, and the review bots (non-blocking, not worth blocking the watch on).
+// Graphite check plus deploy, doc-review, the human-approval and stale-merge
+// gates, the eval suite, and the review bots (non-blocking, not worth blocking the watch on).
 // See [GRAPHITE_MERGEABILITY].
 const WATCH_IGNORED_CHECKS: &[&str] = &[
     "doc-review",
@@ -1749,6 +1755,7 @@ const WATCH_IGNORED_CHECKS: &[&str] = &[
     QA_TECH_REVIEW,
     CLAUDE_CODE_REVIEW,
     HIGH_RISK_APPROVAL,
+    STALE_MERGE_GATE,
     EVAL_RUN_PREFIX,
     EVAL_SELECT,
     EVAL_STATUS,
@@ -6447,6 +6454,7 @@ index 111..222 100644
             mk(EVAL_SELECT, "pending"),
             mk(EVAL_STATUS, "pending"),
             mk(HIGH_RISK_APPROVAL, "pending"),
+            mk(STALE_MERGE_GATE, "pending"),
         ];
         let counts = counts_from_checks(&checks, WATCH_IGNORED_CHECKS);
         assert_eq!(counts.passed, 1);
