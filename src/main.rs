@@ -12,6 +12,7 @@ use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
 mod dedup;
+mod flaky;
 mod gen_plugin;
 mod guide_chunks;
 mod pr_score;
@@ -378,12 +379,13 @@ enum CiCommand {
         #[arg(long)]
         pr: Option<String>,
     },
-    /// Look back N commits on origin/main for a given check name and report how
-    /// often it passed vs failed. Useful for diagnosing flaky tests.
+    /// Report how often a check passes vs fails outside this PR: GitHub Actions on
+    /// the last N main commits, Buildkite on main and other branches' builds.
     Flaky {
         /// Check name (e.g. `test-go`, `test-spanner`).
         name: String,
-        /// How many recent main commits to inspect.
+        /// How many recent commits (GitHub Actions) or builds per pipeline
+        /// (Buildkite) to inspect.
         #[arg(long, default_value = "20")]
         limit: usize,
     },
@@ -1402,7 +1404,10 @@ impl PrCommentsBundle {
         } else if let Some(raw) = &self.threads_raw_json {
             out.push((
                 "review-threads",
-                format!("<review-threads format=\"json\">\n{}\n</review-threads>", cdata(raw)),
+                format!(
+                    "<review-threads format=\"json\">\n{}\n</review-threads>",
+                    cdata(raw)
+                ),
             ));
         }
         if let Some(xml) = &self.issue_comments_xml {
@@ -3459,69 +3464,6 @@ async fn ci_watch_sha(
 
         checks = checks_for_sha(&sha).await;
     }
-}
-
-async fn ci_flaky_cmd(name: String, limit: usize) -> i32 {
-    let shas = sh(&format!("git log origin/main --format='%H' -{limit}"))
-        .await
-        .unwrap_or_default();
-    if shas.is_empty() {
-        eprintln!("Could not list commits on origin/main.");
-        return 2;
-    }
-    let mut pass = 0;
-    let mut fail = 0;
-    let mut skip = 0;
-    let mut other = 0;
-    let mut rows = Vec::new();
-    for sha in shas.lines() {
-        let r = sh(&format!(
-            "gh api 'repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100' \
-             --jq '.check_runs[] | select(.name == \"{}\") | \"\\(.conclusion // .status) \\(.html_url)\"' 2>/dev/null | head -1",
-            name.replace('"', "\\\"")
-        )).await.unwrap_or_default();
-        let mut parts = r.splitn(2, ' ');
-        let conclusion = parts.next().unwrap_or("").to_string();
-        let url = parts.next().unwrap_or("").trim().to_string();
-        let conclusion = if conclusion.is_empty() {
-            "no-run".to_string()
-        } else {
-            conclusion
-        };
-        match conclusion.as_str() {
-            "success" => pass += 1,
-            "failure" | "cancelled" | "timed_out" => fail += 1,
-            "skipped" | "neutral" => skip += 1,
-            "no-run" => skip += 1,
-            _ => other += 1,
-        }
-        rows.push(format!(
-            "{} {}{}",
-            &sha[..7.min(sha.len())],
-            conclusion,
-            if url.is_empty() {
-                String::new()
-            } else {
-                format!("  {url}")
-            }
-        ));
-    }
-    println!("Check `{name}` on last {limit} commits of origin/main:");
-    println!("  ✅ {pass} pass    ❌ {fail} fail    ⏭ {skip} skip/none    ? {other} other\n");
-    for row in &rows {
-        println!("{row}");
-    }
-    let verdict = if pass + fail == 0 {
-        "No data — this check doesn't run on main commits. Compare against other PRs instead."
-    } else if fail == 0 {
-        "Consistently passing on main — failure is likely caused by this PR."
-    } else if pass == 0 {
-        "Consistently failing on main — pre-existing issue, do not fix in this PR without confirmation."
-    } else {
-        "Mixed pass/fail on main — likely flaky. Consider rerunning."
-    };
-    println!("\nVerdict: {verdict}");
-    0
 }
 
 #[derive(Deserialize)]
@@ -6109,7 +6051,7 @@ async fn main() {
                         model,
                     } => ci_failures_cmd(pr, max_bytes, raw, model).await,
                     CiCommand::Watch { pr } => ci_watch_cmd(pr).await,
-                    CiCommand::Flaky { name, limit } => ci_flaky_cmd(name, limit).await,
+                    CiCommand::Flaky { name, limit } => flaky::run(name, limit).await,
                     CiCommand::Retries { pr } => ci_retries_cmd(pr).await,
                     CiCommand::Rerun { name, pr } => ci_rerun_cmd(name, pr).await,
                     CiCommand::Distill { file, model } => ci_distill_cmd(file, model).await,
@@ -6512,7 +6454,9 @@ index 111..222 100644
             comments: Some(GqlComments {
                 nodes: vec![GqlComment {
                     id: format!("{id}-c"),
-                    author: Some(GqlAuthor { login: author.into() }),
+                    author: Some(GqlAuthor {
+                        login: author.into(),
+                    }),
                     body: body.into(),
                     created_at: None,
                 }],
@@ -6532,7 +6476,10 @@ index 111..222 100644
         assert!(shown.contains("id=\"done\""));
         assert!(!shown.contains("additional resolved"));
         assert!(!shown.contains("id=\"wiz\""));
-        assert!(is_noise_comment("github-actions[bot]", "## 🌐 Web Preview\nlink"));
+        assert!(is_noise_comment(
+            "github-actions[bot]",
+            "## 🌐 Web Preview\nlink"
+        ));
     }
 
     #[test]

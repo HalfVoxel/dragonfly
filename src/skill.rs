@@ -105,7 +105,7 @@ When checks fail:
 
 3. **Decide if it's flaky or pre-existing on main**: don't fix unrelated regressions.
    ```bash
-   dragonfly ci flaky test-go   # checks the same name on the last 20 main commits
+   dragonfly ci flaky <check>   # same check on main (GHA + Buildkite) and other branches (Buildkite)
    ```
 
 4. **Check retry history before re-running**:
@@ -318,13 +318,19 @@ If CI is failing due to a seemingly unrelated issue, it could be that:
 To check the test status on main:
 
 ```
-dragonfly ci flaky <check-name>           # default: last 20 commits
-dragonfly ci flaky test-go --limit 50
+dragonfly ci flaky <check-name>           # default: last 20 commits / builds per pipeline
+dragonfly ci flaky "bazel build" --limit 50
 ```
 
-This prints pass/fail/skip counts for the named check on the last N commits of
-`origin/main` and a verdict (consistently failing → pre-existing; mixed →
-flaky; clean → likely caused by this PR).
+This prints pass/fail/skip counts and a verdict (consistently failing →
+pre-existing; mixed → flaky; clean → likely caused by this PR) per source:
+GitHub Actions on the last N main commits where the check ran (path-filtered
+checks skip most commits; bot and `[skip ci]` commits are excluded), Buildkite
+steps on main builds, and
+Buildkite steps on other branches' builds (PR-only pipelines such as
+`pull-request-checks` never run on main). Buildkite step names match without
+their `:emoji:` prefix or `: not required` suffix. A step that failed and then
+passed on retry within one build is reported as confirmed flaky.
 
 * A verified flaky is sometimes passing and sometimes failing (check the latest hour or so).
 * Not all tests run for all PRs and commits. Always verify that the test was not skipped (and thus looks like a success).
