@@ -34,6 +34,8 @@ Focus: design, not individual bugs. Ask whether the PR is built on the right fou
    - one change needs edits on both sides of the interface
    - two components that only make sense together, or one doing two jobs
 
+See if any interfaces/api surfaces are more specialized or clunkier than they need to be. If a field or function really is just a special case of a more general concept that could be relatively easily expressed and make the code more maintainable and more useful for the future.
+
 4. Treat bug clusters as evidence. If several of the bugs other reviewers found sit in one component, its design is probably wrong.
 
 5. For each change you recommend, report what changes, which bugs or edge cases disappear, what the new design can't do that the current one can, and roughly how large the change is.

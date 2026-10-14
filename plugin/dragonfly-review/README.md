@@ -17,10 +17,12 @@ claude plugin install dragonfly-review@dragonfly
 ```
 
 The `dragonfly` binary must be on PATH (cargo installs to `~/.cargo/bin`;
-make sure that's on PATH). Without it the SubagentStart hook fails the
-reviewer spawn rather than starting it contextless, so the missing binary
-surfaces immediately. PR-area scoring additionally needs the `kit` LLM
-helper on PATH and is silently absent without it.
+make sure that's on PATH). Without it the SubagentStart hook cannot inject
+`<dragonfly-context>`, and it cannot stop the spawn either (SubagentStart
+hooks only warn). Both skills therefore run `dragonfly prompt` in the
+orchestrator first, so a missing binary fails there, before any reviewer
+starts. PR-area scoring additionally needs the `kit` LLM helper on PATH and
+is silently absent without it.
 
 ## What's included
 
@@ -28,7 +30,7 @@ helper on PATH and is silently absent without it.
 | --- | --- |
 | `skills/review` | Orchestrator: scope, comment triage, fan-out, report. Review-only: it never pushes, and replies to review threads only after user approval. |
 | `skills/review-and-fix` | Fixed four-reviewer fan-out (correctness, simplification, tests, comments), then applies the unambiguous fixes and defers the rest. Never commits or pushes. |
-| `agents/` | The five reviewer subagents (read-only tools; `model: inherit`) |
+| `agents/` | The five reviewer subagents (read-only tools; `model: opus`) |
 | `hooks/` | SubagentStart hook injecting `<dragonfly-context>` via `dragonfly prompt` |
 
 `hooks/review-context.py` is a vendored copy of the repo's
@@ -40,7 +42,7 @@ one both ways.
 The five `agents/*.md` bodies are **generated** from the repo's
 `agents/` files — edit those, then run `dragonfly gen-plugin-agents`.
 Frontmatter here is hand-maintained (the plugin pins `tools:` for
-read-only enforcement and `model: inherit`); only the body is derived.
+read-only enforcement and `model: opus`); only the body is derived.
 `src/gen_plugin.rs` declares the body deltas, and
 `plugin_agents_match_generated` fails the build when a copy goes stale.
 

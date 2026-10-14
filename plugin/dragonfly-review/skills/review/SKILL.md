@@ -7,7 +7,7 @@ description: Dragonfly PR review — fan out specialist review subagents over th
 
 Review the current branch's changes (the PR) using Dragonfly's fan-out review flow. You orchestrate; the `review-agent` / `comment-reviewer` / `test-reviewer` / `dedup-reviewer` / `design-reviewer` subagents (this plugin's agents; their types may appear namespaced, e.g. `dragonfly-review:review-agent`) do the reading. Review-only: report findings first, fix only what the user picks.
 
-The `dragonfly` CLI is required (install: `cargo install --git https://github.com/HalfVoxel/dragonfly --locked`). If it's missing, fall back to plain `git`/`gh` and a single `review-agent` with the diff scope in the prompt.
+The `dragonfly` CLI is required (install: `cargo install --git https://github.com/HalfVoxel/dragonfly --locked`). If the Phase 0 warm step fails because `dragonfly` is missing, do not spawn the reviewers: fall back to plain `git`/`gh` and a single `general-purpose` subagent with the diff scope in the prompt, and tell the user to install the binary.
 
 ## Phase 0 — Establish scope and warm the context
 
@@ -22,13 +22,13 @@ The `dragonfly` CLI is required (install: `cargo install --git https://github.co
    ```bash
    dragonfly --areas
    ```
-   Each area carries `potential_for_bugs` and `potential_for_simplification` (1–10). Base-ref detection (origin/main, or the Graphite parent for stacked PRs) is built in — never diff against local `main` yourself.
+   Each area carries `potential_for_bugs` and `potential_for_simplification` (1–10). Base-ref detection is built in (origin/main, or the stack parent for stacked PRs; `dragonfly stack` prints it). Never diff against local `main` yourself.
 
 ## Phase 1 — Existing review feedback
 
 If a PR exists for this branch (`gh pr view` succeeds):
 
-- Run `dragonfly pr comments` for cleaned review threads (with thread IDs), top-level reviews, and PR metadata. Do not hand-assemble `gh api` GraphQL.
+- Run `dragonfly pr comments` for cleaned review threads (with thread IDs), top-level reviews, issue comments, and PR metadata. Do not hand-assemble `gh api` GraphQL.
 - For every unresolved bot or human comment: **read the flagged code yourself — never blindly trust the bot.** Common false positives: style suggestions that conflict with project conventions, "unused" warnings for code used via reflection/DI, security warnings on intentional patterns, suggestions that would break existing behavior.
 - Triage each into: valid (and what the fix should be) or dismiss (and why). Keep thread IDs so replies/resolves are possible later. Do not reply or resolve until the user approves; then use `dragonfly pr thread comment --thread-id … --body "Fixed in <sha>"` followed by `dragonfly pr thread resolve --thread-id …`. `pr thread comment` and `pr comment` append a `<sup>via Dragonfly (Claude)</sup>` attribution footer automatically, so never sign the body yourself. Pass `--no-agent-attribution` only when posting text a human wrote verbatim, which must not be attributed to an agent.
 - Reply wording: to humans, only concise informational statements — "Fixed in <sha>" or "Fixed in <sha>, X now does Y" — never rationale or conversation. To bots, rationale is allowed when dismissing a false positive, so they don't re-report it later.

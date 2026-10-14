@@ -10,17 +10,23 @@ fix what are clear improvements and hand back a list of what needs a decision. T
 reviewers are read-only, and you apply every edit yourself.
 
 Use `dragonfly-review:review` instead when the user wants to see findings
-before anything changes, or when the PR needs a deeper revew.
+before anything changes, or when the PR needs a deeper review.
 
 ## Phase 0 — Warm the context
 
 1. `git fetch origin` so remote refs are current.
+2. Warm the shared review context (takes ~10–60s cold; wait for it):
+   ```bash
+   dragonfly prompt review-agent > /dev/null
+   ```
+   This needs the `dragonfly` CLI on PATH (install: `cargo install --git https://github.com/HalfVoxel/dragonfly --locked`). If it fails, stop and report the error; do not fan out without it.
 
 ## Phase 1 — Fan out four reviewers
 
 Spawn all subagents **in a single message** (parallel Agent tool calls).
-The subagents automatically some receive guidance and a diff of the current PR.
-They receive only the diff for comitted changes.
+Their `<dragonfly-context>` (diff, PR areas, relevant CLAUDE.md/AGENTS.md chunks)
+arrives automatically via the SubagentStart hook; pass only the focus below. Only
+committed changes are reviewed.
 
 | `subagent_type` | Focus to pass in the prompt |
 | --- | --- |
@@ -38,7 +44,7 @@ weighing. Everything else is deferred.
 For each potential fix:
 
 - Read files you need to clearly understand the issue and the fix, don't blindly trust the subagents.
-- See if you agree with the subagent assesments.
+- See if you agree with the subagent assessments.
 - Err on the side of simplification. If you have to do large workarounds for some behavior, it might be good to take a step back and think about if the system as a whole could be written more elegantly.
 - Do not commit, do not push, do not reply to or resolve PR threads. Leave the tree dirty for the user to read.
 
