@@ -65,8 +65,10 @@ After pushing, monitor CI checks:
 dragonfly ci watch
 ```
 
-The watch fail-fasts on the first failure and prints a final summary when CI
-settles.
+The watch fail-fasts on the first failure (`--all` waits for every check) and
+prints a final summary when CI settles; on failure it also prints the
+`dragonfly ci failures` report, so the error is already in its output. It exits
+0 green, 1 failing, 3 on `--timeout SECS`.
 
 For a one-shot poll instead of watching:
 
@@ -96,14 +98,16 @@ When checks fail:
    ```bash
    dragonfly ci failures
    ```
-   Each failed check gets its own section with extracted error lines and a link.
-   Non-GHA providers fall back to the check-run output GitHub stores plus the URL,
-   so you always see *something* even when full logs require provider credentials.
-
-   Raw `gh run view <ID> --log-failed` is still available if you need the full
-   GitHub Actions log for a single job.
+   The first lines are deterministic facts per failing check: failed step, how
+   the check fared on main at this PR's base, and the path of its full log.
+   Then come the error lines, verbatim when small, condensed by an LLM when
+   large. Approval gates, reruns and cancellations are listed as notes, not
+   failures. Read the printed log path when the excerpt is not enough.
 
 3. **Decide if it's flaky or pre-existing on main**: don't fix unrelated regressions.
+   The `main:` line of each failing check answers this: `rebase onto main`
+   means main was red at your base and is green now, `failing too` means main
+   is red, `intermittent` means flaky. For more history:
    ```bash
    dragonfly ci flaky <check>   # same check on main (GHA + Buildkite) and other branches (Buildkite)
    ```
