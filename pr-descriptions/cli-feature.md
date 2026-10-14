@@ -1,17 +1,17 @@
 PR #38640 — feat: lov user ff is now faster and supports filtering
 
-# Summary
+## Summary
 
 `lov user ff` was slow and gave no way to search for a flag. It is now about twice as fast and takes an optional filter.
 
 `lov user ff` shows which feature flags are enabled for a user. It took ~2.7s, because it loaded far more secrets than it needed and ran its slow lookups one after another. Finding one specific flag in the full list was also tedious.
 
-# Changes
+## Changes
 
 - `lov user ff` now runs in ~1.3s, down from ~2.7s.
 - An optional filter argument matches flag names and sub-field names in the resolved value, case-insensitively.
 
-# Example
+## Example
 
 ```sh
 # Enabled feature flags for the current user
@@ -33,11 +33,11 @@ lov user ff aBcDeFgHiJkLmNoPqRsTuVwXyZ12
 lov user ff --all
 ```
 
-# Low level
+## Low level
 
 The command called `clisecrets.LoadAndInject(secrets.ServiceGoAPI)`, pulling all 409 go-api secrets just to read three Confidence credentials. The Firebase lookups, WASM provider build and flag listing then ran serially.
 
-## Changes
+### Changes
 
 - Fetch only the three Confidence secrets actually needed (`CONFIDENCE_CLIENT_SECRET`, `CONFIDENCE_ADMIN_CLIENT_ID`, `CONFIDENCE_ADMIN_CLIENT_SECRET`).
 - Run prod/dev Firebase lookups, WASM provider setup, and flag-name listing concurrently via `errgroup`.
