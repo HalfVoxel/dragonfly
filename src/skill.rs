@@ -176,6 +176,8 @@ For each bot comment:
     dragonfly pr comment --body "..."   # or --body - to read from stdin
     ```
 
+    Both commands append a `<sup>via Dragonfly (Claude)</sup>` attribution footer automatically, so never sign the body yourself. Pass `--no-agent-attribution` only when posting text a human wrote verbatim, which must not be attributed to an agent.
+
 ### Comment wording
 
 When responding to PR comments by humans, only ever respond with concise wording like "Fixed in <commit>" (for simple things) or something like "Fixed in <commit>, X now does Y" (for more complex things).

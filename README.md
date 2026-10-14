@@ -52,6 +52,7 @@ dragonfly pr thread resolve --thread-id <id>
 dragonfly pr description -          # read body from stdin
 dragonfly pr comment --body "..."   # post a top-level PR comment (current branch's PR)
 dragonfly pr comment --body -       # ...or read the body from stdin
+dragonfly pr comment --body "..." --no-agent-attribution  # human's verbatim text, no agent footer (also on `pr thread comment`)
 dragonfly pr comments               # print review threads, reviews, and meta (cleaned)
 dragonfly pr comments --pr 12345    # explicit PR number
 dragonfly --feedback "..."  # append a note to ~/.dragonfly/feedback

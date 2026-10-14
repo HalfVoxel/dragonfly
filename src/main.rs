@@ -266,6 +266,10 @@ enum PrCommand {
         /// Comment body (markdown). Pass `-` to read from stdin.
         #[arg(long)]
         body: String,
+        /// Post the body as-is, without the agent footer. Only for text a
+        /// human wrote verbatim, which must not be attributed to an agent.
+        #[arg(long)]
+        no_agent_attribution: bool,
     },
     /// Print PR review threads, top-level reviews, and metadata in the same
     /// cleaned format used by the pre-collected data (pr-meta, pr-reviews,
@@ -324,6 +328,10 @@ enum ThreadCommand {
         /// The reply body
         #[arg(long)]
         body: String,
+        /// Post the body as-is, without the agent footer. Only for text a
+        /// human wrote verbatim, which must not be attributed to an agent.
+        #[arg(long)]
+        no_agent_attribution: bool,
     },
     /// Resolve a review thread
     Resolve {
@@ -1525,8 +1533,17 @@ fn format_pr_meta(json: &str) -> Option<String> {
 const DRAGONFLY_FOOTER: &str =
     "\n\n<sup>via [Dragonfly](https://github.com/HalfVoxel/dragonfly) (Claude)</sup>";
 
-async fn pr_thread_comment(thread_id: &str, body: &str) {
-    let signed = format!("{body}{DRAGONFLY_FOOTER}");
+fn sign_comment(body: &str, agent_attribution: bool) -> String {
+    let body = body.trim_end();
+    if agent_attribution {
+        format!("{body}{DRAGONFLY_FOOTER}")
+    } else {
+        body.to_string()
+    }
+}
+
+async fn pr_thread_comment(thread_id: &str, body: &str, agent_attribution: bool) {
+    let signed = sign_comment(body, agent_attribution);
     let r = sh3(&format!(
         "gh api graphql -f query='mutation($threadId: ID!, $body: String!) {{ \
             addPullRequestReviewThreadReply(input: {{pullRequestReviewThreadId: $threadId, body: $body}}) {{ \
@@ -1599,7 +1616,7 @@ async fn pr_set_description(pr_arg: Option<String>, body_arg: &str) {
     }
 }
 
-async fn pr_comment(pr_arg: Option<String>, body_arg: &str) {
+async fn pr_comment(pr_arg: Option<String>, body_arg: &str, agent_attribution: bool) {
     let body = if body_arg == "-" {
         let mut s = String::new();
         if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut s) {
@@ -1616,7 +1633,7 @@ async fn pr_comment(pr_arg: Option<String>, body_arg: &str) {
         std::process::exit(2);
     };
 
-    let signed = format!("{}{}", body.trim_end(), DRAGONFLY_FOOTER);
+    let signed = sign_comment(&body, agent_attribution);
 
     let mut child = match std::process::Command::new("gh")
         .args(["pr", "comment", &pr_number, "--body-file", "-"])
@@ -5976,8 +5993,12 @@ async fn main() {
             CliCommand::Pr {
                 command: PrCommand::Thread { command },
             } => match command {
-                ThreadCommand::Comment { thread_id, body } => {
-                    pr_thread_comment(&thread_id, &body).await;
+                ThreadCommand::Comment {
+                    thread_id,
+                    body,
+                    no_agent_attribution,
+                } => {
+                    pr_thread_comment(&thread_id, &body, !no_agent_attribution).await;
                 }
                 ThreadCommand::Resolve { thread_id } => {
                     pr_thread_resolve(&thread_id).await;
@@ -5989,9 +6010,14 @@ async fn main() {
                 pr_set_description(pr, &body).await;
             }
             CliCommand::Pr {
-                command: PrCommand::Comment { pr, body },
+                command:
+                    PrCommand::Comment {
+                        pr,
+                        body,
+                        no_agent_attribution,
+                    },
             } => {
-                pr_comment(pr, &body).await;
+                pr_comment(pr, &body, !no_agent_attribution).await;
             }
             CliCommand::Pr {
                 command: PrCommand::Comments { pr, show_resolved },
