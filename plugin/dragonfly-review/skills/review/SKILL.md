@@ -17,7 +17,7 @@ The `dragonfly` CLI is required (install: `cargo install --git https://github.co
    ```bash
    dragonfly prompt review-agent > /dev/null
    ```
-   This populates a 4-minute per-cwd cache that the SubagentStart hook serves to the `review-agent` and `test-reviewer` spawns; the comment-reviewer's inline-diff context and the dedup-reviewer's hint context build separately. Stderr reports cache hit/build timing.
+   This populates a 4-minute per-cwd cache that the SubagentStart hook serves to the `review-agent` and `test-reviewer` spawns; the comment-reviewer's inline-diff context and the dedup-reviewer's context build separately. Stderr reports cache hit/build timing.
 4. While that runs, do Phase 1. Then get the area breakdown (cached by HEAD SHA after the warm):
    ```bash
    dragonfly --areas
@@ -30,12 +30,12 @@ If a PR exists for this branch (`gh pr view` succeeds):
 
 - Run `dragonfly pr comments` for cleaned review threads (with thread IDs), top-level reviews, and PR metadata. Do not hand-assemble `gh api` GraphQL.
 - For every unresolved bot or human comment: **read the flagged code yourself — never blindly trust the bot.** Common false positives: style suggestions that conflict with project conventions, "unused" warnings for code used via reflection/DI, security warnings on intentional patterns, suggestions that would break existing behavior.
-- Triage each into: valid (and what the fix should be) or dismiss (and why). Keep thread IDs so replies/resolves are possible later. Do not reply or resolve until the user approves; then use `dragonfly pr thread comment --thread-id … --body "Fixed in <sha>"` followed by `dragonfly pr thread resolve --thread-id …`.
+- Triage each into: valid (and what the fix should be) or dismiss (and why). Keep thread IDs so replies/resolves are possible later. Do not reply or resolve until the user approves; then use `dragonfly pr thread comment --thread-id … --body "Fixed in <sha>"` followed by `dragonfly pr thread resolve --thread-id …`. `pr thread comment` and `pr comment` append a `<sup>via Dragonfly (Claude)</sup>` attribution footer automatically, so never sign the body yourself. Pass `--no-agent-attribution` only when posting text a human wrote verbatim, which must not be attributed to an agent.
 - Reply wording: to humans, only concise informational statements — "Fixed in <sha>" or "Fixed in <sha>, X now does Y" — never rationale or conversation. To bots, rationale is allowed when dismissing a false positive, so they don't re-report it later.
 
 ## Phase 2 — Fan out reviewers
 
-Spawn all subagents **in a single message** (parallel Agent tool calls). Their `<dragonfly-context>` (diffs, areas, relevant-context chunks; the dedup-reviewer instead gets the inlined duplicate-function hints) arrives automatically via the SubagentStart hook — **do NOT re-inline the diff or file index in prompts.** Pass only the concern, the target area/files, and the area's scores.
+Spawn all subagents **in a single message** (parallel Agent tool calls). Their `<dragonfly-context>` (diffs, areas, relevant-context chunks; the dedup-reviewer gets a slimmer diff-only context) arrives automatically via the SubagentStart hook — **do NOT re-inline the diff or file index in prompts.** Pass only the concern, the target area/files, and the area's scores.
 
 Pick the fan-out from the area breakdown:
 

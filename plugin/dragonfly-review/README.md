@@ -18,9 +18,8 @@ claude plugin install dragonfly-review@dragonfly
 The `dragonfly` binary must be on PATH (cargo installs to `~/.cargo/bin`;
 make sure that's on PATH). Without it the SubagentStart hook fails the
 reviewer spawn rather than starting it contextless, so the missing binary
-surfaces immediately. PR-area scoring and duplicate-function hints
-additionally need the `kit` LLM helper on PATH and are silently absent
-without it.
+surfaces immediately. PR-area scoring additionally needs the `kit` LLM
+helper on PATH and is silently absent without it.
 
 ## What's included
 
@@ -50,8 +49,7 @@ read-only enforcement and `model: inherit`); only the body is derived.
   those copies; otherwise both hook registrations fire and the context is
   injected twice.
 - The skill and subagents call a handful of `dragonfly` subcommands
-  (`prompt`, `--areas`, `pr comments`, `dedup …`), all read-only except
-  `dedup dismiss`, which records persistent not-a-duplicate verdicts.
+  (`prompt`, `--areas`, `pr comments`, `dedup`), all read-only.
   Allowlist them in your permissions settings to avoid prompts, e.g.
   `Bash(dragonfly prompt:*)`, `Bash(dragonfly --areas)`,
   `Bash(dragonfly pr comments:*)`, `Bash(dragonfly dedup:*)`.

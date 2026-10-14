@@ -3801,7 +3801,7 @@ fn prompt_pr_title(branch_commits: &Option<String>) -> Option<String> {
     if commit_subjects.len() == 1 {
         input = input.default(commit_subjects[0].clone());
     }
-    // Background tasks (dedup hints, PR areas, relevant-context) keep
+    // Background tasks (PR areas, relevant-context) keep
     // printing while we block here; buffer their status lines so they
     // can't clobber the typed title.
     let read = {
@@ -4028,7 +4028,6 @@ fn build_files_index(
     files: &[TempFile],
     has_conflicts: bool,
     failed_names: &[String],
-    dedup_funcs: Option<usize>,
 ) -> String {
     let failures_label = if failed_names.is_empty() {
         "CI failure logs (distilled summary; references full log below)".into()
@@ -4063,14 +4062,6 @@ fn build_files_index(
             "CI failure logs (full, untruncated raw)".into(),
         ),
         ("lint", "local lint failures".into()),
-        (
-            "dedup",
-            format!(
-                "{} potential duplicated function{} (hints, not verdicts)",
-                dedup_funcs.unwrap_or(0),
-                if dedup_funcs == Some(1) { "" } else { "s" },
-            ),
-        ),
     ]);
 
     let mut index = String::new();
@@ -4819,10 +4810,11 @@ async fn build_review_agent_context(inline_diffs: bool) -> String {
 }
 
 /// Builds the `<dragonfly-context>` block for dedup-reviewer subagents and
-/// prints it (implementation of `prompt dedup-reviewer`). Tailored for
-/// duplication review: commit list, files-changed summary, per-file diff
-/// paths, and the full duplicate-function hint list inlined — the subagent's
-/// primary input, so no file indirection. Skips the RAG-scored
+/// prints it (implementation of `prompt dedup-reviewer`).
+///
+/// Tailored for duplication review: commit list, files-changed summary and
+/// per-file diff paths. Carries no embedding hints; the reviewer hunts for
+/// duplication by reading the code. Skips the RAG-scored
 /// `<relevant-context>` (convention excerpts don't help duplication review
 /// and are the slowest leg of the review-agent build), which also makes this
 /// cheap enough to rebuild per invocation: only one dedup-reviewer spawns
@@ -4843,10 +4835,9 @@ async fn dedup_reviewer_prompt_cmd() -> i32 {
         let r: Vec<&str> = relevant.iter().map(String::as_str).collect();
         write_diff_files(&r, &base_for_diffs).await
     };
-    let hints_fut = dedup::build_inline_block(&base_ref);
     let ctx_fut = collect_context_strings(&branch_commits, &base_ref);
 
-    let (diff_files_str, hints_block, ctx) = tokio::join!(diff_files_fut, hints_fut, ctx_fut);
+    let (diff_files_str, ctx) = tokio::join!(diff_files_fut, ctx_fut);
 
     let branch = branch.unwrap_or_default();
     let mut out = String::from("<dragonfly-context>\n");
@@ -4866,15 +4857,6 @@ async fn dedup_reviewer_prompt_cmd() -> i32 {
         out.push_str(&diff_files_str);
     } else {
         out.push_str("\n(no per-file diffs against base — review may be unnecessary)\n");
-    }
-    match hints_block {
-        Some(block) => {
-            out.push('\n');
-            out.push_str(&block);
-        }
-        None => out.push_str(
-            "\n(no duplicate-function hints for this PR — focus on the broader duplication hunt)\n",
-        ),
     }
     out.push_str("</dragonfly-context>\n");
     print!("{out}");
@@ -5639,12 +5621,6 @@ async fn build_claude_invocation(
     let relevant_context_handle =
         tokio::spawn(async move { build_relevant_context(&base_ref_for_rag).await });
 
-    // Dedup hints overlap with CI watch too — a cold summary cache can take
-    // many minutes, but the CI wait dominates and a warm cache is seconds.
-    let base_ref_for_dedup = base_ref.clone();
-    let dedup_handle =
-        tokio::spawn(async move { dedup::build_hints_file(&base_ref_for_dedup).await });
-
     // Run area analysis in parallel with PR/CI checks. The PR-areas LLM
     // call needs the inline diff content (kit has no tool-use, so we
     // can't point it at file paths and ask it to Read). Meanwhile the
@@ -5819,18 +5795,7 @@ async fn build_claude_invocation(
         (None, None) => {}
     }
 
-    // Spawned right after push; by now the CI wait has usually absorbed the
-    // dedup latency, so this await is close to free.
-    let dedup_hints = dedup_handle.await.ok().flatten();
-    let dedup_funcs = dedup_hints.as_ref().map(|h| h.funcs);
-    if let Some(h) = dedup_hints {
-        files.push(TempFile {
-            path: h.path,
-            lines: h.lines,
-        });
-    }
-
-    let files_index = build_files_index(&files, merge.has_conflicts, &failed_names, dedup_funcs);
+    let files_index = build_files_index(&files, merge.has_conflicts, &failed_names);
 
     let (prior_reviews, review_instruction) = get_review_log_context(&pr_info.number);
     // The review prompt instructs the model to output exactly "No issues found."

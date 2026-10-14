@@ -209,11 +209,9 @@ its context arrives via the hook; it typically needs no additional
 instructions.
 
 Also spawn a single `dedup-reviewer` subagent for code duplication. The hook
-injects a dedup-tailored context with the full hint list inlined, so it
-needs no extra instructions. It validates each hinted pair (dismissing false
-positives itself via `dragonfly dedup dismiss`) and also hunts for
-duplication the hint pipeline cannot see: repeats within the PR itself,
-non-Go code, sub-function copies.
+injects a dedup-tailored context, so it needs no extra instructions. It reads
+the diff and searches the codebase for existing helpers the PR re-implements,
+repeats within the PR itself, and copies the PR leaves behind.
 
 If you think there's some risk of deployment edge cases, start a `review-agent` to evaluate this.
 The system is deployed gradually, with new backends spinning up over a period of ~10 minutes,
@@ -233,21 +231,11 @@ After fixing, present the changes to the user, and allow for them to review manu
 
 After changes have been approved and fixed, re-run `review-agent` to see if it finds more issues.
 
-## Potential duplicates
+## Duplication
 
-The pre-collected `dedup` file (when present) lists changed functions whose
-behavior looks similar to existing ones — embedding hints, not verdicts. The
-`dedup-reviewer` subagent spawned in Phase 6 owns them: it receives the full
-hint list inline via its hook context, reads each hinted pair, dismisses
-false positives itself, and reports genuine duplicates and any other
-duplication it finds. Don't have other subagents re-check the hints; you
-don't need to read the file yourself.
-
-Report verified genuine duplicates under "Dedup candidates" in the Phase 8
+The `dedup-reviewer` subagent spawned in Phase 6 owns duplication review.
+Report its verified findings under "Dedup candidates" in the Phase 8
 summary; don't refactor them unless the user asks.
-
-`dragonfly dedup` re-lists candidates; `dragonfly dedup exclusions` shows
-dismissed pairs.
 
 ## Phase 7: PR description
 

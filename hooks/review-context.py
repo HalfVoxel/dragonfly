@@ -97,7 +97,7 @@ def main() -> int:
     if bin_path is None:
         return _fail(f"{BIN_NAME!r} not on PATH; cannot build review context")
 
-    # dedup-reviewer has its own tailored context (full hint list inlined);
+    # dedup-reviewer has its own tailored context (diffs, no RAG chunks);
     # the other reviewers share the review-agent context, with only the
     # comment reviewer paying for inlined diffs.
     agent_type = (payload.get("agent_type") or "").split(":")[-1]
