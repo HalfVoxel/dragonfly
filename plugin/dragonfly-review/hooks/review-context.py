@@ -29,10 +29,10 @@ the Rust binary. That command serializes parallel callers behind a
 filesystem flock so a multi-agent fan-out only pays the build cost once
 within a four-minute TTL.
 
-Contract: the hook never fails open. Every failure to produce context
-exits 2 (blocking) rather than letting the reviewer start empty; see
-[_fail]. `dragonfly` is expected to be on PATH, so a checkout without
-the binary installed fails the spawn until it is.
+Contract: the hook never fails silently; every failure to produce
+context exits 2, see [_fail]. `dragonfly` is expected to be on PATH;
+the skills' Phase 0 warm step (`dragonfly prompt review-agent` in the
+orchestrator) catches a missing binary before any reviewer starts.
 
 The hooks.json matcher fires only for the plugin-namespaced agent types
 ("dragonfly-review:review-agent", ...): SubagentStart matchers are
@@ -59,20 +59,21 @@ def _debug(msg: str) -> None:
 
 
 def _fail(reason: str) -> int:
-    """Aborts the spawn with a blocking hook error.
+    """Reports a failure to produce context as a hook error.
 
-    Contract: this hook never fails open. A reviewer subagent that starts
-    without <dragonfly-context> reviews an empty diff and reports "no
-    issues found", which reads as a clean review rather than a broken
-    one. Exit 2 is Claude Code's blocking-error code: the spawn fails and
-    stderr surfaces, so a stale cache or a missing binary is a visible
-    failure the caller must fix, not a silently degraded review.
+    Contract: this hook never fails silently. A reviewer subagent that
+    starts without <dragonfly-context> reviews an empty diff and reports
+    "no issues found", which reads as a clean review rather than a
+    broken one. SubagentStart hooks cannot block a spawn, so exit 2 does
+    not stop the reviewer. It does render stderr as a hook error notice
+    in the subagent's transcript, which makes a missing binary or a
+    failed `dragonfly prompt` visible instead of silently degraded.
     """
     _debug(f"[hook] failing loudly: {reason}")
     print(f"review-context: {reason}", file=sys.stderr)
     print(
-        "review-context: refusing to start the reviewer without "
-        "<dragonfly-context>. Fix the cause and re-spawn.",
+        "review-context: no <dragonfly-context> was injected; this "
+        "reviewer is running on an empty diff. Fix the cause and re-spawn.",
         file=sys.stderr,
     )
     return 2
