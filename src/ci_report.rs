@@ -330,6 +330,11 @@ fn check_source(c: &PrCheck) -> (Source, String) {
     }
 }
 
+/// The provider tag for `c`, judged by where its log lives.
+pub fn provider_label(c: &PrCheck) -> &'static str {
+    crate::classify_provider_label(&check_source(c).1)
+}
+
 /// A fetched log plus what the comparison with main needs.
 #[derive(Default)]
 struct Fetched {

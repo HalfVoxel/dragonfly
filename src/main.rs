@@ -70,6 +70,10 @@ enum CliCommand {
     /// CI status, failure logs, watch, flakiness, retries, rerun.
     /// Replaces ad-hoc gh pr checks / gh run incantations with bounded, agent-friendly output.
     Ci {
+        /// GitHub repository as OWNER/NAME. Defaults to the current checkout's
+        /// repository, or the Lovable monorepo outside a checkout.
+        #[arg(long, global = true)]
+        repo: Option<String>,
         #[command(subcommand)]
         command: CiCommand,
     },
@@ -2372,11 +2376,19 @@ async fn resolve_pr_number(pr: Option<String>) -> Option<String> {
 }
 
 async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
-    let Some((label, sha)) = resolve_report_target(pr).await else {
-        eprintln!("No PR for the current branch and nothing pushed; pass --pr.");
-        return 2;
+    // The conflict probe merges local HEAD, which is only the reported commit
+    // without --pr.
+    let probe_local = pr.is_none();
+    let (label, sha) = match resolve_report_target(pr).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
     };
-    let (checks, has_conflicts) = tokio::join!(checks_for_sha(&sha), check_origin_main_conflicts());
+    let (checks, has_conflicts) = tokio::join!(checks_for_sha(&sha), async {
+        probe_local && check_origin_main_conflicts().await
+    });
     let short = &sha[..7.min(sha.len())];
     let code = print_checks_summary(&format!("{label} @ {short}"), &checks, ignored, all);
     if has_conflicts {
@@ -2385,33 +2397,62 @@ async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
     code
 }
 
-/// Resolves the commit `ci failures` reports on: the PR head with `--pr`, else
-/// the current branch's pushed commit. Returns (label, sha).
-async fn resolve_report_target(pr: Option<String>) -> Option<(String, String)> {
+/// The Lovable monorepo, which `ci` targets when run outside a checkout.
+const DEFAULT_REPO: &str = "lovablelabs/lovable";
+
+/// The repository the `ci` commands' `gh` calls target via `GH_REPO`, when the
+/// current directory does not determine it: `--repo`, else [DEFAULT_REPO]
+/// outside a git checkout. `None` leaves `gh` to resolve it.
+async fn ci_repo(flag: Option<String>) -> Option<String> {
+    if flag.is_some() {
+        return flag;
+    }
+    if std::env::var_os("GH_REPO").is_some() {
+        return None;
+    }
+    let in_checkout = sh3("git rev-parse --git-dir").await.code == 0;
+    (!in_checkout).then(|| DEFAULT_REPO.to_string())
+}
+
+/// Resolves the commit `ci failures` and `ci status` report on: the PR head
+/// with `--pr`, else the current branch's PR head, else its pushed commit.
+/// Returns (label, sha), or why there is nothing to report on.
+async fn resolve_report_target(pr: Option<String>) -> Result<(String, String), String> {
     let pr = match pr {
         Some(p) => Some(p),
         None => resolve_pr_number(None).await,
     };
     match pr {
         Some(pr) => {
-            let sha = sh(&format!(
+            let r = sh3(&format!(
                 "gh pr view {pr} --json headRefOid --jq '.headRefOid'"
             ))
-            .await
-            .filter(|s| !s.is_empty())?;
-            Some((format!("PR #{pr}"), sha))
+            .await;
+            let sha = r.stdout.trim();
+            if r.code != 0 || sha.is_empty() {
+                let why = r
+                    .stderr
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("no head commit");
+                return Err(format!("Could not resolve PR #{pr}: {}", why.trim()));
+            }
+            Ok((format!("PR #{pr}"), sha.to_string()))
         }
-        None => {
-            let (sha, _) = resolve_watch_anchor(None).await?;
-            Some(("Commit".into(), sha))
-        }
+        None => match resolve_watch_anchor(None).await {
+            Some((sha, _)) => Ok(("Commit".into(), sha)),
+            None => Err("No PR for the current branch and nothing pushed; pass --pr.".into()),
+        },
     }
 }
 
 async fn ci_failures_cmd(pr: Option<String>, raw: bool, model: Option<Model>) -> i32 {
-    let Some((label, sha)) = resolve_report_target(pr).await else {
-        eprintln!("No PR for the current branch and nothing pushed; pass --pr.");
-        return 2;
+    let (label, sha) = match resolve_report_target(pr).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
     };
     let checks = checks_for_sha(&sha).await;
     let opts = ci_report::Options {
@@ -2768,7 +2809,7 @@ fn print_checks_summary(label: &str, checks: &[PrCheck], ignored: &[&str], all: 
         let provider = if gate {
             "needs-approval"
         } else {
-            classify_provider_label(&c.link)
+            ci_report::provider_label(c)
         };
         // A gate's commit-status description ("awaiting @lovablelabs/ai
         // approval") is the actionable bit, not its link.
@@ -5474,7 +5515,11 @@ async fn main() {
                 let code = pr_review_cmd(model).await;
                 std::process::exit(code);
             }
-            CliCommand::Ci { command } => {
+            CliCommand::Ci { repo, command } => {
+                if let Some(repo) = ci_repo(repo).await {
+                    // SAFETY: set before any task that reads the environment is spawned.
+                    unsafe { std::env::set_var("GH_REPO", repo) };
+                }
                 let code = match command {
                     CiCommand::Status { all, pr } => {
                         ci_status_cmd(pr, all, &[QA_TECH_REVIEW, CLAUDE_CODE_REVIEW]).await
