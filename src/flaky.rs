@@ -48,11 +48,124 @@ impl Tally {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum Outcome {
+pub enum Outcome {
     Pass,
     Fail,
     Skip,
     Other,
+}
+
+/// One finished run of a check on main.
+pub struct MainRun {
+    pub sha: String,
+    pub subject: String,
+    /// When the run was created, as a Unix timestamp; 0 when unknown.
+    pub created_at: i64,
+    pub outcome: Outcome,
+}
+
+/// How a check fares on main, as evidence for whether a PR's failure is its own.
+#[derive(Debug, PartialEq)]
+pub enum Health {
+    /// Every recent run passed.
+    Passing {
+        runs: usize,
+    },
+    /// Failures scattered among passes.
+    Flaky {
+        failed: usize,
+        runs: usize,
+    },
+    /// One unbroken stretch of `failed` runs ended before the newest run, at `sha`:
+    /// main was broken and was fixed before the moment judged.
+    Recovered {
+        failed: usize,
+        sha: String,
+        subject: String,
+    },
+    /// The newest runs fail: main itself is red for this check.
+    Broken {
+        failed: usize,
+        runs: usize,
+    },
+    /// Main was red when the PR's run started and has passed since `sha`.
+    FixedSince {
+        sha: String,
+        subject: String,
+    },
+    /// Main was red at the moment judged, and no later main run shows whether it still is.
+    BrokenThen {
+        failed: usize,
+        runs: usize,
+    },
+    NoData,
+}
+
+/// Classifies a check's main history, newest run first.
+///
+/// With `at` (the PR's base on main, else when its run started), the verdict describes main at that moment:
+/// a PR run against a red main fails for main's reason, and a later green main run
+/// means a rebase or rerun picks up the fix. Skipped and unfinished runs are ignored.
+pub fn health(runs_newest_first: &[MainRun], at: Option<i64>) -> Health {
+    let finished: Vec<&MainRun> = runs_newest_first
+        .iter()
+        .filter(|r| matches!(r.outcome, Outcome::Pass | Outcome::Fail))
+        .collect();
+    let (after, before): (Vec<&MainRun>, Vec<&MainRun>) = match at {
+        Some(t) => finished
+            .iter()
+            .partition(|r| r.created_at > t && r.created_at != 0),
+        None => (Vec::new(), finished.clone()),
+    };
+    if before.is_empty() {
+        return Health::NoData;
+    }
+    let failed = before.iter().filter(|r| r.outcome == Outcome::Fail).count();
+    let runs = before.len();
+    if failed == 0 {
+        return Health::Passing { runs };
+    }
+    // Two failures at the newest end, or a failing newest run with most runs red.
+    let newest_fail = before[0].outcome == Outcome::Fail;
+    let red = newest_fail
+        && (before.get(1).is_some_and(|r| r.outcome == Outcome::Fail) || failed * 2 >= runs);
+    if !newest_fail {
+        // Fail streaks, newest first; a single one of two or more runs is a breakage.
+        let streaks = before
+            .windows(2)
+            .filter(|w| w[0].outcome == Outcome::Pass && w[1].outcome == Outcome::Fail)
+            .count();
+        if streaks == 1 && failed >= 2 {
+            // The newest run passes, so the streak starts at index >= 1.
+            let first_fail = before
+                .iter()
+                .position(|r| r.outcome == Outcome::Fail)
+                .unwrap_or(1);
+            let fix = before[first_fail - 1];
+            return Health::Recovered {
+                failed,
+                sha: fix.sha.chars().take(7).collect(),
+                subject: fix.subject.clone(),
+            };
+        }
+        return Health::Flaky { failed, runs };
+    }
+    if !red {
+        return Health::Flaky { failed, runs };
+    }
+    // The fix is the oldest run of the green streak at the newest end of `after`.
+    let fix = after
+        .iter()
+        .take_while(|r| r.outcome == Outcome::Pass)
+        .last();
+    match fix {
+        Some(r) => Health::FixedSince {
+            sha: r.sha.chars().take(7).collect(),
+            subject: r.subject.clone(),
+        },
+        None if at.is_some() && after.is_empty() => Health::BrokenThen { failed, runs },
+        None => Health::Broken { failed, runs },
+    }
 }
 
 pub async fn run(name: String, limit: usize) -> i32 {
@@ -145,7 +258,8 @@ async fn gha_report(name: &str, limit: usize) -> Option<String> {
             ran.len()
         ));
     }
-    out.push_str(&format!("\nVerdict: {}\n", main_verdict(&tally, 0)));
+    let outcomes: Vec<Outcome> = ran.iter().map(|r| r.outcome).collect();
+    out.push_str(&format!("\nVerdict: {}\n", main_verdict(&outcomes, 0)));
     Some(out)
 }
 
@@ -261,6 +375,10 @@ struct BkBuild {
     pipeline: BkBuildPipeline,
     #[serde(default)]
     jobs: Vec<BkJob>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -293,6 +411,68 @@ struct StepResult {
     state: String,
     /// An earlier attempt failed and a retry in the same build passed.
     flipped: bool,
+}
+
+/// The step named `step` on `pipeline`'s recent finished main builds, newest first.
+///
+/// None when `bk` is unavailable; empty when the pipeline never builds main
+/// (PR-only pipelines such as `pull-request-checks`).
+/// The step matching `step` in `pipeline`'s finished main builds: the newest
+/// `limit`, plus the `limit` before `before` so a PR build from days ago is
+/// compared with main as it was then.
+pub async fn buildkite_main_runs(
+    pipeline: &str,
+    step: &str,
+    limit: usize,
+    before: Option<i64>,
+) -> Option<Vec<MainRun>> {
+    let base = format!(
+        "/pipelines/{pipeline}/builds?branch=main&per_page={limit}&include_retried_jobs=true&state[]=passed&state[]=failed"
+    );
+    let older = before
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+        .map(|t| format!("{base}&created_to={}", t.format("%Y-%m-%dT%H:%M:%SZ")));
+    let (newest, older) = tokio::join!(bk_get(&base), async {
+        match &older {
+            Some(p) => bk_get(p).await,
+            None => None,
+        }
+    });
+    let mut builds: Vec<BkBuild> = serde_json::from_str(&newest?).ok()?;
+    for b in older
+        .and_then(|raw| serde_json::from_str::<Vec<BkBuild>>(&raw).ok())
+        .unwrap_or_default()
+    {
+        if !builds.iter().any(|x| x.number == b.number) {
+            builds.push(b);
+        }
+    }
+    let query = normalize_step(step);
+    let mut runs: Vec<MainRun> = builds
+        .iter()
+        .filter_map(|b| {
+            let r = step_result(b, &query)?;
+            Some(MainRun {
+                sha: b.commit.clone(),
+                subject: b
+                    .message
+                    .as_deref()
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+                created_at: b
+                    .created_at
+                    .as_deref()
+                    .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                    .map_or(0, |t| t.timestamp()),
+                outcome: r.outcome,
+            })
+        })
+        .collect();
+    runs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Some(runs)
 }
 
 async fn bk_get(path: &str) -> Option<String> {
@@ -346,11 +526,12 @@ async fn buildkite_report(name: &str, limit: usize) -> Option<String> {
     let mut out = String::new();
     if !main_results.is_empty() {
         let (tally, flips, rows) = summarize(&main_results);
+        let outcomes: Vec<Outcome> = main_results.iter().map(|r| r.outcome).collect();
         out.push_str(&format!(
             "Buildkite `{name}` on {} recent main builds:\n{}\n\n{rows}\nVerdict: {}\n",
             main_results.len(),
             tally.summary(),
-            main_verdict(&tally, flips)
+            main_verdict(&outcomes, flips)
         ));
     }
     if !pr_results.is_empty() {
@@ -521,17 +702,33 @@ fn summarize(results: &[StepResult]) -> (Tally, usize, String) {
     (tally, flips, rows)
 }
 
-fn main_verdict(t: &Tally, flips: usize) -> &'static str {
+fn main_verdict(outcomes_newest_first: &[Outcome], flips: usize) -> &'static str {
     if flips > 0 {
-        "Failed then passed on retry within a build — confirmed flaky. Consider rerunning."
-    } else if t.pass + t.fail == 0 {
-        "No data — this check doesn't run on main. Compare against other branches instead."
-    } else if t.fail == 0 {
-        "Consistently passing on main — failure is likely caused by this PR."
-    } else if t.pass == 0 {
-        "Consistently failing on main — pre-existing issue, do not fix in this PR without confirmation."
-    } else {
-        "Mixed pass/fail on main — likely flaky. Consider rerunning."
+        return "Failed then passed on retry within a build — confirmed flaky. Consider rerunning.";
+    }
+    let runs: Vec<MainRun> = outcomes_newest_first
+        .iter()
+        .map(|&outcome| MainRun {
+            sha: String::new(),
+            subject: String::new(),
+            created_at: 0,
+            outcome,
+        })
+        .collect();
+    match health(&runs, None) {
+        Health::NoData => {
+            "No data — this check doesn't run on main. Compare against other branches instead."
+        }
+        Health::Passing { .. } => {
+            "Consistently passing on main — failure is likely caused by this PR."
+        }
+        Health::Broken { .. } | Health::FixedSince { .. } | Health::BrokenThen { .. } => {
+            "Broken on main: the newest runs fail — pre-existing, not caused by this PR. A rerun will fail the same way; look for a fix on main."
+        }
+        Health::Recovered { .. } => {
+            "Was broken on main for a stretch but passes again — not flaky. A failure now is likely this PR's, or its branch predates the fix: rebase."
+        }
+        Health::Flaky { .. } => "Intermittent on main — likely flaky. Consider rerunning.",
     }
 }
 
@@ -606,7 +803,81 @@ mod tests {
             web_url: String::new(),
             pipeline: BkBuildPipeline { slug: "p".into() },
             jobs,
+            message: None,
+            created_at: None,
         }
+    }
+
+    fn runs(spec: &str) -> Vec<MainRun> {
+        // Newest first; one char per run: P pass, F fail, S skip. Run i was created at 100 - i.
+        spec.chars()
+            .enumerate()
+            .map(|(i, c)| MainRun {
+                sha: format!("sha{i}abcdef"),
+                subject: format!("commit {i}"),
+                created_at: 100 - i as i64,
+                outcome: match c {
+                    'P' => Outcome::Pass,
+                    'F' => Outcome::Fail,
+                    _ => Outcome::Skip,
+                },
+            })
+            .collect()
+    }
+
+    // Regression: `ci flaky js_checks` called main breakage (10 of 12 runs red, newest
+    // red) "mixed pass/fail, likely flaky" and suggested a rerun that could not pass.
+    #[test]
+    fn a_red_newest_end_is_broken_not_flaky() {
+        assert_eq!(
+            health(&runs("FPFFFFFFFPFF"), None),
+            Health::Broken {
+                failed: 10,
+                runs: 12
+            }
+        );
+        assert_eq!(
+            health(&runs("PPFPPPPP"), None),
+            Health::Flaky { failed: 1, runs: 8 }
+        );
+        assert_eq!(health(&runs("PSPP"), None), Health::Passing { runs: 3 });
+        // One stretch of red that ended: a fixed breakage, not flakiness.
+        assert_eq!(
+            health(&runs("PPFFFFFFP"), None),
+            Health::Recovered {
+                failed: 6,
+                sha: "sha1abc".into(),
+                subject: "commit 1".into()
+            }
+        );
+        assert_eq!(
+            health(&runs("PFFPFFP"), None),
+            Health::Flaky { failed: 4, runs: 7 }
+        );
+        assert_eq!(health(&runs("SS"), None), Health::NoData);
+    }
+
+    #[test]
+    fn health_judges_main_as_it_was_when_the_pr_ran() {
+        // The PR ran at t=95.5: runs 0-4 came after it. Main was red then, green since run 3.
+        let h = health(&runs("PPPPFFFFF"), Some(95));
+        assert_eq!(
+            h,
+            Health::FixedSince {
+                sha: "sha3abc".into(),
+                subject: "commit 3".into()
+            }
+        );
+        // Still red after the PR ran: broken, not fixed.
+        assert_eq!(
+            health(&runs("FFFFP"), Some(98)),
+            Health::Broken { failed: 2, runs: 3 }
+        );
+        // Nothing finished after it (path-filtered or skipped): red then, unknown now.
+        assert_eq!(
+            health(&runs("SSFFP"), Some(98)),
+            Health::BrokenThen { failed: 2, runs: 3 }
+        );
     }
 
     #[test]
