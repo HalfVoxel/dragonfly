@@ -221,6 +221,29 @@ replacing the old ones. This means old or new frontends can communicate with old
 for a short time. Potentially even having data flows like
 old frontend -> new backend -> old frontend -> old backend or similar.
 
+Once the correctness and deployment `review-agent`s finish, spawn a single
+`design-reviewer` subagent. It judges whether the PR is built on the right
+foundation and uses clusters of bugs as evidence of a flawed design, so it
+starts after the bug hunt. First verify each bug finding yourself and discard
+false positives; mark one you could not confirm either way as unverified.
+It receives the PR diff and high level instructions automatically. Your prompt
+carries only these two sections:
+
+```
+# Bugs other reviewers found
+1. <file:line>: <the bug, one line>
+2. <file:line>: <the bug, one line> (unverified)
+
+# Relevant files
+<relative-file-path>:<start-end>  <integer 0-100>
+```
+
+Write "None" under the bugs header when no bug survived. List each file at
+most once, with the ranges you read while verifying plus the code outside the
+diff that explains the PR: callers, the components it replaces or duplicates,
+AGENTS.md files and docs. Score 100 for the code the PR is about, 80 for code
+it changes or directly depends on, and 50 for broader context.
+
 CUSTOM_REVIEW_PLACEHOLDER
 
 Instruct the subagents to write a numbered list of issues they find.
@@ -269,7 +292,8 @@ It will need to be rewritten to follow these guidelines.
 Report a summary:
 - **CI**: Final status of all checks
 - **Fixes applied**: List of commits made to fix CI or bot issues. Remember that CI issues unrelated to this PR should not be fixed, but the user should be informed.
-- **Dedup candidates**: Verified genuine duplicates from the pre-collected `dedup` hints file (function, existing counterpart, suggested direction). Omit the section if there were none.
+- **Dedup candidates**: The `dedup-reviewer`'s verified duplicates (each copy, suggested consolidation direction). Omit the section if there were none.
+- **Design**: The `design-reviewer`'s recommended changes in its ranking order, then its justified decisions one line each. Omit the section if it recommended nothing.
 - **Remaining items**: Any unresolved bot comments or issues needing user input
 - **PR URL**: Link to the PR
 

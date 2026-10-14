@@ -8,20 +8,20 @@ delta: the subprocess timeout is 550 here vs 600 in the repo copy. It
 must stay below the 600s hook timeout in hooks.json, or Claude Code
 kills the hook before the TimeoutExpired path can report the failure.
 
-When a `review-agent`, `comment-reviewer`, `dedup-reviewer`, or
-`test-reviewer` subagent (see ../agents/) is spawned, this hook shells
-out to
-    dragonfly prompt review-agent [--inline-diffs]   # review/comment/test agents
+When a `review-agent`, `comment-reviewer`, `dedup-reviewer`,
+`test-reviewer`, or `design-reviewer` subagent (see ../agents/) is
+spawned, this hook shells out to
+    dragonfly prompt review-agent [--inline-diffs]   # review/comment/test/design agents
     dragonfly prompt dedup-reviewer                  # dedup agent
 and returns the output as the subagent's initial context via
 `hookSpecificOutput.additionalContext` JSON (plain hook stdout does not
 reach SubagentStart subagents; see the comment at the emit site below).
 
 `comment-reviewer` gets `--inline-diffs` (full diffs inlined in the
-context); `review-agent` and `test-reviewer` get the default /tmp
-diff-file references (both read full source files anyway);
-`dedup-reviewer` gets its own context with the full duplicate-function
-hint list inlined.
+context); `review-agent`, `test-reviewer` and `design-reviewer` get the
+default /tmp diff-file references (all read full source files anyway);
+`dedup-reviewer` gets its own slimmer context (no relevant-context
+scoring).
 
 The orchestration heavy-lifting — assembling commit list, changed files,
 per-file diff files, and the scored <relevant-context> block — lives in

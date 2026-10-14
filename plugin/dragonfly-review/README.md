@@ -3,8 +3,9 @@
 Dragonfly's fan-out PR review as a Claude Code plugin: the
 `dragonfly-review:review` and `dragonfly-review:review-and-fix` skills
 spawn specialist reviewer subagents
-(`review-agent` per concern, `comment-reviewer`, `dedup-reviewer`, and
-`test-reviewer` when tests changed), each fed pre-collected diff context by
+(`review-agent` per concern, `comment-reviewer`, `dedup-reviewer`,
+`test-reviewer` when tests changed, and a `design-reviewer` seeded with
+the verified bugs), each fed pre-collected diff context by
 a SubagentStart hook that shells out to `dragonfly prompt`.
 
 ## Install
@@ -27,7 +28,7 @@ helper on PATH and is silently absent without it.
 | --- | --- |
 | `skills/review` | Orchestrator: scope, comment triage, fan-out, report. Review-only: it never pushes, and replies to review threads only after user approval. |
 | `skills/review-and-fix` | Fixed four-reviewer fan-out (correctness, simplification, tests, comments), then applies the unambiguous fixes and defers the rest. Never commits or pushes. |
-| `agents/` | The four reviewer subagents (read-only tools; `model: inherit`) |
+| `agents/` | The five reviewer subagents (read-only tools; `model: inherit`) |
 | `hooks/` | SubagentStart hook injecting `<dragonfly-context>` via `dragonfly prompt` |
 
 `hooks/review-context.py` is a vendored copy of the repo's
@@ -36,7 +37,7 @@ root), and `skills/review/SKILL.md` shares its policy blocks with
 `DRAGONFLY_SKILL` in `src/skill.rs`. Sync deliberate changes to either
 one both ways.
 
-The four `agents/*.md` bodies are **generated** from the repo's
+The five `agents/*.md` bodies are **generated** from the repo's
 `agents/` files — edit those, then run `dragonfly gen-plugin-agents`.
 Frontmatter here is hand-maintained (the plugin pins `tools:` for
 read-only enforcement and `model: inherit`); only the body is derived.

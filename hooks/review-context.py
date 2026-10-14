@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """SubagentStart hook for Claude Code.
 
-When a `review-agent`, `comment-reviewer`, `dedup-reviewer`, or
-`test-reviewer` subagent (see agents/) is spawned by the parent dragonfly
-flow, this hook shells out to
-    dragonfly prompt review-agent [--inline-diffs]   # review/comment/test agents
+When a `review-agent`, `comment-reviewer`, `dedup-reviewer`,
+`test-reviewer`, or `design-reviewer` subagent (see agents/) is spawned
+by the parent dragonfly flow, this hook shells out to
+    dragonfly prompt review-agent [--inline-diffs]   # review/comment/test/design agents
     dragonfly prompt dedup-reviewer                  # dedup agent
 and returns the output as the subagent's initial context via
 `hookSpecificOutput.additionalContext` JSON (plain hook stdout does not
 reach SubagentStart subagents; see the comment at the emit site below).
 
 `comment-reviewer` gets `--inline-diffs` (full diffs inlined in the
-context); `review-agent` and `test-reviewer` get the default /tmp
-diff-file references (both read full source files anyway);
-`dedup-reviewer` gets its own context with the full duplicate-function
-hint list inlined.
+context); `review-agent`, `test-reviewer` and `design-reviewer` get the
+default /tmp diff-file references (all read full source files anyway);
+`dedup-reviewer` gets its own slimmer context (no relevant-context
+scoring).
 
 The orchestration heavy-lifting — assembling commit list, changed files,
 per-file diff files, and the scored <relevant-context> block — lives in
@@ -29,11 +29,10 @@ the binary's own dir before exec'ing `claude`, so a manual `claude`
 invocation against this settings file fails the spawn until the binary
 is installed.
 
-Matchers in settings/dragonfly-settings.json gate this hook on agent_type
-"review-agent", "comment-reviewer", "dedup-reviewer", and "test-reviewer";
-the hook keys the --inline-diffs flag off that same agent_type. These
-matchers only ever see bare agent types, so the namespace strip below is
-a no-op here; it exists to keep this body in sync with the plugin's
+The matcher in settings/dragonfly-settings.json gates this hook on the
+agent types listed above, and the hook keys the --inline-diffs flag off
+that same agent_type. That matcher only ever sees bare agent types, so
+the namespace strip below is a no-op here; it exists to keep this body in sync with the plugin's
 vendored copy, which receives "dragonfly-review:"-prefixed agent types
 and deliberately runs its subprocess with a shorter (550s) timeout.
 """

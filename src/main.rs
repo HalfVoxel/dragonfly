@@ -5160,6 +5160,7 @@ const REVIEW_AGENT_MD: &str = include_str!("../agents/review-agent.md");
 const COMMENT_REVIEWER_MD: &str = include_str!("../agents/comment-reviewer.md");
 const DEDUP_REVIEWER_MD: &str = include_str!("../agents/dedup-reviewer.md");
 const TEST_REVIEWER_MD: &str = include_str!("../agents/test-reviewer.md");
+const DESIGN_REVIEWER_MD: &str = include_str!("../agents/design-reviewer.md");
 // Bundled so the `@../code-comments.md` reference in agent bodies can be
 // inlined at registration time. See [expand_bundled_refs].
 const CODE_COMMENTS_MD: &str = include_str!("../code-comments.md");
@@ -5172,6 +5173,7 @@ const BUNDLED_AGENTS: &[&str] = &[
     COMMENT_REVIEWER_MD,
     DEDUP_REVIEWER_MD,
     TEST_REVIEWER_MD,
+    DESIGN_REVIEWER_MD,
 ];
 
 /// Minimal YAML-frontmatter splitter for agent markdown files. Only handles

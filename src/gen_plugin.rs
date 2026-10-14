@@ -55,6 +55,10 @@ const SPECS: &[AgentSpec] = &[
         name: "test-reviewer",
         subs: &[],
     },
+    AgentSpec {
+        name: "design-reviewer",
+        subs: &[],
+    },
 ];
 
 /// Repo checkout the generator reads and writes. Compiled in, so the command
@@ -195,6 +199,56 @@ mod tests {
                 have, want,
                 "plugin/dragonfly-review/agents/{}.md is stale; run `cargo run -- gen-plugin-agents`",
                 spec.name
+            );
+        }
+    }
+
+    /// SubagentStart matchers from a settings or hooks.json file, compiled
+    /// as full-string regexes the way Claude Code applies them.
+    fn subagent_start_matchers(json: &str) -> Vec<regex::Regex> {
+        let v: serde_json::Value = serde_json::from_str(json).expect("parse hook config");
+        v["hooks"]["SubagentStart"]
+            .as_array()
+            .expect("SubagentStart array")
+            .iter()
+            .map(|h| {
+                let m = h["matcher"].as_str().expect("matcher string");
+                regex::Regex::new(&format!("^(?:{m})$")).expect("matcher regex")
+            })
+            .collect()
+    }
+
+    /// Invariant: every bundled agent is vendored into the plugin and matched
+    /// by both SubagentStart hook configs. An agent missing from a matcher
+    /// still spawns, but without `<dragonfly-context>`, so it reviews nothing
+    /// and reports a clean diff.
+    #[test]
+    fn every_bundled_agent_is_vendored_and_hooked() {
+        let settings = subagent_start_matchers(crate::DRAGONFLY_SETTINGS_TEMPLATE);
+        let plugin_hooks = std::fs::read_to_string(
+            repo_root().join("plugin/dragonfly-review/hooks/hooks.json"),
+        )
+        .expect("read plugin hooks.json");
+        let plugin = subagent_start_matchers(&plugin_hooks);
+
+        let mut bundled: Vec<String> = crate::BUNDLED_AGENTS
+            .iter()
+            .map(|md| crate::split_agent_frontmatter(md).0["name"].clone())
+            .collect();
+        let mut specs: Vec<String> = SPECS.iter().map(|s| s.name.to_string()).collect();
+        bundled.sort();
+        specs.sort();
+        assert_eq!(bundled, specs, "BUNDLED_AGENTS and SPECS list different agents");
+
+        for name in &bundled {
+            assert!(
+                settings.iter().any(|r| r.is_match(name)),
+                "{name} is not matched by settings/dragonfly-settings.json SubagentStart"
+            );
+            let namespaced = format!("dragonfly-review:{name}");
+            assert!(
+                plugin.iter().any(|r| r.is_match(&namespaced)),
+                "{namespaced} is not matched by plugin/dragonfly-review/hooks/hooks.json"
             );
         }
     }

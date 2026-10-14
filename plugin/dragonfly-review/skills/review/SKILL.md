@@ -1,11 +1,11 @@
 ---
 name: review
-description: Dragonfly PR review — fan out specialist review subagents over the current branch's diff before pushing or marking a PR ready. Use when the user asks to review the PR/branch/diff, before any git push of substantive changes, or before creating a PR. Runs in the main session and spawns review-agent subagents (one per concern) plus comment-reviewer, dedup-reviewer, and (when tests changed) test-reviewer subagents, all fed pre-collected diff/context by the dragonfly CLI. Review-only — it reports findings and fixes them only after the user picks.
+description: Dragonfly PR review — fan out specialist review subagents over the current branch's diff before pushing or marking a PR ready. Use when the user asks to review the PR/branch/diff, before any git push of substantive changes, or before creating a PR. Runs in the main session and spawns review-agent subagents (one per concern) plus comment-reviewer, dedup-reviewer, and (when tests changed) test-reviewer subagents, then a design-reviewer seeded with the verified bugs, all fed pre-collected diff/context by the dragonfly CLI. Review-only — it reports findings and fixes them only after the user picks.
 ---
 
 # Dragonfly review
 
-Review the current branch's changes (the PR) using Dragonfly's fan-out review flow. You orchestrate; the `review-agent` / `comment-reviewer` / `test-reviewer` / `dedup-reviewer` subagents (this plugin's agents; their types may appear namespaced, e.g. `dragonfly-review:review-agent`) do the reading. Review-only: report findings first, fix only what the user picks.
+Review the current branch's changes (the PR) using Dragonfly's fan-out review flow. You orchestrate; the `review-agent` / `comment-reviewer` / `test-reviewer` / `dedup-reviewer` / `design-reviewer` subagents (this plugin's agents; their types may appear namespaced, e.g. `dragonfly-review:review-agent`) do the reading. Review-only: report findings first, fix only what the user picks.
 
 The `dragonfly` CLI is required (install: `cargo install --git https://github.com/HalfVoxel/dragonfly --locked`). If it's missing, fall back to plain `git`/`gh` and a single `review-agent` with the diff scope in the prompt.
 
@@ -44,9 +44,30 @@ Pick the fan-out from the area breakdown:
 - **Deployment edge cases** — one `review-agent` if the diff touches wire formats, API contracts, schemas, enums, or feature flags. Remind it: deploys are gradual (~10 minutes), so old and new frontends/backends coexist and can call each other in mixed orders (e.g. old frontend → new backend → old backend).
 - **Comments & docs** — always one `comment-reviewer` (a single instance is sufficient; it typically needs no extra instructions).
 - **Test quality** — one `test-reviewer` if the PR adds or modifies test files (structure, duplicate or low-value tests, assertion style, coverage gaps). A single instance is sufficient; it typically needs no extra instructions.
-- **Duplication** — always one `dedup-reviewer`. Its hook context inlines the full duplicate-function hint list; it validates each hinted pair (dismissing false positives itself via `dragonfly dedup dismiss`) and also hunts for duplication the hint pipeline cannot see: repeats within the PR itself, non-Go code, sub-function copies. Don't have other subagents re-check the hints, and don't read the hints yourself.
+- **Duplication** — always one `dedup-reviewer`. It reads the diff and searches the codebase for existing helpers the PR re-implements, repeats within the PR itself, and copies the PR leaves behind.
 
 Small PR (all scores < 6, few files): one `review-agent` over the whole diff + the `comment-reviewer` + the `dedup-reviewer`.
+
+## Phase 2b — Design review
+
+The `design-reviewer` judges whether the PR is built on the right foundation, and uses clusters of bugs as evidence of a flawed design. It therefore starts after the bug hunt, not in the Phase 2 message.
+
+1. Wait for the correctness and deployment `review-agent`s to finish. The comment, test and dedup reviewers can keep running.
+2. Verify each bug finding: read the flagged code yourself and discard false positives. Mark a finding you could not confirm either way as unverified rather than dropping it.
+3. Spawn one `design-reviewer`. It receives the PR diff and high level instructions automatically. Your prompt carries only these two sections:
+
+   ```
+   # Bugs other reviewers found
+   1. <file:line>: <the bug, one line>
+   2. <file:line>: <the bug, one line> (unverified)
+
+   # Relevant files
+   <relative-file-path>:<start-end>  <integer 0-100>
+   ```
+
+   Write "None" under the bugs header when no bug survived. List each file at most once, with the ranges you read while verifying plus the code outside the diff that explains the PR: callers, the components it replaces or duplicates, AGENTS.md files and docs. Score 100 for the code the PR is about, 80 for code it changes or directly depends on, and 50 for broader context. Leave out irrelevant files.
+
+Spawn it even when no bug survived: the design review does not depend on bugs existing.
 
 ## Phase 3 — Aggregate and report
 
@@ -55,8 +76,9 @@ Merge subagent findings into a single markdown report (omit empty sections):
 1. **Issues** — numbered, ordered by severity (`🔴 Critical` / `🟡 Medium` / `🟢 Low`). Each: file:line, one-two sentence explanation, concrete suggested fix, confidence. Dedupe overlapping findings across subagents.
 2. **Review-comment triage** — per existing thread: valid (suggested action) or dismiss (reason); include thread IDs.
 3. **Pre-existing issues (informational)** — wrong on the base, not caused by this PR; never fix without the user's say-so.
-4. **Dedup candidates** — the `dedup-reviewer`'s verified genuine duplicates (function, existing counterpart, suggested direction) and its broader duplication findings. It dismisses false positives itself (`dragonfly dedup dismiss`; persists across worktrees — `dragonfly dedup exclusions` lists them), so only its genuine/unsure verdicts reach this report.
-5. **Verdict** — one line, e.g. "2 critical, 3 medium — not ready to push" or "No blocking issues found".
+4. **Dedup candidates** — the `dedup-reviewer`'s duplication findings (each copy, suggested consolidation direction).
+5. **Design** — the `design-reviewer`'s recommended changes in its ranking order: the change, which numbered issues it removes, what it loses, and its size. Then its justified decisions, one line each.
+6. **Verdict** — one line, e.g. "2 critical, 3 medium — not ready to push" or "No blocking issues found".
 
 Ask which issues to fix as free-form text (not AskUserQuestion). After fixing approved issues, re-run the relevant `review-agent` at most once.
 
