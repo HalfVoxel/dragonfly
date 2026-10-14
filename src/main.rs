@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::{Child, Command};
 use tokio::time::sleep;
 
+mod ci_report;
 mod dedup;
 mod flaky;
 mod gen_plugin;
@@ -353,39 +354,50 @@ enum CiCommand {
         #[arg(long)]
         pr: Option<String>,
     },
-    /// For each failed check (GitHub Actions, Buildkite, Spacelift, Wiz, …), print
-    /// a per-check section with per-step conclusions and extracted error lines,
-    /// then the link. Output is piped through an LLM (claude --model haiku) to
-    /// distill into a terse summary when the dump is non-trivial (>=1000 bytes);
-    /// the per-check raw logs (truncated at 16k each) are saved to
-    /// /tmp/psc-ci-failures-full-*.md and referenced in the footer.
+    /// Report each failing check at the PR head (or the pushed commit): failed
+    /// step, how the check does on main, the error lines from its log, and the
+    /// log's path on disk.
+    ///
+    /// Reads GitHub Actions job logs while the run is still going, Buildkite
+    /// logs through the `bk` CLI, and the check-run output for other providers.
+    /// Prints the excerpts as is when small; otherwise an LLM condenses them
+    /// and the full report path is printed. Approval gates, reruns and
+    /// cancellations are listed as notes, never as failures.
+    ///
+    /// Exit codes: 0 no fixable failures, 1 failures, 2 nothing to report on.
     Failures {
         /// Explicit PR number. Defaults to the current branch's PR.
         #[arg(long)]
         pr: Option<String>,
-        /// Maximum bytes of full log per check (default 8000).
-        #[arg(long, default_value = "8000")]
-        max_bytes: usize,
-        /// Skip the LLM distill step; print the raw per-check dump.
+        /// Print every excerpt; never call an LLM.
         #[arg(long)]
         raw: bool,
-        /// Override the distiller model (default: haiku).
+        /// Condense with only this model instead of the default fallback chain.
         #[arg(long)]
         model: Option<Model>,
     },
     /// Poll the checks of the last-pushed commit until all pass or one fails
-    /// (fail-fast), then print a final summary (same shape as `ci status`).
+    /// (fail-fast), then print a summary; on failure also print the
+    /// `ci failures` report for that commit.
     ///
     /// Anchors on the pushed SHA (`@{push}` / origin/<branch>, or the PR head
     /// with --pr), so `git push && dragonfly ci watch` watches exactly what
-    /// was pushed even if someone else pushes mid-watch. Waits for slow
-    /// checks like test-e2e but skips the Graphite mergeability check,
-    /// deploy, and doc-review.
+    /// was pushed, and follows a newer push. Waits for slow checks like
+    /// test-e2e but skips approval gates, review bots, evals, deploy and
+    /// doc-review. Prints progress only on a terminal.
+    ///
+    /// Exit codes: 0 green, 1 failing, 2 nothing to watch, 3 timed out.
     Watch {
         /// Anchor on this PR's head commit instead of the current branch's
         /// pushed commit.
         #[arg(long)]
         pr: Option<String>,
+        /// Wait for every check to finish instead of stopping at the first failure.
+        #[arg(long)]
+        all: bool,
+        /// Give up after this many seconds and exit 3 with the current state.
+        #[arg(long)]
+        timeout: Option<u64>,
     },
     /// Report how often a check passes vs fails outside this PR: GitHub Actions on
     /// the last N main commits, Buildkite on main and other branches' builds.
@@ -412,13 +424,12 @@ enum CiCommand {
         #[arg(long)]
         pr: Option<String>,
     },
-    /// Run an existing failure-log file through the haiku distiller and print
-    /// the summary. Useful for benchmarking the distill prompt against cached
-    /// `/tmp/psc-failures-*.md` files without needing a live PR.
+    /// Condense a saved failure report or log excerpt with the `ci failures`
+    /// prompt, for tuning the prompt without a live PR.
     Distill {
-        /// Path to a failure-log markdown file (e.g. /tmp/psc-failures-XXXX.md).
+        /// E.g. a `/tmp/dragonfly-ci/<target>/report.md` written by `ci failures`.
         file: PathBuf,
-        /// Override the distiller model (default: haiku).
+        /// Condense with only this model instead of the default fallback chain.
         #[arg(long)]
         model: Option<Model>,
     },
@@ -1745,9 +1756,29 @@ const EVAL_RUN_PREFIX: &str = "Run relevant eval (*";
 const EVAL_SELECT: &str = "Select relevant evals";
 const EVAL_STATUS: &str = "Relevant eval status";
 
-// Checks that are slow, flaky, or non-blocking — exclude from the wait so they
-// don't keep `pending` above zero forever. Failures here are surfaced to the
-// user but not auto-fixed as part of dragonfly.
+// Ignore lists by purpose:
+//   advisory  never waited on, never reported: review bots, evals, deploy, Graphite
+//   gates     never waited on; reported as needing a human, never as fixable
+//   slow      test-e2e: the main flow does not wait for it, but reports include it
+
+// Advisory checks: no code change is expected to flip them, so `ci failures`
+// leaves them out of its report.
+const REPORT_IGNORED_CHECKS: &[&str] = &[
+    "Cursor Bugbot",
+    "depthfirst Bot",
+    "doc-review",
+    "deploy",
+    GRAPHITE_MERGEABILITY,
+    QA_TECH_REVIEW,
+    CLAUDE_CODE_REVIEW,
+    STALE_MERGE_GATE,
+    EVAL_RUN_PREFIX,
+    EVAL_SELECT,
+    EVAL_STATUS,
+];
+
+// The main flow's CI wait skips slow checks too, so it hands over to the agent
+// without sitting through test-e2e; `ci failures` still reports them.
 const IGNORED_CHECKS: &[&str] = &[
     "Cursor Bugbot",
     "test-e2e",
@@ -1766,10 +1797,10 @@ const IGNORED_CHECKS: &[&str] = &[
 ];
 
 // `ci watch` waits for slow checks like test-e2e, but skips the never-terminating
-// Graphite check plus deploy, doc-review, the human-approval and stale-merge
-// gates, the eval suite, and the review bots (non-blocking, not worth blocking the watch on).
-// See [GRAPHITE_MERGEABILITY].
+// Graphite check, the gates, and the advisory checks. See [GRAPHITE_MERGEABILITY].
 const WATCH_IGNORED_CHECKS: &[&str] = &[
+    "Cursor Bugbot",
+    "depthfirst Bot",
     "doc-review",
     "deploy",
     GRAPHITE_MERGEABILITY,
@@ -1784,16 +1815,31 @@ const WATCH_IGNORED_CHECKS: &[&str] = &[
 ];
 
 // Gate-style checks: they report `fail` until a human/team action (not a CI
-// fix) flips them — currently the core-prompt review gate. No code change
-// turns these green. `ci status` tags them `🔒 needs-approval` and excludes
+// fix) flips them. `ci status` tags them `🔒 needs-approval` and excludes
 // them from the failure tally (so a clean PR doesn't read as failing on a
-// gate alone); `ci failures` reports them separately instead of trying to
-// fetch fixable logs that don't exist. Without this, `ci status` (which shows
-// the gate) and `ci failures` (which drops it via [IGNORED_CHECKS]) contradict.
+// gate alone); `ci failures` lists them as notes instead of fetching logs.
 const GATE_CHECKS: &[&str] = &[CORE_PROMPT_REVIEW, HIGH_RISK_APPROVAL];
 
-fn is_gate_check(name: &str) -> bool {
-    GATE_CHECKS.contains(&name)
+const MERGE_GATES: &str = "buildkite/merge-gates";
+
+/// Whether failing check `c` waits on a human action rather than a code fix.
+///
+/// The merge-gates probe fails with "gates need a run" until the PR carries the
+/// `merge-gates` label; only its real-run failures are fixable.
+fn is_gate(c: &PrCheck) -> bool {
+    GATE_CHECKS.contains(&c.name.as_str())
+        || (c.name == MERGE_GATES && c.output.contains("gates need a run"))
+}
+
+/// What a failing gate needs, for the note that replaces its log.
+fn gate_reason(c: &PrCheck) -> &str {
+    if c.name == MERGE_GATES {
+        "label the PR `merge-gates` once the head is final"
+    } else if c.description.is_empty() {
+        "needs a human"
+    } else {
+        &c.description
+    }
 }
 
 // Ignore-list entries ending in `*` match by prefix; everything else matches
@@ -2150,113 +2196,15 @@ async fn wait_for_ci(
     }
 }
 
-// ── Failure logs ─────────────────────────────────────────────────────────────
+// ── LLM calls ────────────────────────────────────────────────────────────────
 
-fn extract_failure_summary(log: &str) -> String {
-    let re = Regex::new(
-        r"(?i)FAIL|--- FAIL|panic:|Error:|error:|ERROR|fatal:|undefined:|cannot |could not |timed out|exit status"
-    ).unwrap();
-
-    let lines: Vec<&str> = log
-        .lines()
-        .map(|line| line.splitn(4, '\t').last().unwrap_or(line).trim_end())
-        .collect();
-
-    const CONTEXT: usize = 3;
-    let mut keep = vec![false; lines.len()];
-    for (i, line) in lines.iter().enumerate() {
-        if re.is_match(line) {
-            let lo = i.saturating_sub(CONTEXT);
-            let hi = (i + CONTEXT + 1).min(lines.len());
-            for slot in &mut keep[lo..hi] {
-                *slot = true;
-            }
-        }
-    }
-
-    let mut out: Vec<&str> = Vec::new();
-    let mut prev_kept = false;
-    for (i, &k) in keep.iter().enumerate() {
-        if k {
-            if !prev_kept && !out.is_empty() {
-                out.push("--");
-            }
-            out.push(lines[i]);
-            prev_kept = true;
-        } else {
-            prev_kept = false;
-        }
-    }
-    out.join("\n")
+/// Lovable's `kit` in the main checkout, for shells where the devenv is not on PATH.
+fn kit_fallback_path() -> PathBuf {
+    home_dir().join("code/lovable/lovable/bin/kit")
 }
 
-const DISTILL_INSTRUCTIONS: &str = r#"You are given CI failure logs collected from a GitHub PR. Extract the most relevant information so a developer can quickly understand what failed and why.
-
-# Output rules
-
-- Find the error(s) and the most relevant context and output them verbatim with light summarization to skip irrelevant details.
-- Output markdown. Do NOT output JSON. Do NOT wrap your output in a fenced code block.
-- Open with a one-line headline naming the error. If failures fall into multiple distinct buckets, list each bucket on its own line.
-- Distinguish infrastructure failures (runner outages, network issues) from PR-introduced failures (compile errors, failing tests, lint, type errors).
-- Group similar failures across checks. Example: "5 cases: use slices.Sort instead of manual sort (go modernization lint)".
-- For each unique failure bucket, include the exact error line that pinpoints the problem. Strip timestamps, runner names, and any boilerplate. Just the error itself.
-- If a check has a real PR-introduced failure (e.g. type errors, failing tests), list each distinct error once with file:line:col when available.
-- DO NOT write a root cause analysis or remediation advice. NO sentences like "Fix the code above", "Remove the unused field", "Suggested next steps", "Check your network", or any "this means / this is because" inference. Just surface the raw failure lines verbatim and stop. The developer will decide what to do.
-- If a test failed across multiple re-runs, surface EVERY distinct FAIL line (one per attempt) and the final summary line (e.g. `2 runs, 32693 tests, 198 skipped, 2 failures`). Don't show only the first attempt.
-- Some checks are pure aggregators of other checks (names ending in `-result`, or whose only failure line is `echo "X failed"` / `Process completed with exit code 1`). Label these as `(aggregator of: X, Y)` and don't repeat the underlying errors — they're already covered by the upstream check.
-- Drop "Set up job", "Prepare workflow", "Download action repository", and other setup noise unless it IS the failure.
-- Keep total output under ~60 lines. Be concise. The developer has access to the full log if they really need it.
-
-# Example
-
-## Good
-
-'''
-## Infrastructure: GitHub Actions download failures (codeload.github.com)
-- 11 checks: Failed to download `actions/checkout@v4` (codeload.github.com)
-- 2 checks: Failed to download `docker/setup-qemu-action@v3` (codeload.github.com)
-
-All checks fail with a similar error:
-```
-An action could not be found at the URI 'https://codeload.github.com/[action]/tar.gz/[hash]'
-Failed to download archive after 1 attempts.
-```
-
-Affected jobs: test-firestore, Build & Deploy Preview, label-pr
-'''
-
-## Bad
-
-'''
-## GitHub Actions download failures (codeload.github.com)
-
-Root cause: check your internet connection. The URL 'https://codeload.github.com/[action]/tar.gz/[hash]' cannot be downloaded.
-
-Suggested next steps: check network connectivity using ping.
-'''
-
-## Also bad (remediation drift — forbidden)
-
-'''
-## Go linting failures (unused code)
-
-go/api/integrations/security/tools/integration.go:28:6: type securityDeps is unused (unused)
-go/api/integrations/security/tools/integration.go:35:2: field deps is unused (unused)
-
-Affected jobs: lint-go, lint-go-result (aggregator of: lint-go)
-
-Result: Fix the code issues above and remove the unused type, then the lint checks will pass.
-'''
-
-The "Result:" sentence is exactly what to AVOID — just stop after the error lines and affected-jobs list.
-"#;
-
-/// Hardcoded fallback so dragonfly picks up lovable's `kit` even when
-/// it isn't on PATH. PATH lookup is still tried first so the user can override.
-const KIT_FALLBACK_PATH: &str = "/Users/arong/projects/lovable/lovable/bin/kit";
-
 /// Call `kit llm` with a system prompt and a file containing the user
-/// content. Tries `kit` on PATH first, then `KIT_FALLBACK_PATH`. Returns
+/// content. Tries `kit` on PATH first, then [kit_fallback_path]. Returns
 /// `None` on spawn failure / nonzero exit / empty output.
 ///
 /// Same-model benchmark showed kit's transport is 2-6x faster than the
@@ -2269,7 +2217,8 @@ async fn call_kit_llm(
     content_file: &std::path::Path,
 ) -> Option<String> {
     let path_str = content_file.to_string_lossy();
-    for bin in ["kit", KIT_FALLBACK_PATH] {
+    let fallback = kit_fallback_path();
+    for bin in [std::path::Path::new("kit"), fallback.as_path()] {
         let result = Command::new(bin)
             .args([
                 "llm",
@@ -2298,34 +2247,14 @@ async fn call_kit_llm(
     None
 }
 
-/// Pipe a full failure-log dump through `model` (default Haiku 4.5) and
-/// return a terse, deduped markdown summary. Skips the LLM entirely for
-/// inputs under 5 KB. Returns `None` on invocation failure so callers
-/// can fall back to the raw content.
-///
-/// The full untruncated log lives on disk at `full_log_path`; a footer
-/// pointing back at it is appended below.
-async fn distill_failure_logs(
-    raw: &str,
-    full_log_path: &std::path::Path,
-    model: Model,
-) -> Option<String> {
-    let mut output = call_kit_llm(model.kit_id(), DISTILL_INSTRUCTIONS, full_log_path).await?;
-    output.push_str(&format!(
-        "\n\nFull untruncated log ({} bytes): {}\n",
-        raw.len(),
-        full_log_path.display()
-    ));
-    Some(output)
-}
-
 /// One failing check, sourced from `gh pr checks --json`. Covers every provider
 /// surfaced as a commit status / check-run — GitHub Actions, Buildkite, Wiz,
 /// Spacelift, custom statuses — not just GHA workflow runs.
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Deserialize, Debug, Clone, Default)]
 struct PrCheck {
     name: String,
-    /// `pass`, `fail`, `pending`, `skipping`.
+    /// `pass`, `fail`, `pending`, `skipping`; [checks_for_sha] adds `cancelled`
+    /// and `stale`.
     bucket: String,
     /// Empty string when GitHub provides no link (rare but observed).
     #[serde(default)]
@@ -2336,6 +2265,13 @@ struct PrCheck {
     workflow: String,
     #[serde(default)]
     description: String,
+    /// The check run's output title, summary and text: Buildkite, Wiz and
+    /// Spacelift put their failure summary here. Set by [checks_for_sha].
+    #[serde(default)]
+    output: String,
+    /// Pending again after an earlier attempt on the same commit failed.
+    #[serde(default)]
+    rerun_of_failure: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2370,284 +2306,6 @@ fn parse_gha_link(link: &str) -> (u64, Option<u64>) {
     (run, job)
 }
 
-/// `link` like `https://buildkite.com/<org>/<pipeline>/builds/<n>`. Returns
-/// (org, pipeline, build_number) when parsable.
-fn parse_buildkite_link(link: &str) -> Option<(String, String, u64)> {
-    let re = Regex::new(r"buildkite\.com/([^/]+)/([^/]+)/builds/(\d+)").unwrap();
-    let c = re.captures(link)?;
-    Some((
-        c.get(1)?.as_str().into(),
-        c.get(2)?.as_str().into(),
-        c.get(3)?.as_str().parse().ok()?,
-    ))
-}
-
-async fn list_failed_checks(pr_number: &str) -> Vec<PrCheck> {
-    let r = sh3(&format!(
-        "gh pr checks {pr_number} --json name,bucket,link,workflow,description"
-    ))
-    .await;
-    let mut all: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
-    all.retain(|c| c.bucket == "fail" && !is_ignored_check(&c.name, IGNORED_CHECKS));
-    all
-}
-
-/// Fetch the failing job's log via `gh run view`. Prefer per-job mode when the
-/// check link points at a specific job; that avoids dumping every failing job
-/// in a workflow when only one is the target.
-async fn fetch_gha_log(check: &PrCheck) -> String {
-    let (run_id, job_id) = parse_gha_link(&check.link);
-    let cmd = match job_id {
-        Some(j) => format!("gh run view --job={j} --log"),
-        None if run_id != 0 => format!("gh run view {run_id} --log"),
-        _ => return String::new(),
-    };
-    let log = sh3(&cmd).await;
-    let raw = if !log.stdout.is_empty() {
-        log.stdout
-    } else {
-        log.stderr
-    };
-    denoise_gha_log(&raw)
-}
-
-/// Drop `git fetch`/checkout noise from a GHA job log.
-///
-/// `actions/checkout` with `fetch-depth: 0` prints one `[new branch] <name> ->
-/// origin/<name>` line per remote ref plus a flood of `Updating files: N%`
-/// progress lines. On a repo with thousands of branches this is the bulk of the
-/// log and breaks failure surfacing two ways: it front-loads the log so a
-/// byte-prefix truncation never reaches the failing step, and hundreds of
-/// branch names contain substrings like "error"/"fail" that seed
-/// [extract_failure_summary]'s keep window, inflating its output past 100 KB.
-fn denoise_gha_log(log: &str) -> String {
-    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(concat!(
-            r"\[(new (branch|tag|ref)|tag update|deleted)\]",
-            r"|-> origin/\S+( \(forced update\))?$",
-            r"|\b(Updating files|Receiving objects|Resolving deltas|Compressing objects",
-            r"|Counting objects|Enumerating objects|Filtering content|Checking out files): +\d",
-        ))
-        .unwrap()
-    });
-    log.lines()
-        .filter(|line| !re.is_match(line))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-#[derive(Deserialize)]
-struct GhJob {
-    steps: Option<Vec<GhJobStep>>,
-}
-#[derive(Deserialize)]
-struct GhJobStep {
-    name: String,
-    #[serde(default)]
-    status: String,
-    conclusion: Option<String>,
-}
-
-/// Compact per-step conclusions for a GHA job, e.g.
-/// `Step conclusions: "Run ./test"=success, "Test Report"=failure`.
-///
-/// This is the signal that distinguishes "the test reran and passed; only the
-/// junit report-publish step is red" (flaky, dorny/test-reporter with
-/// fail-on-error) from a real test failure — a distinction invisible in the
-/// flat log text the distiller otherwise sees. Cheap (a few lines) so it's
-/// safe to prepend to the distiller input alongside the regex-trimmed log.
-/// Empty when the check has no per-job link or the API returns no steps.
-async fn fetch_gha_step_conclusions(check: &PrCheck) -> String {
-    let (_run, job_id) = parse_gha_link(&check.link);
-    let Some(job_id) = job_id else {
-        return String::new();
-    };
-    let r = sh3(&format!(
-        "gh api 'repos/{{owner}}/{{repo}}/actions/jobs/{job_id}'"
-    ))
-    .await;
-    let Some(job) = parse_json::<GhJob>(&r.stdout) else {
-        return String::new();
-    };
-    let steps = job.steps.unwrap_or_default();
-    if steps.is_empty() {
-        return String::new();
-    }
-    let parts: Vec<String> = steps
-        .iter()
-        .map(|s| {
-            let c = s
-                .conclusion
-                .as_deref()
-                .filter(|c| !c.is_empty())
-                .unwrap_or(if s.status.is_empty() { "?" } else { &s.status });
-            format!("\"{}\"={}", s.name, c)
-        })
-        .collect();
-    format!("Step conclusions: {}", parts.join(", "))
-}
-
-/// Buildkite logs require `BUILDKITE_API_TOKEN`. Without one, surface the URL +
-/// any check-run output GitHub already stored, so the agent isn't left blind.
-async fn fetch_buildkite_log(check: &PrCheck, head_sha: &str) -> String {
-    let parsed = parse_buildkite_link(&check.link);
-    let token = std::env::var("BUILDKITE_API_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty());
-
-    if let (Some((org, pipeline, number)), Some(tok)) = (parsed.clone(), token) {
-        let api = format!(
-            "https://api.buildkite.com/v2/organizations/{org}/pipelines/{pipeline}/builds/{number}?include_retried_jobs=true"
-        );
-        let r = sh3(&format!(
-            "curl -sf -H 'Authorization: Bearer {tok}' {api:?}"
-        ))
-        .await;
-        if r.code == 0 && !r.stdout.is_empty() {
-            // Extract per-job logs for failing jobs.
-            let logs = extract_buildkite_failed_logs(&r.stdout, &tok).await;
-            if !logs.is_empty() {
-                return logs;
-            }
-        }
-    }
-
-    // Fallback: GitHub's check-run output for this name, plus the link.
-    let mut parts = Vec::new();
-    if let Some((_, _, number)) = parsed {
-        parts.push(format!("Buildkite build #{number}: {}", check.link));
-    } else {
-        parts.push(format!("Buildkite check: {}", check.link));
-    }
-    if !check.description.is_empty() {
-        parts.push(check.description.clone());
-    }
-    let cr = fetch_check_run_output(head_sha, &check.name).await;
-    if !cr.is_empty() {
-        parts.push(cr);
-    }
-    if std::env::var("BUILDKITE_API_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .is_none()
-    {
-        parts.push(
-            "(Set BUILDKITE_API_TOKEN to fetch full Buildkite logs. \
-             Otherwise open the URL above.)"
-                .into(),
-        );
-    }
-    parts.join("\n")
-}
-
-#[derive(Deserialize)]
-struct BkBuild {
-    #[allow(dead_code)]
-    number: u64,
-    jobs: Option<Vec<BkJob>>,
-}
-#[derive(Deserialize)]
-struct BkJob {
-    id: Option<String>,
-    name: Option<String>,
-    state: Option<String>,
-    exit_status: Option<i64>,
-    raw_log_url: Option<String>,
-}
-
-async fn extract_buildkite_failed_logs(build_json: &str, token: &str) -> String {
-    let build: BkBuild = match serde_json::from_str(build_json) {
-        Ok(b) => b,
-        Err(_) => return String::new(),
-    };
-    let mut out = Vec::new();
-    for j in build.jobs.into_iter().flatten() {
-        let failed =
-            j.state.as_deref() == Some("failed") || j.exit_status.map(|e| e != 0).unwrap_or(false);
-        if !failed {
-            continue;
-        }
-        let name = j.name.clone().unwrap_or_else(|| "unnamed".into());
-        let log = if let Some(url) = j.raw_log_url.as_ref() {
-            let r = sh3(&format!(
-                "curl -sf -H 'Authorization: Bearer {token}' {url:?}"
-            ))
-            .await;
-            if r.code == 0 { r.stdout } else { String::new() }
-        } else {
-            String::new()
-        };
-        let summary = extract_failure_summary(&log);
-        out.push(format!(
-            "### Buildkite job: {name} (id={})\nExit: {}\n```\n{}\n```\n",
-            j.id.unwrap_or_default(),
-            j.exit_status
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| "?".into()),
-            if summary.is_empty() {
-                truncate(&log, 4000).to_string()
-            } else {
-                summary
-            },
-        ));
-    }
-    out.join("\n")
-}
-
-/// `gh api repos/.../check-runs` returns `output.title` / `output.summary` /
-/// `output.text` for many providers (Buildkite, Wiz, Spacelift). Use it as a
-/// fallback so the agent always gets *something* even when we can't fetch the
-/// provider's full log.
-async fn fetch_check_run_output(head_sha: &str, name: &str) -> String {
-    if head_sha.is_empty() {
-        return String::new();
-    }
-    let r = sh3(&format!(
-        "gh api 'repos/{{owner}}/{{repo}}/commits/{head_sha}/check-runs?per_page=100' \
-         --jq '.check_runs[] | select(.name == \"{}\")'",
-        name.replace('"', "\\\"")
-    ))
-    .await;
-    if r.code != 0 || r.stdout.is_empty() {
-        return String::new();
-    }
-    // Take the first check-run if there are multiple (retries).
-    let first_obj = r.stdout.split("\n}\n{").next().unwrap_or(&r.stdout);
-    let parsed: serde_json::Value = match serde_json::from_str(first_obj) {
-        Ok(v) => v,
-        Err(_) => return String::new(),
-    };
-    let mut parts = Vec::new();
-    for k in ["title", "summary", "text"] {
-        if let Some(s) = parsed
-            .pointer(&format!("/output/{k}"))
-            .and_then(|v| v.as_str())
-        {
-            if !s.is_empty() {
-                parts.push(format!("**{k}**: {}", truncate(s, 2000)));
-            }
-        }
-    }
-    parts.join("\n")
-}
-
-async fn fetch_external_log(check: &PrCheck, head_sha: &str) -> String {
-    let mut parts = vec![format!(
-        "External check ({}): {}",
-        classify_provider_label(&check.link),
-        check.link
-    )];
-    if !check.description.is_empty() {
-        parts.push(check.description.clone());
-    }
-    let cr = fetch_check_run_output(head_sha, &check.name).await;
-    if !cr.is_empty() {
-        parts.push(cr);
-    }
-    parts.join("\n")
-}
-
 fn classify_provider_label(link: &str) -> &'static str {
     if link.contains("buildkite.com/") {
         "buildkite"
@@ -2666,14 +2324,6 @@ fn classify_provider_label(link: &str) -> &'static str {
     }
 }
 
-fn strip_ansi(s: &str) -> String {
-    // GitHub Actions' log API returns ESC bytes rendered as literal "^[" pairs;
-    // normalize back to real ESC so strip_ansi_escapes handles them.
-    let normalized = s.replace("^[", "\x1b");
-    let stripped = strip_ansi_escapes::strip(normalized.as_bytes());
-    String::from_utf8(stripped).unwrap_or(normalized)
-}
-
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max {
         s
@@ -2687,134 +2337,27 @@ fn truncate(s: &str, max: usize) -> &str {
     }
 }
 
-/// Keep the last `max` bytes of `s` at a UTF-8 boundary, marking the cut.
-///
-/// CI logs put the failure and the trailing `##[error]Process completed` line
-/// at the end, so when a log overflows the cap the tail is the part worth
-/// keeping; the head holds only setup/checkout noise a head-anchored
-/// [truncate] would preserve instead.
-fn truncate_tail(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut start = s.len() - max;
-    while start < s.len() && !s.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("…[earlier log truncated]…\n{}", &s[start..])
-}
-
-/// Collect per-check failure logs across all providers. Replaces the old
-/// GHA-only run-list path. Falls back to a synthetic note for any check we
-/// can't fetch a real log for — never returns empty when there are failures.
+/// The failure report for the main flow's agent prompt, built by [ci_report::build]
+/// from the checks at `head_sha`.
 async fn collect_failure_logs(pr_number: &str, head_sha: &str) -> FailureLogs {
     println!("   Collecting failure logs...");
-    let failed = list_failed_checks(pr_number).await;
-    let mut summaries = Vec::new();
-    let mut full_logs = Vec::new();
-    let mut names = Vec::new();
-
-    for check in &failed {
-        let provider = classify_provider(&check.link);
-        let provider_label = classify_provider_label(&check.link);
-        println!(
-            "      Fetching log for {} ({})...",
-            check.name, provider_label
-        );
-        let (raw, steps) = if matches!(provider, CheckProvider::GitHubActions) {
-            tokio::join!(fetch_gha_log(check), fetch_gha_step_conclusions(check))
-        } else {
-            let raw = match provider {
-                CheckProvider::Buildkite => fetch_buildkite_log(check, head_sha).await,
-                _ => fetch_external_log(check, head_sha).await,
-            };
-            (raw, String::new())
-        };
-        let raw = strip_ansi(&raw);
-        names.push(check.name.clone());
-        let summary = if matches!(provider, CheckProvider::GitHubActions) {
-            extract_failure_summary(&raw)
-        } else {
-            // For non-GHA, the "raw" text is already a curated summary.
-            raw.clone()
-        };
-        let header = format!("### {} ({})", check.name, provider_label);
-        let link_line = if check.link.is_empty() {
-            String::new()
-        } else {
-            format!("\nLink: {}", check.link)
-        };
-        // Prepend per-step conclusions so flaky-reran-and-passed is
-        // distinguishable from a real failure; see [fetch_gha_step_conclusions].
-        let step_line = if steps.is_empty() {
-            String::new()
-        } else {
-            format!("\n{steps}")
-        };
-        summaries.push(format!(
-            "{header}{link_line}{step_line}\n```\n{}\n```",
-            if summary.trim().is_empty() {
-                "(no extracted error lines)"
-            } else {
-                summary.trim()
-            }
-        ));
-        if matches!(provider, CheckProvider::GitHubActions) && !raw.is_empty() {
-            let body = truncate_tail(&raw, 16000);
-            full_logs.push(format!("## {} — full log\n```\n{}\n```", check.name, body));
-        }
-    }
-
-    if failed.is_empty() {
-        // Defensive: gh pr checks --json returned nothing failed but caller
-        // believed there were failures. Don't leave the file empty — point at
-        // the live `gh pr checks` output.
-        summaries.push(
-            "(no failing checks reported by `gh pr checks --json`; \
-                        run `dragonfly ci status` to investigate)"
-                .into(),
-        );
-    }
-
-    let raw_content = format!(
-        "# CI Failure Logs\n\n## Error Summary\n\n{}\n\n---\n\n# Full Logs\n\n{}\n",
-        summaries.join("\n\n"),
-        full_logs.join("\n\n"),
-    );
-
-    // For non-trivial logs, pipe through haiku and replace the bulk dump
-    // with a distilled summary that points at the full log on disk.
-    if raw_content.len() >= 1000 {
-        let full_file = section("failures-full", &raw_content);
-        println!(
-            "   Distilling failure logs ({} bytes) via LLM...",
-            raw_content.len()
-        );
-        let distill_start = std::time::Instant::now();
-        match distill_failure_logs(&raw_content, &full_file.path, Model::Haiku).await {
-            Some(distilled) => {
-                println!(
-                    "   Distilled in {:.1}s ({} bytes → {} bytes).",
-                    distill_start.elapsed().as_secs_f64(),
-                    raw_content.len(),
-                    distilled.len(),
-                );
-                return FailureLogs {
-                    content: distilled,
-                    names,
-                    full_file: Some(full_file),
-                };
-            }
-            None => {
-                println!("   Distill failed; falling back to raw failure logs.");
-            }
-        }
-    }
-
+    let checks = checks_for_sha(head_sha).await;
+    let opts = ci_report::Options {
+        raw: false,
+        model: None,
+        main_history: true,
+    };
+    let report = ci_report::build(&format!("PR #{pr_number}"), head_sha, &checks, &opts).await;
+    let full_file = report.file.as_ref().map(|path| TempFile {
+        lines: std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0),
+        path: path.clone(),
+    });
     FailureLogs {
-        content: raw_content,
-        names,
-        full_file: None,
+        content: report.text,
+        names: report.failed,
+        full_file,
     }
 }
 
@@ -2829,274 +2372,56 @@ async fn resolve_pr_number(pr: Option<String>) -> Option<String> {
 }
 
 async fn ci_status_cmd(pr: Option<String>, all: bool, ignored: &[&str]) -> i32 {
-    let Some(pr_number) = resolve_pr_number(pr).await else {
-        eprintln!("No PR for current branch and --pr not supplied.");
+    let Some((label, sha)) = resolve_report_target(pr).await else {
+        eprintln!("No PR for the current branch and nothing pushed; pass --pr.");
         return 2;
     };
-    let checks_cmd =
-        format!("gh pr checks {pr_number} --json name,bucket,link,workflow,description");
-    let (r, has_conflicts) = tokio::join!(sh3(&checks_cmd), check_origin_main_conflicts(),);
-    let mut checks: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
-    checks.retain(|c| !is_ignored_check(&c.name, ignored));
-    // Dedup by name, keeping the highest-priority bucket: fail > pending > pass > skipping.
-    let priority = |b: &str| match b {
-        "fail" => 3,
-        "pending" => 2,
-        "pass" => 1,
-        _ => 0,
-    };
-    checks.sort_by(|a, b| priority(&b.bucket).cmp(&priority(&a.bucket)));
-    let mut seen = std::collections::HashSet::new();
-    checks.retain(|c| seen.insert(c.name.clone()));
-    if !all {
-        checks.retain(|c| c.bucket == "fail" || c.bucket == "pending");
-    }
-    checks.sort_by(|a, b| (priority(&b.bucket), &a.name).cmp(&(priority(&a.bucket), &b.name)));
-
-    let mut failed = 0;
-    let mut pending = 0;
-    let mut passed_total = 0;
-    let mut skipped_total = 0;
-    let mut gates = 0;
-    // Always count totals from full set.
-    let all_checks: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
-    let mut by_name: HashMap<String, &PrCheck> = HashMap::new();
-    for c in all_checks
-        .iter()
-        .filter(|c| !is_ignored_check(&c.name, ignored))
-    {
-        // Keep the highest-priority row per name.
-        let keep = by_name
-            .get(&c.name)
-            .map(|p| priority(&c.bucket) > priority(&p.bucket))
-            .unwrap_or(true);
-        if keep {
-            by_name.insert(c.name.clone(), c);
-        }
-    }
-    for c in by_name.values() {
-        // A failing gate is awaiting human approval, not a fixable CI failure;
-        // count it separately so the exit code and `fail` tally stay clean.
-        if c.bucket == "fail" && is_gate_check(&c.name) {
-            gates += 1;
-            continue;
-        }
-        match c.bucket.as_str() {
-            "fail" => failed += 1,
-            "pending" => pending += 1,
-            "pass" => passed_total += 1,
-            _ => skipped_total += 1,
-        }
-    }
-
-    let gate_suffix = if gates > 0 {
-        format!(", {gates} needs-approval")
-    } else {
-        String::new()
-    };
-    println!(
-        "PR #{pr_number} — {} fail, {} pending, {} pass, {} skip{gate_suffix}",
-        failed, pending, passed_total, skipped_total
-    );
+    let (checks, has_conflicts) = tokio::join!(checks_for_sha(&sha), check_origin_main_conflicts());
+    let short = &sha[..7.min(sha.len())];
+    let code = print_checks_summary(&format!("{label} @ {short}"), &checks, ignored, all);
     if has_conflicts {
         println!("⚠️  Merge conflicts with origin/main — some checks did not run.");
     }
-    for c in &checks {
-        let is_gate = c.bucket == "fail" && is_gate_check(&c.name);
-        let icon = if is_gate {
-            "🔒"
-        } else {
-            match c.bucket.as_str() {
-                "fail" => "❌",
-                "pending" => "⏳",
-                "pass" => "✅",
-                _ => "⏭",
-            }
-        };
-        let provider = if is_gate {
-            "needs-approval"
-        } else {
-            classify_provider_label(&c.link)
-        };
-        // The gate's commit-status description (e.g. "awaiting @lovablelabs/ai
-        // approval") is the actionable bit, not the link.
-        let trailer = if is_gate && !c.description.is_empty() {
-            format!("  — {}", c.description)
-        } else if c.link.is_empty() {
-            String::new()
-        } else {
-            format!("  {}", c.link)
-        };
-        println!("{icon} [{provider:>14}] {}{trailer}", c.name);
-    }
-    // Exit non-zero only on a real (fixable) failure — a pending approval gate
-    // is not something the agent can or should "fix".
-    if failed > 0 { 1 } else { 0 }
+    code
 }
 
-/// Failing gate-style checks (name + commit-status description), e.g. the
-/// core-prompt review gate "awaiting @lovablelabs/ai approval". Surfaced
-/// separately by `ci failures` so a gate-only red PR doesn't read as
-/// "No failing checks" while `ci status` shows a red gate.
-async fn failing_gate_checks(pr_number: &str) -> Vec<PrCheck> {
-    let r = sh3(&format!(
-        "gh pr checks {pr_number} --json name,bucket,link,workflow,description"
-    ))
-    .await;
-    let all: Vec<PrCheck> = parse_json(&r.stdout).unwrap_or_default();
-    all.into_iter()
-        .filter(|c| c.bucket == "fail" && is_gate_check(&c.name))
-        .collect()
-}
-
-/// Print failing gate checks with their commit-status description, so the
-/// agent learns *why* a red check has no fixable log rather than burning
-/// round-trips on `gh run view`. A gate needs a human/team action, not a fix.
-fn print_gate_note(gates: &[PrCheck]) {
-    println!(
-        "\n🔒 {} approval gate(s) red (not fixable by CI — needs a human/team action):",
-        gates.len()
-    );
-    for g in gates {
-        let desc = if g.description.is_empty() {
-            String::new()
-        } else {
-            format!(" — {}", g.description)
-        };
-        let link = if g.link.is_empty() {
-            String::new()
-        } else {
-            format!("  {}", g.link)
-        };
-        println!("  - {}{desc}{link}", g.name);
-    }
-}
-
-async fn ci_failures_cmd(
-    pr: Option<String>,
-    max_bytes: usize,
-    raw_only: bool,
-    model: Option<Model>,
-) -> i32 {
-    let model = model.unwrap_or(Model::Haiku);
-    let Some(pr_number) = resolve_pr_number(pr).await else {
-        eprintln!("No PR for current branch and --pr not supplied.");
-        return 2;
+/// Resolves the commit `ci failures` reports on: the PR head with `--pr`, else
+/// the current branch's pushed commit. Returns (label, sha).
+async fn resolve_report_target(pr: Option<String>) -> Option<(String, String)> {
+    let pr = match pr {
+        Some(p) => Some(p),
+        None => resolve_pr_number(None).await,
     };
-    let head_sha = sh("git rev-parse HEAD").await.unwrap_or_default();
-    let (failed, gates) = tokio::join!(
-        list_failed_checks(&pr_number),
-        failing_gate_checks(&pr_number)
-    );
-    if failed.is_empty() {
-        // A gate-only red PR is not a fixable failure — say so explicitly so
-        // this agrees with `ci status` instead of reporting a bare "none"
-        // while `ci status` shows a red gate.
-        if gates.is_empty() {
-            println!("No failing checks for PR #{pr_number}.");
-        } else {
-            println!("No fixable CI failures for PR #{pr_number}.");
-            print_gate_note(&gates);
-        }
-        return 0;
-    }
-
-    // `buf` is the compact distiller input (per-step conclusions + regex-
-    // trimmed errors). `full_buf` keeps the lightly-truncated raw logs for the
-    // on-disk `-full` file the distiller footer points at, so "read the full
-    // log" actually yields the log rather than the trimmed summary.
-    let mut buf = String::new();
-    let mut full_buf = String::new();
-    let header = format!(
-        "# Failing checks for PR #{pr_number} ({} total)\n\n",
-        failed.len()
-    );
-    buf.push_str(&header);
-    full_buf.push_str(&header);
-    for check in &failed {
-        let provider = classify_provider(&check.link);
-        let provider_label = classify_provider_label(&check.link);
-        buf.push_str(&format!("## {} ({})\n", check.name, provider_label));
-        if !check.link.is_empty() {
-            buf.push_str(&format!("Link: {}\n", check.link));
-        }
-        let (raw, steps) = if matches!(provider, CheckProvider::GitHubActions) {
-            tokio::join!(fetch_gha_log(check), fetch_gha_step_conclusions(check))
-        } else {
-            let raw = match provider {
-                CheckProvider::Buildkite => fetch_buildkite_log(check, &head_sha).await,
-                _ => fetch_external_log(check, &head_sha).await,
-            };
-            (raw, String::new())
-        };
-        let raw = strip_ansi(&raw);
-        // Per-step conclusions go in ahead of the trimmed log so the distiller
-        // can tell a reran-and-passed test (only the publish step red) from a
-        // real failure without the full log.
-        if !steps.is_empty() {
-            buf.push_str(&format!("{steps}\n"));
-        }
-        let body = if matches!(provider, CheckProvider::GitHubActions) {
-            let s = extract_failure_summary(&raw);
-            if s.is_empty() {
-                truncate_tail(&raw, max_bytes)
-            } else {
-                s
-            }
-        } else {
-            truncate(&raw, max_bytes).to_string()
-        };
-        if body.trim().is_empty() {
-            buf.push_str("(no extracted error lines)\n\n");
-        } else {
-            buf.push_str(&format!("```\n{}\n```\n\n", body.trim()));
-        }
-        full_buf.push_str(&format!("## {} ({})\n", check.name, provider_label));
-        if !steps.is_empty() {
-            full_buf.push_str(&format!("{steps}\n"));
-        }
-        let full_body = truncate_tail(&raw, 16000);
-        if full_body.trim().is_empty() {
-            full_buf.push_str("(no log captured)\n\n");
-        } else {
-            full_buf.push_str(&format!("```\n{}\n```\n\n", full_body.trim()));
-        }
-    }
-
-    if raw_only || buf.len() < 1000 {
-        print!("{buf}");
-        if !gates.is_empty() {
-            print_gate_note(&gates);
-        }
-        return 1;
-    }
-
-    let full_file = section("ci-failures-full", &full_buf);
-    eprintln!(
-        "   Distilling failure logs ({} bytes) via {}...",
-        buf.len(),
-        model.kit_id()
-    );
-    let start = std::time::Instant::now();
-    match distill_failure_logs(&buf, &full_file.path, model).await {
-        Some(distilled) => {
-            eprintln!(
-                "   Distilled in {:.1}s ({} bytes → {} bytes).",
-                start.elapsed().as_secs_f64(),
-                buf.len(),
-                distilled.len(),
-            );
-            println!("{distilled}");
+    match pr {
+        Some(pr) => {
+            let sha = sh(&format!(
+                "gh pr view {pr} --json headRefOid --jq '.headRefOid'"
+            ))
+            .await
+            .filter(|s| !s.is_empty())?;
+            Some((format!("PR #{pr}"), sha))
         }
         None => {
-            eprintln!("   Distill failed; falling back to raw failure logs.");
-            print!("{buf}");
+            let (sha, _) = resolve_watch_anchor(None).await?;
+            Some(("Commit".into(), sha))
         }
     }
-    if !gates.is_empty() {
-        print_gate_note(&gates);
-    }
-    1
+}
+
+async fn ci_failures_cmd(pr: Option<String>, raw: bool, model: Option<Model>) -> i32 {
+    let Some((label, sha)) = resolve_report_target(pr).await else {
+        eprintln!("No PR for the current branch and nothing pushed; pass --pr.");
+        return 2;
+    };
+    let checks = checks_for_sha(&sha).await;
+    let opts = ci_report::Options {
+        raw,
+        model,
+        main_history: true,
+    };
+    let report = ci_report::build(&label, &sha, &checks, &opts).await;
+    print!("{}", report.text);
+    if report.failed.is_empty() { 0 } else { 1 }
 }
 
 /// Resolve the commit `ci watch` anchors on: an explicit PR's head, or where
@@ -3154,7 +2479,7 @@ impl WatchAnchor {
     }
 }
 
-async fn ci_watch_cmd(pr: Option<String>) -> i32 {
+async fn ci_watch_cmd(pr: Option<String>, opts: WatchOptions) -> i32 {
     // The conflict probe's `git fetch origin main` is the slowest startup
     // call and depends on nothing below — start it before anchor resolution
     // so it overlaps the gh round-trips.
@@ -3192,15 +2517,11 @@ async fn ci_watch_cmd(pr: Option<String>) -> i32 {
     if conflicts.unwrap_or(false) {
         println!("⚠️  Merge conflicts with origin/main — some checks did not run.");
     }
-    ci_watch_sha(anchor, sha, ci_start, first_checks).await
+    ci_watch_sha(anchor, sha, ci_start, first_checks, opts).await
 }
 
 // ── SHA-anchored CI watch ────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct RestCheckRuns {
-    check_runs: Vec<RestCheckRun>,
-}
 #[derive(Deserialize)]
 struct RestCheckRun {
     id: u64,
@@ -3209,6 +2530,17 @@ struct RestCheckRun {
     conclusion: Option<String>,
     #[serde(default)]
     html_url: Option<String>,
+    #[serde(default)]
+    output: Option<RestCheckOutput>,
+}
+#[derive(Deserialize, Default)]
+struct RestCheckOutput {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
 }
 #[derive(Deserialize)]
 struct RestCombinedStatus {
@@ -3226,52 +2558,74 @@ struct RestStatus {
 }
 
 /// Check runs + commit statuses for one specific commit, mapped into the same
-/// name/bucket shape `gh pr checks --json` produces. Querying by SHA instead
-/// of by PR is what lets `push -w` watch exactly what it pushed.
+/// name/bucket shape `gh pr checks --json` produces.
+///
+/// Querying by SHA instead of by PR is what lets `push -w` watch exactly what
+/// it pushed. `filter=all` keeps earlier attempts so a rerun of a failed check
+/// is recognisable; `--paginate` matters because the monorepo posts well over
+/// 100 check runs per commit.
 async fn checks_for_sha(sha: &str) -> Vec<PrCheck> {
-    let runs_cmd =
-        format!("gh api 'repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100'");
+    let runs_cmd = format!(
+        "gh api --paginate 'repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100&filter=all' --jq '.check_runs[]'"
+    );
     // The combined-status endpoint covers providers that report commit
     // statuses rather than check runs (Buildkite, Spacelift, Graphite, …).
-    let status_cmd = format!("gh api 'repos/{{owner}}/{{repo}}/commits/{sha}/status'");
+    let status_cmd = format!("gh api 'repos/{{owner}}/{{repo}}/commits/{sha}/status?per_page=100'");
     let (runs, statuses) = tokio::join!(sh3(&runs_cmd), sh3(&status_cmd));
     parse_sha_checks(&runs.stdout, &statuses.stdout)
 }
 
-fn parse_sha_checks(runs_json: &str, statuses_json: &str) -> Vec<PrCheck> {
+/// Parses `runs_ndjson` (one check-run object per line) and the combined-status
+/// JSON into one [PrCheck] per name.
+fn parse_sha_checks(runs_ndjson: &str, statuses_json: &str) -> Vec<PrCheck> {
     // A re-triggered workflow creates a new check suite with same-named runs;
     // keep only the newest run per name (mirrors [parse_checks]'s run-id dedup).
     let mut latest: HashMap<String, (u64, PrCheck)> = HashMap::new();
-    if let Some(r) = parse_json::<RestCheckRuns>(runs_json) {
-        for run in r.check_runs {
-            let bucket = if run.status != "completed" {
-                "pending"
-            } else {
-                match run.conclusion.as_deref() {
-                    Some("success") => "pass",
-                    Some("skipped") | Some("neutral") => "skipping",
-                    // A queued run the scheduler abandoned because a newer run
-                    // for the same head superseded it — never a code failure.
-                    Some("stale") => "stale",
-                    // Usually cancel-superseded after a re-trigger. Held apart
-                    // from `fail` so `ci watch` can debounce instead of
-                    // fail-fasting on a phantom; see [ci_watch_sha].
-                    Some("cancelled") => "cancelled",
-                    // failure, timed_out, action_required, …
-                    _ => "fail",
-                }
-            };
-            let check = PrCheck {
-                name: run.name.clone(),
-                bucket: bucket.into(),
-                link: run.html_url.unwrap_or_default(),
-                workflow: String::new(),
-                description: String::new(),
-            };
-            if latest.get(&run.name).is_none_or(|(id, _)| run.id > *id) {
-                latest.insert(run.name, (run.id, check));
+    let mut failed_before: std::collections::HashSet<String> = Default::default();
+    let mut runs: Vec<RestCheckRun> = runs_ndjson
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    runs.sort_by_key(|r| r.id);
+    for run in runs {
+        let bucket = if run.status != "completed" {
+            "pending"
+        } else {
+            match run.conclusion.as_deref() {
+                Some("success") => "pass",
+                Some("skipped") | Some("neutral") => "skipping",
+                // A queued run the scheduler abandoned because a newer run
+                // for the same head superseded it — never a code failure.
+                Some("stale") => "stale",
+                // Usually cancel-superseded after a re-trigger. Held apart
+                // from `fail` so `ci watch` can debounce instead of
+                // fail-fasting on a phantom; see [ci_watch_sha].
+                Some("cancelled") => "cancelled",
+                // failure, timed_out, action_required, …
+                _ => "fail",
             }
+        };
+        let out = run.output.unwrap_or_default();
+        let output = [out.title, out.summary, out.text]
+            .into_iter()
+            .flatten()
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let check = PrCheck {
+            name: run.name.clone(),
+            bucket: bucket.into(),
+            link: run.html_url.unwrap_or_default(),
+            rerun_of_failure: bucket == "pending" && failed_before.contains(&run.name),
+            output,
+            ..Default::default()
+        };
+        if bucket == "fail" {
+            failed_before.insert(run.name.clone());
         }
+        // Runs are sorted by id, so each insert replaces an older attempt.
+        latest.insert(run.name, (run.id, check));
     }
     let mut checks: Vec<PrCheck> = latest.into_values().map(|(_, c)| c).collect();
 
@@ -3286,11 +2640,12 @@ fn parse_sha_checks(runs_json: &str, statuses_json: &str) -> Vec<PrCheck> {
                 name: st.context,
                 bucket: bucket.into(),
                 link: st.target_url.unwrap_or_default(),
-                workflow: String::new(),
                 description: st.description.unwrap_or_default(),
+                ..Default::default()
             });
         }
     }
+    checks.sort_by(|a, b| a.name.cmp(&b.name));
     checks
 }
 
@@ -3310,6 +2665,8 @@ fn counts_from_checks(checks: &[PrCheck], ignored: &[&str]) -> CheckCounts {
     {
         match c.bucket.as_str() {
             "pass" => counts.passed += 1,
+            // Waiting on a human; a watch that stopped here would never go green.
+            "fail" if is_gate(c) => {}
             "fail" => counts.failed += 1,
             "skipping" => counts.skipping += 1,
             "stale" => counts.stale += 1,
@@ -3328,59 +2685,123 @@ fn counts_from_checks(checks: &[PrCheck], ignored: &[&str]) -> CheckCounts {
 /// Print pre-fetched checks in the `ci status` shape (tally header, then one
 /// line per failing/pending check). Returns 1 when any non-ignored check
 /// failed, else 0.
-fn print_checks_summary(label: &str, checks: &[PrCheck], ignored: &[&str]) -> i32 {
-    let counts = counts_from_checks(checks, ignored);
-    let mut header = format!(
-        "{label} — {} fail, {} pending, {} pass, {} skip",
-        counts.failed, counts.pending, counts.passed, counts.skipping
-    );
-    if !counts.cancelled_names.is_empty() {
-        header += &format!(", {} cancelled", counts.cancelled_names.len());
-    }
-    if counts.stale > 0 {
-        header += &format!(", {} stale", counts.stale);
-    }
-    println!("{header}");
-    let priority = |b: &str| match b {
-        "fail" => 4,
+fn bucket_rank(bucket: &str) -> u8 {
+    match bucket {
+        "fail" => 5,
         "cancelled" => 3,
         "pending" => 2,
         "stale" => 1,
         _ => 0,
-    };
-    let mut shown: Vec<&PrCheck> = checks
+    }
+}
+
+/// Prints a one-line tally for `label`, then one line per check that is not
+/// green (every check with `all`), worst first. Returns 1 when a fixable check
+/// fails.
+///
+/// A failing gate is awaiting a human, not a fixable failure: it is tagged
+/// `🔒 needs-approval` and kept out of the fail tally and the exit code.
+fn print_checks_summary(label: &str, checks: &[PrCheck], ignored: &[&str], all: bool) -> i32 {
+    let checks: Vec<&PrCheck> = checks
         .iter()
         .filter(|c| !is_ignored_check(&c.name, ignored))
+        .collect();
+    // A name can come twice (a check run and a commit status); show its worst copy.
+    let mut worst: HashMap<&str, &PrCheck> = HashMap::new();
+    for c in checks {
+        let prev = worst.get(c.name.as_str());
+        if prev.is_none_or(|p| bucket_rank(&c.bucket) > bucket_rank(&p.bucket)) {
+            worst.insert(&c.name, c);
+        }
+    }
+    let checks: Vec<&PrCheck> = worst.into_values().collect();
+    let is_gate = |c: &PrCheck| c.bucket == "fail" && is_gate(c);
+    let count = |pred: &dyn Fn(&PrCheck) -> bool| checks.iter().filter(|c| pred(c)).count();
+    let failed = count(&|c| c.bucket == "fail" && !is_gate(c));
+    let gates = count(&is_gate);
+    let pending = count(&|c| c.bucket == "pending");
+    let rerunning = count(&|c| c.rerun_of_failure);
+    let mut header = format!(
+        "{label} — {failed} fail, {pending} pending, {} pass, {} skip",
+        count(&|c| c.bucket == "pass"),
+        count(&|c| c.bucket == "skipping"),
+    );
+    for (n, what) in [
+        (rerunning, "rerunning"),
+        (gates, "needs-approval"),
+        (count(&|c| c.bucket == "cancelled"), "cancelled"),
+        (count(&|c| c.bucket == "stale"), "stale"),
+    ] {
+        if n > 0 {
+            header += &format!(", {n} {what}");
+        }
+    }
+    println!("{header}");
+
+    let rank = |c: &PrCheck| {
+        if is_gate(c) {
+            4
+        } else {
+            bucket_rank(&c.bucket)
+        }
+    };
+    let mut shown: Vec<&PrCheck> = checks
+        .into_iter()
         .filter(|c| {
-            matches!(
+            all || matches!(
                 c.bucket.as_str(),
                 "fail" | "pending" | "cancelled" | "stale"
             )
         })
         .collect();
-    shown.sort_by(|a, b| (priority(&b.bucket), &a.name).cmp(&(priority(&a.bucket), &b.name)));
+    shown.sort_by(|a, b| (rank(b), &a.name).cmp(&(rank(a), &b.name)));
     for c in shown {
+        let gate = is_gate(c);
         let icon = match c.bucket.as_str() {
+            _ if gate => "🔒",
             "fail" => "❌",
             "pending" => "⏳",
             "cancelled" | "stale" => "🔁",
+            "pass" => "✅",
             _ => "⏭",
         };
-        let provider = classify_provider_label(&c.link);
-        let link = if c.link.is_empty() {
+        let provider = if gate {
+            "needs-approval"
+        } else {
+            classify_provider_label(&c.link)
+        };
+        // A gate's commit-status description ("awaiting @lovablelabs/ai
+        // approval") is the actionable bit, not its link.
+        let trailer = if gate {
+            format!("  — {}", gate_reason(c))
+        } else if c.link.is_empty() {
             String::new()
         } else {
             format!("  {}", c.link)
         };
-        println!("{icon} [{provider:>10}] {}{link}", c.name);
+        let rerun = if c.rerun_of_failure {
+            " (rerun after a failure)"
+        } else {
+            ""
+        };
+        println!("{icon} [{provider:>14}] {}{rerun}{trailer}", c.name);
     }
-    if counts.failed > 0 { 1 } else { 0 }
+    if failed > 0 { 1 } else { 0 }
+}
+
+struct WatchOptions {
+    /// Names the target in the report header ("PR #123" or "Commit").
+    label: String,
+    /// Wait for every check instead of fail-fasting.
+    all: bool,
+    timeout: Option<std::time::Duration>,
 }
 
 /// Poll one commit's checks until they settle, then print a final summary.
 ///
 /// Terminal rules:
-/// - A real failure (conclusion `failure`/`timed_out`/…) fail-fasts instantly.
+/// - A real failure (conclusion `failure`/`timed_out`/…) fail-fasts instantly,
+///   unless [WatchOptions::all] waits for the rest.
 /// - `cancelled` is debounced one extra poll: a cancellation is usually
 ///   cancel-superseded after a re-trigger, whose replacement runs register a
 ///   beat later. It only counts as red if the SAME cancelled set survives a
@@ -3402,8 +2823,13 @@ async fn ci_watch_sha(
     initial_sha: String,
     initial_ci_start: f64,
     first_checks: Vec<PrCheck>,
+    opts: WatchOptions,
 ) -> i32 {
+    use std::io::IsTerminal;
     const POLL: std::time::Duration = std::time::Duration::from_secs(15);
+    // Agents read a non-terminal stdout as one blob at exit; `\r` frames would
+    // pile up in it as hundreds of lines.
+    let tty = std::io::stdout().is_terminal();
     let mut sha = initial_sha;
     let mut ci_start = initial_ci_start;
     let start = std::time::Instant::now();
@@ -3413,7 +2839,7 @@ async fn ci_watch_sha(
     // Re-seen unchanged ⇒ genuine cancellation; changed/superseded ⇒ reset.
     let mut cancel_settle: Option<Vec<String>> = None;
 
-    loop {
+    let code = loop {
         let counts = counts_from_checks(&checks, WATCH_IGNORED_CHECKS);
         let total = counts.passed
             + counts.failed
@@ -3421,7 +2847,6 @@ async fn ci_watch_sha(
             + counts.skipping
             + counts.stale
             + counts.cancelled_names.len();
-        let short = format!("Commit {}", &sha[..7.min(sha.len())]);
 
         // Checks take a few seconds to register after a push; an empty list
         // means "not started yet", never "all done".
@@ -3433,35 +2858,34 @@ async fn ci_watch_sha(
         } else {
             format_ci_status(&counts, ci_start, 0)
         };
-        if line != prev_line {
+        if tty && line != prev_line {
             print!("\r{line}    ");
             std::io::stdout().flush().ok();
             prev_line = line;
         }
 
         // Real failures fail-fast immediately — no debounce.
-        if counts.failed > 0 {
-            println!();
-            return print_checks_summary(&short, &checks, WATCH_IGNORED_CHECKS);
+        if counts.failed > 0 && (!opts.all || counts.pending == 0) {
+            break 1;
         }
 
         // Nothing pending ⇒ candidate terminal state.
         if total > 0 && counts.pending == 0 {
             if counts.cancelled_names.is_empty() {
-                println!();
-                return print_checks_summary(&short, &checks, WATCH_IGNORED_CHECKS);
+                break 0;
             }
             // Only cancelled checks remain. Settle them across one more poll.
             if cancel_settle.as_ref() == Some(&counts.cancelled_names) {
-                println!();
-                print_checks_summary(&short, &checks, WATCH_IGNORED_CHECKS);
-                return 1;
+                break 1;
             }
             cancel_settle = Some(counts.cancelled_names.clone());
         } else {
             cancel_settle = None;
         }
 
+        if opts.timeout.is_some_and(|t| start.elapsed() + POLL > t) {
+            break 3;
+        }
         sleep(POLL).await;
 
         // A new push supersedes the watched commit; follow it instead of
@@ -3469,7 +2893,8 @@ async fn ci_watch_sha(
         if let Some(new_sha) = anchor.current_head().await {
             if !new_sha.is_empty() && new_sha != sha {
                 println!(
-                    "\n🔄 Push detected. Restarting watch at #{}",
+                    "{}🔄 Push detected. Restarting watch at #{}",
+                    if tty { "\n" } else { "" },
                     &new_sha[..7.min(new_sha.len())]
                 );
                 sha = new_sha;
@@ -3480,7 +2905,35 @@ async fn ci_watch_sha(
         }
 
         checks = checks_for_sha(&sha).await;
+    };
+
+    if tty {
+        println!();
     }
+    let short = &sha[..7.min(sha.len())];
+    print_checks_summary(
+        &format!("{} @ {short}", opts.label),
+        &checks,
+        WATCH_IGNORED_CHECKS,
+        false,
+    );
+    match code {
+        1 => {
+            let report_opts = ci_report::Options {
+                raw: false,
+                model: None,
+                main_history: true,
+            };
+            let report = ci_report::build(&opts.label, &sha, &checks, &report_opts).await;
+            println!("\n{}", report.text.trim_end());
+        }
+        3 => println!(
+            "⌛ Timed out after {}s with checks still running.",
+            start.elapsed().as_secs()
+        ),
+        _ => {}
+    }
+    code
 }
 
 #[derive(Deserialize)]
@@ -3595,9 +3048,23 @@ async fn ci_rerun_cmd(name: String, pr: Option<String>) -> i32 {
     // (`test-go`, `test-realtime`) matches even when its workflow has a
     // different display name (`Test`, `Test Go realtime`). Name-matching
     // against `gh run list`'s workflow names misses that mapping.
-    let failed = list_failed_checks(&pr_number).await;
+    let Some(sha) = sh(&format!(
+        "gh pr view {pr_number} --json headRefOid --jq '.headRefOid'"
+    ))
+    .await
+    .filter(|s| !s.is_empty()) else {
+        eprintln!("Could not resolve the head commit of PR #{pr_number}.");
+        return 2;
+    };
+    let checks = checks_for_sha(&sha).await;
+    let failed: Vec<PrCheck> = ci_report::select(&checks)
+        .failing
+        .into_iter()
+        .chain(ci_report::select(&checks).cancelled)
+        .cloned()
+        .collect();
     if failed.is_empty() {
-        eprintln!("No failing checks for PR #{pr_number} to rerun.");
+        eprintln!("No failing or cancelled checks for PR #{pr_number} to rerun.");
         return 2;
     }
     // Accept both the short check name and the workflow display name, in
@@ -3655,7 +3122,6 @@ async fn ci_rerun_cmd(name: String, pr: Option<String>) -> i32 {
 }
 
 async fn ci_distill_cmd(file: PathBuf, model: Option<Model>) -> i32 {
-    let model = model.unwrap_or(Model::Haiku);
     let raw = match std::fs::read_to_string(&file) {
         Ok(s) => s,
         Err(e) => {
@@ -3663,33 +3129,13 @@ async fn ci_distill_cmd(file: PathBuf, model: Option<Model>) -> i32 {
             return 2;
         }
     };
-    if raw.len() < 1000 {
-        eprintln!(
-            "Input is only {} bytes; distill skipped (raw printed as-is).",
-            raw.len()
-        );
-        print!("{raw}");
-        return 0;
-    }
-    eprintln!(
-        "   Distilling failure logs ({} bytes) via {}...",
-        raw.len(),
-        model.kit_id()
-    );
-    let start = std::time::Instant::now();
-    match distill_failure_logs(&raw, &file, model).await {
-        Some(distilled) => {
-            eprintln!(
-                "   Distilled in {:.1}s ({} bytes → {} bytes).",
-                start.elapsed().as_secs_f64(),
-                raw.len(),
-                distilled.len(),
-            );
-            println!("{distilled}");
+    match ci_report::distill_text(&raw, model).await {
+        Some(summary) => {
+            println!("{summary}");
             0
         }
         None => {
-            eprintln!("Distill failed.");
+            eprintln!("Distill failed on every model.");
             1
         }
     }
@@ -4041,11 +3487,7 @@ async fn collect_context_strings(
 
 // ── Build files index ────────────────────────────────────────────────────────
 
-fn build_files_index(
-    files: &[TempFile],
-    has_conflicts: bool,
-    failed_names: &[String],
-) -> String {
+fn build_files_index(files: &[TempFile], has_conflicts: bool, failed_names: &[String]) -> String {
     let failures_label = if failed_names.is_empty() {
         "CI failure logs (distilled summary; references full log below)".into()
     } else {
@@ -6037,13 +5479,15 @@ async fn main() {
                     CiCommand::Status { all, pr } => {
                         ci_status_cmd(pr, all, &[QA_TECH_REVIEW, CLAUDE_CODE_REVIEW]).await
                     }
-                    CiCommand::Failures {
-                        pr,
-                        max_bytes,
-                        raw,
-                        model,
-                    } => ci_failures_cmd(pr, max_bytes, raw, model).await,
-                    CiCommand::Watch { pr } => ci_watch_cmd(pr).await,
+                    CiCommand::Failures { pr, raw, model } => ci_failures_cmd(pr, raw, model).await,
+                    CiCommand::Watch { pr, all, timeout } => {
+                        let opts = WatchOptions {
+                            label: pr.as_ref().map_or("Commit".into(), |p| format!("PR #{p}")),
+                            all,
+                            timeout: timeout.map(std::time::Duration::from_secs),
+                        };
+                        ci_watch_cmd(pr, opts).await
+                    }
                     CiCommand::Flaky { name, limit } => flaky::run(name, limit).await,
                     CiCommand::Retries { pr } => ci_retries_cmd(pr).await,
                     CiCommand::Rerun { name, pr } => ci_rerun_cmd(name, pr).await,
@@ -6219,15 +5663,16 @@ mod tests {
 
     #[test]
     fn parse_sha_checks_buckets_and_dedup() {
-        let runs = r#"{"check_runs": [
-            {"id": 1, "name": "test-go", "status": "completed", "conclusion": "failure", "html_url": "https://github.com/x/y/actions/runs/1/job/1"},
-            {"id": 2, "name": "test-go", "status": "in_progress", "conclusion": null, "html_url": "https://github.com/x/y/actions/runs/2/job/2"},
-            {"id": 3, "name": "lint", "status": "completed", "conclusion": "success"},
-            {"id": 4, "name": "docs", "status": "completed", "conclusion": "skipped"},
-            {"id": 5, "name": "e2e", "status": "completed", "conclusion": "cancelled"},
-            {"id": 6, "name": "queued-job", "status": "queued", "conclusion": null},
-            {"id": 7, "name": "superseded", "status": "completed", "conclusion": "stale"}
-        ]}"#;
+        // One object per line: the shape `gh api --paginate --jq '.check_runs[]'` emits.
+        let runs = r#"{"id": 2, "name": "test-go", "status": "in_progress", "conclusion": null, "html_url": "https://github.com/x/y/actions/runs/2/job/2"}
+{"id": 1, "name": "test-go", "status": "completed", "conclusion": "failure", "html_url": "https://github.com/x/y/actions/runs/1/job/1"}
+{"id": 3, "name": "lint", "status": "completed", "conclusion": "success"}
+{"id": 4, "name": "docs", "status": "completed", "conclusion": "skipped"}
+{"id": 5, "name": "e2e", "status": "completed", "conclusion": "cancelled"}
+{"id": 6, "name": "queued-job", "status": "queued", "conclusion": null}
+{"id": 7, "name": "superseded", "status": "completed", "conclusion": "stale"}
+{"id": 8, "name": "buildkite/go", "status": "completed", "conclusion": "failure", "output": {"title": "Failed", "summary": "go test failed", "text": null}}
+"#;
         let statuses = r#"{"state": "pending", "statuses": [
             {"context": "buildkite/app", "state": "pending", "target_url": "https://buildkite.com/o/p/builds/1"},
             {"context": "wiz", "state": "success"},
@@ -6243,6 +5688,10 @@ mod tests {
         };
         // Newest run (id 2, in_progress) wins over the older failed attempt.
         assert_eq!(bucket("test-go"), "pending");
+        let find = |name: &str| checks.iter().find(|c| c.name == name).unwrap();
+        assert!(find("test-go").rerun_of_failure);
+        assert!(!find("queued-job").rerun_of_failure);
+        assert_eq!(find("buildkite/go").output, "Failed\n\ngo test failed");
         assert_eq!(bucket("lint"), "pass");
         assert_eq!(bucket("docs"), "skipping");
         // cancelled/stale are held apart from `fail` so `ci watch` debounces a
@@ -6253,7 +5702,7 @@ mod tests {
         assert_eq!(bucket("buildkite/app"), "pending");
         assert_eq!(bucket("wiz"), "pass");
         assert_eq!(bucket("spacelift/stack"), "fail");
-        assert_eq!(checks.len(), 9);
+        assert_eq!(checks.len(), 10);
     }
 
     #[test]
@@ -6353,9 +5802,7 @@ index 111..222 100644
         let mk = |name: &str, bucket: &str| PrCheck {
             name: name.into(),
             bucket: bucket.into(),
-            link: String::new(),
-            workflow: String::new(),
-            description: String::new(),
+            ..Default::default()
         };
         let checks = vec![
             mk("test-go", "pass"),
@@ -6375,9 +5822,7 @@ index 111..222 100644
         let mk = |name: &str, bucket: &str| PrCheck {
             name: name.into(),
             bucket: bucket.into(),
-            link: String::new(),
-            workflow: String::new(),
-            description: String::new(),
+            ..Default::default()
         };
         let checks = vec![
             mk("test-go", "pass"),
@@ -6412,9 +5857,7 @@ index 111..222 100644
         let mk = |name: &str, bucket: &str| PrCheck {
             name: name.into(),
             bucket: bucket.into(),
-            link: String::new(),
-            workflow: String::new(),
-            description: String::new(),
+            ..Default::default()
         };
         let checks = vec![
             mk("test-go", "pass"),
@@ -6493,62 +5936,6 @@ index 111..222 100644
             classify_issue_comment("aron", "this needs a second look"),
             ("comment", false)
         );
-    }
-
-    #[test]
-    fn denoise_drops_checkout_noise_and_keeps_the_failure() {
-        // `actions/checkout` ref enumeration + working-tree progress, then the
-        // real failing step. Format mirrors `gh run view --log`: job\tstep\tts.
-        let log = [
-            "job\tCheckout PR head\t2026Z  * [new branch]            fix-error-handling -> origin/fix-error-handling",
-            "job\tCheckout PR head\t2026Z  * [new branch]            saml-delete-orphan-user-on-join-fail -> origin/saml-delete-orphan-user-on-join-fail",
-            "job\tCheckout PR head\t2026Z  + abc1234...def5678 b -> origin/b (forced update)",
-            "job\tCheckout PR head\t2026Z  - [deleted]               (none) -> origin/gone",
-            "job\tCheckout PR head\t2026Z  * [new tag]               v1.2.3 -> v1.2.3",
-            "job\tCheckout PR head\t2026Z Updating files:  53% (1234/2345)",
-            "job\tCheckout PR head\t2026Z Updating files: 100% (2345/2345), done.",
-            "job\tRun codeowners PR check\t2026Z [fail] 1 added file(s) have NO matching CODEOWNERS rule:",
-            "job\tRun codeowners PR check\t2026Z   - go/api/pkg/reviewpublish/strip_test.go",
-            "job\tRun codeowners PR check\t2026Z ##[error]Process completed with exit code 1.",
-        ]
-        .join("\n");
-        let out = denoise_gha_log(&log);
-        // Ref enumeration and checkout progress are stripped...
-        assert!(!out.contains("[new branch]"));
-        assert!(!out.contains("fix-error-handling"));
-        assert!(!out.contains("forced update"));
-        assert!(!out.contains("[deleted]"));
-        assert!(!out.contains("[new tag]"));
-        assert!(!out.contains("Updating files"));
-        // ...but the actual failure survives verbatim.
-        assert!(out.contains("NO matching CODEOWNERS rule"));
-        assert!(out.contains("go/api/pkg/reviewpublish/strip_test.go"));
-        assert!(out.contains("Process completed with exit code 1"));
-
-        // Regression: branch names containing "error"/"fail" no longer seed
-        // extract_failure_summary's keep window, so the summary stays tight and
-        // surfaces the real error instead of a wall of `-> origin/<branch>`.
-        let summary = extract_failure_summary(&out);
-        assert!(summary.contains("strip_test.go"));
-        assert!(!summary.contains("origin/"));
-        assert!(
-            summary.len() < 600,
-            "summary ballooned to {} bytes",
-            summary.len()
-        );
-    }
-
-    #[test]
-    fn truncate_tail_keeps_the_end_where_failures_live() {
-        // Under the cap: returned unchanged, no marker.
-        assert_eq!(truncate_tail("short", 100), "short");
-        // Over the cap: the tail (where `##[error]` lands) is kept; the
-        // setup-noise head is dropped behind a marker.
-        let long = format!("{}##[error]boom", "x".repeat(500));
-        let out = truncate_tail(&long, 20);
-        assert!(out.starts_with("…[earlier log truncated]…\n"));
-        assert!(out.ends_with("##[error]boom"));
-        assert!(!out.contains(&"x".repeat(22)));
     }
 
     #[test]
